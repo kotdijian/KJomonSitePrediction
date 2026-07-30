@@ -1,0 +1,198 @@
+---
+title: "国分寺市 縄文住居立地要素抽出モデル：初期解析R Markdown"
+author: "Atsushi Noguchi / KJomonSitePrediction"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+## 谷地形指標の追加
+
+初期のDEMモデルでは、標高、傾斜、TPI、局所起伏などを用いて縄文住居の立地傾向を推定した。しかし、予測確率図を確認すると、谷底部または谷斜面に高い確率が表示される箇所が認められた。
+
+これは、谷底がモデル上では「中位標高」「平坦」「局所起伏が小さい」場所として表現されやすく、標高や傾斜だけでは谷底性を十分に識別できないためと考えられる。考古学的には、谷底および谷斜面は縄文時代住居の主要な立地場所とは考えにくい。したがって、谷地形を明示的に表す追加指標を作成し、初期モデルの改良を行う。
+
+本分析では、地形分類図や明治期低湿地データを直接用いず、10m DEMから谷地形 proxy を作成する。外部の地形分類データは有用であるが、縮尺や作成時期がDEMと異なるため、10mグリッド単位でのモデル化では位置ずれの影響が懸念される。そのため、ここではDEMから一貫して算出可能な指標を優先する。
+
+作成する指標は次の4つである。
+
+| 指標 | 内容 | 目的 |
+|---|---|---|
+| `tpi_250m` | 250m範囲の平均標高との差 | 中規模の谷地形・段丘縁辺の検出 |
+| `tpi_500m` | 500m範囲の平均標高との差 | より広域の谷・台地面構造の検出 |
+| `rel_min_250m` | 250m範囲の最低標高からの比高 | 近傍谷底からの高さの推定 |
+| `rel_min_500m` | 500m範囲の最低標高からの比高 | 広域的な谷底からの高さの推定 |
+
+TPIは、その地点が周囲と比較して高いか低いかを表す。負の値は周囲より低い位置、正の値は周囲より高い位置を示す。  
+一方、`rel_min_*` は周辺の最低標高からの相対的な高さであり、谷底に近いセルでは小さく、段丘面や台地上では大きくなる。
+
+これらは谷底そのものを直接確定する指標ではないが、谷地形をDEMから抽出するための操作的な指標として利用する。
+---
+
+```{r setup, message=TRUE, warning=FALSE}
+# 必要パッケージ
+required_pkgs <- c(
+  "sf", "terra", "dplyr", "ggplot2", "tibble", "readr",
+  "tidyr", "purrr", "mgcv", "pROC", "ranger", "scales", "broom"
+)
+
+install_if_missing <- TRUE
+
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0 && install_if_missing) {
+  install.packages(missing_pkgs)
+}
+
+library(sf)
+library(terra)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(readr)
+library(tidyr)
+library(purrr)
+library(mgcv)
+library(pROC)
+library(ranger)
+library(scales)
+
+# 投影座標系で処理するため、s2は使わない
+sf::sf_use_s2(FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 8,
+  fig.height = 6
+)
+```
+
+```{r parameters}
+# 作業ディレクトリ構成
+raw_dir <- "data_raw"
+processed_dir <- "data_processed"
+output_dir <- "output"
+fig_dir <- file.path(output_dir, "figures")
+
+for (d in c(raw_dir, processed_dir, output_dir, fig_dir)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+# 解析座標系：JGD2011 / Japan Plane Rectangular CS IX
+# 国分寺市を含む東京都域ではEPSG:6677を使用
+target_epsg <- 6677
+target_crs <- paste0("EPSG:", target_epsg)
+
+# GitHub raw URL候補
+# ユーザー提示URL：
+# https://github.com/kotdijian/KJomonSitePrediction/blob/main/Kokubunji_Jomon.gpkg
+# https://github.com/kotdijian/KJomonSitePrediction/blob/main/10mDEM.tif
+raw_base <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main"
+
+gpkg_url_candidates <- c(
+  paste0(raw_base, "/Kokubunji_Jomon.gpkg")
+)
+
+dem_url_candidates <- c(
+  paste0(raw_base, "/10mDEM.tif"),
+  paste0(raw_base, "/10mDEM.tiff")
+)
+
+# ローカル保存先
+gpkg_path <- file.path(raw_dir, "Kokubunji_Jomon.gpkg")
+dem_path <- file.path(raw_dir, "10mDEM.tif")
+
+# 解析用GeoPackage出力先
+analysis_gpkg <- file.path(processed_dir, "Kokubunji_Jomon_analysis.gpkg")
+```
+
+```{r valley-terrain-indices}
+library(terra)
+library(sf)
+library(dplyr)
+
+dir.create(processed_dir, showWarnings = FALSE, recursive = TRUE)
+
+dem <- terra::rast(dem_path)
+
+if (is.na(terra::crs(dem)) || terra::crs(dem) == "") {
+  terra::crs(dem) <- "EPSG:6677"
+}
+
+# 円形ウィンドウを自作する関数
+# radius_m はメートル単位
+make_circle_window <- function(r, radius_m) {
+  res_m <- mean(terra::res(r))
+  n <- ceiling(radius_m / res_m)
+  coords <- expand.grid(x = -n:n, y = -n:n)
+  dist_m <- sqrt(coords$x^2 + coords$y^2) * res_m
+  w <- matrix(
+    ifelse(dist_m <= radius_m, 1, NA),
+    nrow = 2 * n + 1,
+    ncol = 2 * n + 1
+  )
+  w
+}
+
+w250 <- make_circle_window(dem, 250)
+w500 <- make_circle_window(dem, 500)
+
+# 250m・500mスケールの平均標高
+mean_250 <- terra::focal(
+  dem,
+  w = w250,
+  fun = "mean",
+  na.policy = "omit",
+  na.rm = TRUE
+)
+
+mean_500 <- terra::focal(
+  dem,
+  w = w500,
+  fun = "mean",
+  na.policy = "omit",
+  na.rm = TRUE
+)
+
+# 広域TPI
+tpi_250m <- dem - mean_250
+tpi_500m <- dem - mean_500
+
+names(tpi_250m) <- "tpi_250m"
+names(tpi_500m) <- "tpi_500m"
+
+# 周辺最低標高
+min_250 <- terra::focal(
+  dem,
+  w = w250,
+  fun = "min",
+  na.policy = "omit",
+  na.rm = TRUE
+)
+
+min_500 <- terra::focal(
+  dem,
+  w = w500,
+  fun = "min",
+  na.policy = "omit",
+  na.rm = TRUE
+)
+
+# 周辺最低標高からの比高
+rel_min_250m <- dem - min_250
+rel_min_500m <- dem - min_500
+
+names(rel_min_250m) <- "rel_min_250m"
+names(rel_min_500m) <- "rel_min_500m"
+
+terrain_valley_stack <- c(
+  tpi_250m,
+  tpi_500m,
+  rel_min_250m,
+  rel_min_500m
+)
+
+terrain_valley_stack
