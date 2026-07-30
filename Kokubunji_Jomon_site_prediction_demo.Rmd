@@ -1,0 +1,1001 @@
+---
+title: "国分寺市 縄文住居立地要素抽出モデル：初期解析R Markdown"
+author: "Atsushi Noguchi / KJomonSitePrediction"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# 目的
+
+このR Markdownは、`Kokubunji_Jomon.gpkg` と `10mDEM.tif` を用いて、国分寺市域における縄文時代竪穴住居の立地要素を抽出するための初期モデルを構築するものです。
+
+主な処理は次の通りです。
+
+1. GeoPackageとDEMの読み込み
+2. レイヤ構成・CRS・ジオメトリの確認
+3. 国分寺市域10mグリッドの作成
+4. トレンチから「調査済みセル」を作成
+5. 縄文住居ポリゴン・代表点からpresenceを作成
+6. DEMから標高・傾斜・TPIなどの地形量を抽出
+7. presence / absence のモデルテーブル作成
+8. 記述統計、GLM、GAM、Random Forestによる初期モデル
+9. 予測確率マップと解析用データの書き出し
+
+この段階では、湧水点・明治期低湿地・土地利用はまだ投入しません。DEMと調査済み範囲を用いた地形モデルのデモです。
+
+# 0. パッケージ準備
+
+```{r setup, message=TRUE, warning=FALSE}
+# 必要パッケージ
+required_pkgs <- c(
+  "sf", "terra", "dplyr", "ggplot2", "tibble", "readr",
+  "tidyr", "purrr", "mgcv", "pROC", "ranger", "scales", "broom"
+)
+
+install_if_missing <- TRUE
+
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0 && install_if_missing) {
+  install.packages(missing_pkgs)
+}
+
+library(sf)
+library(terra)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(readr)
+library(tidyr)
+library(purrr)
+library(mgcv)
+library(pROC)
+library(ranger)
+library(scales)
+
+# 投影座標系で処理するため、s2は使わない
+sf::sf_use_s2(FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 8,
+  fig.height = 6
+)
+```
+
+# 1. パス・パラメータ設定
+
+GitHubの `blob` URLではなく、Rで直接読み込める `raw.githubusercontent.com` のURLを使います。
+
+実際の完全なGeoPackageファイル名が `Kokubunji_Jomon.gpkg` の場合は、`data_raw/Kokubunji_Jomon.gpkg` に置いてから実行しても構いません。
+
+```{r parameters}
+# 作業ディレクトリ構成
+raw_dir <- "data_raw"
+processed_dir <- "data_processed"
+output_dir <- "output"
+fig_dir <- file.path(output_dir, "figures")
+
+for (d in c(raw_dir, processed_dir, output_dir, fig_dir)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+# 解析座標系：JGD2011 / Japan Plane Rectangular CS IX
+# 国分寺市を含む東京都域ではEPSG:6677を使用
+target_epsg <- 6677
+target_crs <- paste0("EPSG:", target_epsg)
+
+# GitHub raw URL候補
+# ユーザー提示URL：
+# https://github.com/kotdijian/KJomonSitePrediction/blob/main/Kokubunji_Jomon.gpkg
+# https://github.com/kotdijian/KJomonSitePrediction/blob/main/10mDEM.tif
+raw_base <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main"
+
+gpkg_url_candidates <- c(
+  paste0(raw_base, "/Kokubunji_Jomon.gpkg")
+)
+
+dem_url_candidates <- c(
+  paste0(raw_base, "/10mDEM.tif"),
+  paste0(raw_base, "/10mDEM.tiff")
+)
+
+# ローカル保存先
+gpkg_path <- file.path(raw_dir, "Kokubunji_Jomon.gpkg")
+dem_path <- file.path(raw_dir, "10mDEM.tif")
+
+# 解析用GeoPackage出力先
+analysis_gpkg <- file.path(processed_dir, "Kokubunji_Jomon_analysis.gpkg")
+
+# 10mセルの調査済み判定閾値
+# presenceセルはこの閾値未満でも採用し、absenceセルはこの閾値以上の調査済みセルに限定する
+min_surveyed_ratio_absence <- 0.25
+
+# TPIなどの窓半径
+radius_tpi_50m <- 50
+radius_tpi_100m <- 100
+radius_relief_50m <- 50
+```
+
+# 2. データのダウンロードまたは確認
+
+既に `data_raw/` にファイルがある場合は、ダウンロードせずにそのファイルを使います。
+
+```{r download-data}
+# GitHub上のファイルを更新した場合は TRUE にすると強制再ダウンロードします。
+# 通常は FALSE のままで構いません。
+force_download <- FALSE
+
+validate_gpkg <- function(path) {
+  if (!file.exists(path) || file.info(path)$size < 1000) return(FALSE)
+  ok <- tryCatch({
+    lyr <- sf::st_layers(path)
+    length(lyr$name) > 0
+  }, error = function(e) FALSE)
+  ok
+}
+
+validate_raster <- function(path) {
+  if (!file.exists(path) || file.info(path)$size < 1000) return(FALSE)
+  ok <- tryCatch({
+    r <- terra::rast(path)
+    terra::nlyr(r) >= 1
+  }, error = function(e) FALSE)
+  ok
+}
+
+download_and_validate_gpkg <- function(urls, dest, force = FALSE) {
+  if (!force && validate_gpkg(dest)) {
+    message("既存GeoPackageを使用します: ", dest)
+    return(dest)
+  }
+
+  if (file.exists(dest)) {
+    message("既存GeoPackageを削除して再取得します: ", dest)
+    unlink(dest)
+  }
+
+  for (u in urls) {
+    message("GeoPackageをダウンロード試行: ", u)
+    ok <- tryCatch({
+      utils::download.file(u, dest, mode = "wb", quiet = FALSE)
+      validate_gpkg(dest)
+    }, error = function(e) {
+      message("失敗: ", conditionMessage(e))
+      FALSE
+    })
+    if (ok) {
+      message("GeoPackageとして読み込み可能です: ", dest)
+      return(dest)
+    }
+    if (file.exists(dest)) unlink(dest)
+  }
+
+  stop("GeoPackageのダウンロードまたは読み込みに失敗しました。GitHubのraw URL、ブランチ名、ファイル名、ローカルファイルを確認してください。")
+}
+
+download_and_validate_raster <- function(urls, dest, force = FALSE) {
+  if (!force && validate_raster(dest)) {
+    message("既存DEMを使用します: ", dest)
+    return(dest)
+  }
+
+  if (file.exists(dest)) {
+    message("既存DEMを削除して再取得します: ", dest)
+    unlink(dest)
+  }
+
+  for (u in urls) {
+    message("DEMをダウンロード試行: ", u)
+    ok <- tryCatch({
+      utils::download.file(u, dest, mode = "wb", quiet = FALSE)
+      validate_raster(dest)
+    }, error = function(e) {
+      message("失敗: ", conditionMessage(e))
+      FALSE
+    })
+    if (ok) {
+      message("ラスタとして読み込み可能です: ", dest)
+      return(dest)
+    }
+    if (file.exists(dest)) unlink(dest)
+  }
+
+  stop("DEMのダウンロードまたは読み込みに失敗しました。GitHubのraw URL、ブランチ名、ファイル名、ローカルファイルを確認してください。")
+}
+
+gpkg_path <- download_and_validate_gpkg(gpkg_url_candidates, gpkg_path, force = force_download)
+dem_path <- download_and_validate_raster(dem_url_candidates, dem_path, force = force_download)
+```
+
+# 3. GeoPackageのレイヤ構成確認
+
+想定レイヤは以下です。
+
+- `jdwelling_polygon`
+- `jumegame_polygon`
+- `jshuseki_polygon`
+- `jdokou_polygon`
+- `jdwelling_point`
+- `jumegame_point`
+- `jshuseki_point`
+- `jdokou_point`
+- `trench_polygon`
+- `kokubunji_city_boundary`
+- `kokubunji_city_buffer`
+
+```{r list-layers}
+layers <- sf::st_layers(gpkg_path)
+layers
+
+expected_layers <- c(
+  "jdwelling_polygon",
+  "jumegame_polygon",
+  "jshuseki_polygon",
+  "jdokou_polygon",
+  "jdwelling_point",
+  "jumegame_point",
+  "jshuseki_point",
+  "jdokou_point",
+  "trench_polygon",
+  "kokubunji_city_boundary",
+  "kokubunji_city_buffer"
+)
+
+missing_layers <- setdiff(expected_layers, layers$name)
+if (length(missing_layers) > 0) {
+  warning("想定レイヤのうち見つからないものがあります: ", paste(missing_layers, collapse = ", "))
+}
+```
+
+# 4. レイヤ読み込み関数
+
+必須レイヤが欠けている場合は停止します。埋甕・集石・土坑などの補助レイヤは、欠けていても空レイヤとして扱えるようにします。
+
+```{r read-functions}
+read_layer_required <- function(gpkg, layer, epsg = target_epsg) {
+  available_layers <- sf::st_layers(gpkg)$name
+  if (!(layer %in% available_layers)) {
+    stop(
+      "必須レイヤが見つかりません: ", layer, "\n",
+      "利用可能なレイヤ: ", paste(available_layers, collapse = ", ")
+    )
+  }
+
+  x <- sf::st_read(gpkg, layer = layer, quiet = TRUE)
+  if (!inherits(x, "sf")) stop("sfオブジェクトとして読み込めません: ", layer)
+
+  # CRSが欠落している場合は、今回のデータ前提に合わせてEPSG:6677を付与する。
+  # CRSがある場合はEPSG:6677へ変換する。
+  if (is.na(sf::st_crs(x))) {
+    sf::st_crs(x) <- epsg
+  } else {
+    x <- sf::st_transform(x, epsg)
+  }
+
+  x <- sf::st_make_valid(x)
+  x <- x[!sf::st_is_empty(x), ]
+
+  if (nrow(x) == 0) {
+    stop("レイヤは存在しますが、有効なジオメトリがありません: ", layer)
+  }
+
+  x
+}
+
+read_layer_optional <- function(gpkg, layer, epsg = target_epsg) {
+  available_layers <- sf::st_layers(gpkg)$name
+  if (!(layer %in% available_layers)) {
+    message("任意レイヤが見つからないため空レイヤとして扱います: ", layer)
+    return(sf::st_sf(geometry = sf::st_sfc(crs = epsg)))
+  }
+
+  x <- sf::st_read(gpkg, layer = layer, quiet = TRUE)
+  if (!inherits(x, "sf")) {
+    warning("sfオブジェクトとして読み込めないため空レイヤとして扱います: ", layer)
+    return(sf::st_sf(geometry = sf::st_sfc(crs = epsg)))
+  }
+
+  if (is.na(sf::st_crs(x))) {
+    sf::st_crs(x) <- epsg
+  } else {
+    x <- sf::st_transform(x, epsg)
+  }
+
+  x <- sf::st_make_valid(x)
+  x <- x[!sf::st_is_empty(x), ]
+  x
+}
+```
+
+# 5. ベクタデータ読み込み
+
+```{r read-vector-data}
+# 必須レイヤ
+city <- read_layer_required(gpkg_path, "kokubunji_city_boundary")
+city_buffer <- read_layer_required(gpkg_path, "kokubunji_city_buffer")
+trenches <- read_layer_required(gpkg_path, "trench_polygon")
+dw_poly <- read_layer_required(gpkg_path, "jdwelling_polygon")
+dw_pt <- read_layer_required(gpkg_path, "jdwelling_point")
+
+# 任意レイヤ
+umegame_poly <- read_layer_optional(gpkg_path, "jumegame_polygon")
+shuseki_poly <- read_layer_optional(gpkg_path, "jshuseki_polygon")
+dokou_poly <- read_layer_optional(gpkg_path, "jdokou_polygon")
+
+umegame_pt <- read_layer_optional(gpkg_path, "jumegame_point")
+shuseki_pt <- read_layer_optional(gpkg_path, "jshuseki_point")
+dokou_pt <- read_layer_optional(gpkg_path, "jdokou_point")
+
+# 市域とバッファはdissolveして単一ジオメトリ化
+city <- city |> summarise(.groups = "drop")
+city_buffer <- city_buffer |> summarise(.groups = "drop")
+
+# 件数確認
+tibble::tibble(
+  layer = c("trenches", "dw_poly", "dw_pt", "umegame_pt", "shuseki_pt", "dokou_pt"),
+  n = c(nrow(trenches), nrow(dw_poly), nrow(dw_pt), nrow(umegame_pt), nrow(shuseki_pt), nrow(dokou_pt))
+)
+```
+
+# 6. CRS・範囲の確認
+
+```{r crs-extent-check}
+crs_table <- tibble::tibble(
+  layer = c("city", "city_buffer", "trenches", "dw_poly", "dw_pt"),
+  epsg = c(
+    sf::st_crs(city)$epsg,
+    sf::st_crs(city_buffer)$epsg,
+    sf::st_crs(trenches)$epsg,
+    sf::st_crs(dw_poly)$epsg,
+    sf::st_crs(dw_pt)$epsg
+  )
+)
+crs_table
+
+plot(sf::st_geometry(city_buffer), col = NA, border = "gray")
+plot(sf::st_geometry(city), col = NA, border = "black", add = TRUE)
+plot(sf::st_geometry(trenches), col = NA, border = "gray40", add = TRUE)
+plot(sf::st_geometry(dw_pt), col = "red", pch = 16, cex = 0.4, add = TRUE)
+```
+
+# 7. DEM読み込み・CRS確認
+
+```{r read-dem}
+dem10 <- terra::rast(dem_path)
+dem10
+
+# CRSが未定義の場合のみEPSG:6677を仮設定。
+# 本来はQGIS側で正しいCRSを付与してから出力すること。
+if (is.na(terra::crs(dem10))) {
+  warning("DEMのCRSが未定義です。EPSG:6677として扱います。")
+  terra::crs(dem10) <- target_crs
+}
+
+# CRSが異なる場合はEPSG:6677へ再投影
+if (!terra::same.crs(dem10, terra::vect(city))) {
+  message("DEMをEPSG:6677へ再投影します。")
+  dem10 <- terra::project(dem10, target_crs)
+}
+
+# 市域バッファでcrop
+# DEMは市域ポリゴンでマスクしすぎず、バッファ範囲を保持する
+dem10 <- terra::crop(dem10, terra::vect(city_buffer))
+
+dem10
+plot(dem10, main = "10m DEM")
+plot(terra::vect(city), add = TRUE, border = "black")
+```
+
+# 8. 10mグリッド作成
+
+市域に交差する10mセルを作成します。セルは完全な正方形として保持し、後で市域内外や調査済み面積を属性として扱います。
+
+```{r make-grid-10m}
+cellsize <- 10
+
+grid_geom <- sf::st_make_grid(
+  city,
+  cellsize = cellsize,
+  square = TRUE,
+  what = "polygons"
+)
+
+grid10 <- sf::st_sf(
+  grid_id = sprintf("G%06d", seq_along(grid_geom)),
+  geometry = grid_geom,
+  crs = sf::st_crs(city)
+)
+
+# 市域に交差するセルだけ残す
+grid10 <- grid10[lengths(sf::st_intersects(grid10, city)) > 0, ]
+
+grid10$cell_area <- as.numeric(sf::st_area(grid10))
+
+tibble::tibble(
+  n_grid = nrow(grid10),
+  cell_area_min = min(grid10$cell_area),
+  cell_area_max = max(grid10$cell_area)
+)
+
+plot(sf::st_geometry(city), col = NA, border = "black")
+plot(sf::st_geometry(grid10[1:min(5000, nrow(grid10)), ]), col = NA, border = "gray80", add = TRUE)
+```
+
+# 9. トレンチから調査済みセルを作成
+
+重複調査区がある場合、面積が二重計上されないようにトレンチをunionしてからセルとの交差面積を計算します。
+
+```{r surveyed-area}
+calc_intersection_area <- function(grid, poly, out_col) {
+  if (!inherits(grid, "sf")) stop("grid が sf オブジェクトではありません。")
+  if (is.null(poly)) {
+    stop("poly が NULL です。先に read-vector-data chunk を実行し、trench_polygon が読み込まれているか確認してください。")
+  }
+  if (!inherits(poly, "sf")) stop("poly が sf オブジェクトではありません。")
+
+  grid[[out_col]] <- 0
+  if (nrow(poly) == 0) return(grid)
+
+  if (is.na(sf::st_crs(poly))) {
+    sf::st_crs(poly) <- sf::st_crs(grid)
+  } else {
+    poly <- sf::st_transform(poly, sf::st_crs(grid))
+  }
+
+  poly <- sf::st_make_valid(poly)
+  poly <- poly[!sf::st_is_empty(poly), ]
+  if (nrow(poly) == 0) {
+    warning("有効なポリゴンがないため、", out_col, " はすべて0として扱います。")
+    return(grid)
+  }
+
+  # st_union() の返り値を明示的に sfc -> sf に変換する。
+  # これにより、st_crs(NULL) <- ... が発生しないようにする。
+  poly_u_geom <- sf::st_union(sf::st_geometry(poly))
+  poly_u <- sf::st_sf(geometry = poly_u_geom)
+  sf::st_crs(poly_u) <- sf::st_crs(grid)
+
+  inter <- suppressWarnings(
+    sf::st_intersection(grid |> dplyr::select(grid_id, cell_area), poly_u)
+  )
+  if (nrow(inter) == 0) return(grid)
+
+  inter$intersect_area <- as.numeric(sf::st_area(inter))
+
+  area_tbl <- inter |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(grid_id) |>
+    dplyr::summarise(!!out_col := sum(intersect_area, na.rm = TRUE), .groups = "drop")
+
+  grid |>
+    dplyr::select(-dplyr::all_of(out_col)) |>
+    dplyr::left_join(area_tbl, by = "grid_id") |>
+    dplyr::mutate(
+      !!out_col := ifelse(is.na(.data[[out_col]]), 0, .data[[out_col]])
+    )
+}
+
+grid10 <- calc_intersection_area(grid10, trenches, "surveyed_area")
+
+grid10 <- grid10 |>
+  mutate(
+    surveyed_ratio = pmin(surveyed_area / cell_area, 1),
+    surveyed_any = surveyed_area > 0,
+    surveyed_for_absence = surveyed_ratio >= min_surveyed_ratio_absence
+  )
+
+summary(grid10$surveyed_ratio)
+
+ggplot(sf::st_drop_geometry(grid10), aes(surveyed_ratio)) +
+  geom_histogram(bins = 50) +
+  labs(title = "10mセル内の調査済み面積率", x = "surveyed_ratio", y = "セル数")
+```
+
+# 10. 縄文住居presenceと補助遺構カウント
+
+主presenceは代表点を基本とし、補助的に住居ポリゴンとの交差面積も持たせます。
+
+```{r feature-counts}
+count_points_in_grid <- function(grid, pts, out_col) {
+  if (nrow(pts) == 0) {
+    grid[[out_col]] <- 0L
+    return(grid)
+  }
+  idx <- sf::st_intersects(grid, pts)
+  grid[[out_col]] <- lengths(idx)
+  grid
+}
+
+grid10 <- grid10 |>
+  count_points_in_grid(dw_pt, "dwelling_count_pt") |>
+  count_points_in_grid(umegame_pt, "umegame_count_pt") |>
+  count_points_in_grid(shuseki_pt, "shuseki_count_pt") |>
+  count_points_in_grid(dokou_pt, "dokou_count_pt")
+
+# 住居ポリゴンのセル内交差面積
+grid10 <- calc_intersection_area(grid10, dw_poly, "dwelling_area")
+
+grid10 <- grid10 |>
+  mutate(
+    dwelling_presence_pt = dwelling_count_pt > 0,
+    dwelling_presence_poly = dwelling_area > 0,
+    dwelling_presence = dwelling_presence_pt | dwelling_presence_poly,
+    umegame_presence = umegame_count_pt > 0,
+    shuseki_presence = shuseki_count_pt > 0,
+    dokou_presence = dokou_count_pt > 0
+  )
+
+grid10 |>
+  sf::st_drop_geometry() |>
+  summarise(
+    n_cells = n(),
+    n_surveyed_any = sum(surveyed_any),
+    n_surveyed_for_absence = sum(surveyed_for_absence),
+    n_dwelling_presence = sum(dwelling_presence),
+    n_umegame_presence = sum(umegame_presence),
+    n_shuseki_presence = sum(shuseki_presence),
+    n_dokou_presence = sum(dokou_presence)
+  )
+```
+
+# 11. presence / absence / unknown の確認図
+
+```{r response-map-before-dem}
+grid10 <- grid10 |>
+  mutate(
+    response_class = case_when(
+      dwelling_presence ~ "presence_dwelling",
+      surveyed_for_absence ~ "surveyed_absence",
+      TRUE ~ "unknown_unsurveyed_or_low_survey"
+    )
+  )
+
+ggplot() +
+  geom_sf(data = grid10 |> filter(response_class != "unknown_unsurveyed_or_low_survey"),
+          aes(fill = response_class), color = NA) +
+  geom_sf(data = city, fill = NA, color = "black", linewidth = 0.3) +
+  scale_fill_manual(values = c(
+    presence_dwelling = "red",
+    surveyed_absence = "gray80"
+  )) +
+  coord_sf() +
+  labs(title = "10mセル：縄文住居presenceと調査済みabsence候補", fill = "class") +
+  theme_minimal()
+```
+
+# 12. DEM地形量の作成
+
+この段階では、標高、傾斜、方位から作るnorthness/eastness、TPI、局所起伏を作成します。
+
+```{r terrain-predictors}
+# 傾斜・方位
+slope_deg <- terra::terrain(dem10, v = "slope", unit = "degrees", neighbors = 8)
+aspect_deg <- terra::terrain(dem10, v = "aspect", unit = "degrees", neighbors = 8)
+
+# TPI関数：指定半径を含む正方形窓で近傍平均との差を取る
+make_tpi <- function(r, radius_m) {
+  res_m <- mean(terra::res(r))
+  n <- 2 * ceiling(radius_m / res_m) + 1
+  w <- matrix(1, nrow = n, ncol = n)
+  neigh_mean <- terra::focal(r, w = w, fun = mean, na.rm = TRUE, fillvalue = NA)
+  r - neigh_mean
+}
+
+make_relief <- function(r, radius_m) {
+  res_m <- mean(terra::res(r))
+  n <- 2 * ceiling(radius_m / res_m) + 1
+  w <- matrix(1, nrow = n, ncol = n)
+  rmax <- terra::focal(r, w = w, fun = max, na.rm = TRUE, fillvalue = NA)
+  rmin <- terra::focal(r, w = w, fun = min, na.rm = TRUE, fillvalue = NA)
+  rmax - rmin
+}
+
+tpi_50m <- make_tpi(dem10, radius_tpi_50m)
+tpi_100m <- make_tpi(dem10, radius_tpi_100m)
+relief_50m <- make_relief(dem10, radius_relief_50m)
+
+# 方位は循環変数なので northness / eastness に変換
+aspect_rad <- aspect_deg * pi / 180
+northness <- cos(aspect_rad)
+eastness <- sin(aspect_rad)
+
+pred_stack <- c(dem10, slope_deg, tpi_50m, tpi_100m, relief_50m, northness, eastness)
+names(pred_stack) <- c(
+  "elev", "slope_deg", "tpi_50m", "tpi_100m", "relief_50m", "northness", "eastness"
+)
+
+pred_stack
+plot(pred_stack[[c("elev", "slope_deg", "tpi_50m")]])
+```
+
+# 13. 10mセルへのDEM地形量付与
+
+`terra::extract()` を用いて、各10mセルにラスタ値の平均を付与します。
+
+```{r extract-terrain-to-grid}
+# terra用ベクタに変換
+grid10_vect <- terra::vect(grid10)
+
+terrain_vals <- terra::extract(
+  pred_stack,
+  grid10_vect,
+  fun = mean,
+  na.rm = TRUE,
+  ID = FALSE
+)
+
+terrain_vals <- tibble::as_tibble(terrain_vals)
+
+# 既に同名列がある場合に備えて削除してから結合
+terrain_names <- names(terrain_vals)
+grid10 <- grid10 |> select(-any_of(terrain_names))
+grid10 <- dplyr::bind_cols(grid10, terrain_vals)
+
+summary(sf::st_drop_geometry(grid10)[terrain_names])
+```
+
+# 14. モデルテーブル作成
+
+presenceは縄文住居ありセル、absenceは「調査済みだが縄文住居なし」のセルです。未調査セルは学習に使いません。
+
+```{r make-model-table}
+grid10 <- grid10 |>
+  mutate(
+    response = case_when(
+      dwelling_presence ~ 1L,
+      surveyed_for_absence & !dwelling_presence ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+predictor_vars <- c(
+  "elev", "slope_deg", "tpi_50m", "tpi_100m", "relief_50m", "northness", "eastness"
+)
+
+model_table <- grid10 |>
+  sf::st_drop_geometry() |>
+  filter(!is.na(response)) |>
+  filter(if_all(all_of(predictor_vars), ~ !is.na(.x))) |>
+  mutate(response = as.integer(response))
+
+model_table |>
+  count(response) |>
+  mutate(label = ifelse(response == 1, "dwelling_presence", "surveyed_absence"))
+
+summary(model_table[predictor_vars])
+```
+
+# 15. presence / absence の地形条件比較
+
+```{r eda-terrain-distributions}
+model_long <- model_table |>
+  mutate(response_label = ifelse(response == 1, "presence", "absence")) |>
+  select(response_label, all_of(predictor_vars)) |>
+  pivot_longer(cols = all_of(predictor_vars), names_to = "variable", values_to = "value")
+
+ggplot(model_long, aes(value, fill = response_label)) +
+  geom_density(alpha = 0.35, na.rm = TRUE) +
+  facet_wrap(~ variable, scales = "free", ncol = 2) +
+  labs(title = "縄文住居presence / 調査済みabsenceの地形量分布", x = NULL, y = "density") +
+  theme_minimal()
+
+# 群別要約
+model_table |>
+  mutate(response_label = ifelse(response == 1, "presence", "absence")) |>
+  group_by(response_label) |>
+  summarise(
+    across(all_of(predictor_vars), list(mean = mean, median = median, sd = sd), na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+# 16. 相関確認とPCA
+
+地形量同士は相関しやすいため、モデル投入前に相関構造を確認します。
+
+```{r correlation-pca}
+cor_mat <- model_table |>
+  select(all_of(predictor_vars)) |>
+  cor(use = "complete.obs")
+
+round(cor_mat, 2)
+
+pca_fit <- prcomp(model_table[predictor_vars], center = TRUE, scale. = TRUE)
+summary(pca_fit)
+
+pca_scores <- as_tibble(pca_fit$x[, 1:2]) |>
+  mutate(response = factor(model_table$response, levels = c(0, 1), labels = c("absence", "presence")))
+
+ggplot(pca_scores, aes(PC1, PC2, color = response)) +
+  geom_point(alpha = 0.35, size = 1) +
+  labs(title = "地形量PCA：presence / absence") +
+  theme_minimal()
+```
+
+# 17. GLM：説明重視の初期モデル
+
+ロジスティック回帰で、地形量と住居presenceの関係を確認します。ここでは単純な初期モデルとして、地形量をそのまま投入します。
+
+```{r glm-model}
+glm_formula <- as.formula(
+  paste("response ~", paste(predictor_vars, collapse = " + "))
+)
+
+glm_fit <- glm(
+  glm_formula,
+  family = binomial(link = "logit"),
+  data = model_table,
+  weights = pmax(model_table$surveyed_ratio, 0.01)
+)
+
+summary(glm_fit)
+
+# オッズ比
+or_table <- broom::tidy(glm_fit, conf.int = TRUE, exponentiate = TRUE)
+or_table
+```
+
+# 18. GLMの学習データ内評価
+
+この評価は空間的に独立した検証ではありません。初期の動作確認用です。
+
+```{r glm-train-eval}
+model_table$pred_glm <- predict(glm_fit, newdata = model_table, type = "response")
+
+roc_glm <- pROC::roc(model_table$response, model_table$pred_glm, quiet = TRUE)
+pROC::auc(roc_glm)
+
+plot(roc_glm, main = "GLM ROC：training data")
+
+# 高確率上位20%にpresenceがどれだけ含まれるか
+top20_cut <- quantile(model_table$pred_glm, probs = 0.80, na.rm = TRUE)
+top20_capture <- model_table |>
+  summarise(
+    top20_cut = top20_cut,
+    area_ratio = mean(pred_glm >= top20_cut, na.rm = TRUE),
+    presence_capture_rate = sum(response == 1 & pred_glm >= top20_cut, na.rm = TRUE) / sum(response == 1, na.rm = TRUE)
+  )
+top20_capture
+
+# キャリブレーション確認
+model_table |>
+  mutate(pred_bin = ntile(pred_glm, 10)) |>
+  group_by(pred_bin) |>
+  summarise(
+    pred_mean = mean(pred_glm, na.rm = TRUE),
+    obs_rate = mean(response, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  ggplot(aes(pred_mean, obs_rate, size = n)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "GLM calibration：予測確率と実際のpresence率", x = "平均予測確率", y = "実際のpresence率") +
+  theme_minimal()
+```
+
+# 19. GAM：非線形効果の確認
+
+傾斜やTPIは線形とは限らないため、GAMで応答曲線を確認します。
+
+```{r gam-model}
+gam_formula <- as.formula(
+  paste0(
+    "response ~ ",
+    paste0("s(", predictor_vars, ", k = 5)", collapse = " + ")
+  )
+)
+
+gam_fit <- mgcv::gam(
+  gam_formula,
+  family = binomial(link = "logit"),
+  data = model_table,
+  weights = pmax(model_table$surveyed_ratio, 0.01),
+  method = "REML"
+)
+
+summary(gam_fit)
+par(mfrow = c(3, 3))
+plot(gam_fit, shade = TRUE, pages = 1)
+par(mfrow = c(1, 1))
+```
+
+# 20. GAMの学習データ内評価
+
+```{r gam-train-eval}
+model_table$pred_gam <- predict(gam_fit, newdata = model_table, type = "response")
+
+roc_gam <- pROC::roc(model_table$response, model_table$pred_gam, quiet = TRUE)
+pROC::auc(roc_gam)
+
+plot(roc_gam, main = "GAM ROC：training data")
+```
+
+# 21. Random Forest：探索的変数重要度
+
+Random Forestは説明モデルではなく、非線形・相互作用の探索用として使います。
+
+```{r random-forest}
+rf_data <- model_table |>
+  select(response, all_of(predictor_vars), surveyed_ratio) |>
+  mutate(response = factor(response, levels = c(0, 1), labels = c("absence", "presence")))
+
+set.seed(1234)
+rf_fit <- ranger::ranger(
+  response ~ .,
+  data = rf_data,
+  probability = TRUE,
+  importance = "permutation",
+  num.trees = 500,
+  min.node.size = 5
+)
+
+rf_fit
+
+importance_tbl <- tibble::tibble(
+  variable = names(rf_fit$variable.importance),
+  importance = as.numeric(rf_fit$variable.importance)
+) |>
+  arrange(desc(importance))
+
+importance_tbl
+
+ggplot(importance_tbl, aes(reorder(variable, importance), importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Random Forest permutation importance", x = NULL, y = "importance") +
+  theme_minimal()
+```
+
+# 22. 全セルへの予測確率付与
+
+GLMとGAMを、市域内の全10mセルへ適用します。未調査セルを含めて、地形条件にもとづく相対的な立地確率を可視化します。
+
+```{r predict-all-grid}
+grid_predict_df <- grid10 |>
+  sf::st_drop_geometry()
+
+# 予測に必要な地形量があるセルのみ予測
+valid_pred <- complete.cases(grid_predict_df[, predictor_vars])
+
+grid10$pred_glm <- NA_real_
+grid10$pred_gam <- NA_real_
+
+grid10$pred_glm[valid_pred] <- predict(glm_fit, newdata = grid_predict_df[valid_pred, ], type = "response")
+grid10$pred_gam[valid_pred] <- predict(gam_fit, newdata = grid_predict_df[valid_pred, ], type = "response")
+
+summary(grid10$pred_glm)
+summary(grid10$pred_gam)
+```
+
+# 23. 予測確率マップ
+
+```{r prediction-map}
+ggplot() +
+  geom_sf(data = grid10, aes(fill = pred_gam), color = NA) +
+  geom_sf(data = city, fill = NA, color = "black", linewidth = 0.3) +
+  geom_sf(data = dw_pt, color = "red", size = 0.4, alpha = 0.7) +
+  scale_fill_viridis_c(option = "C", na.value = NA, labels = percent) +
+  labs(title = "GAMによる縄文住居立地確率：DEM地形モデル", fill = "pred") +
+  theme_minimal()
+
+# 調査済み範囲だけを強調した確認図
+ggplot() +
+  geom_sf(data = grid10, aes(fill = pred_gam), color = NA) +
+  geom_sf(data = grid10 |> filter(surveyed_any), fill = NA, color = "gray40", linewidth = 0.05) +
+  geom_sf(data = dw_pt, color = "red", size = 0.5, alpha = 0.8) +
+  geom_sf(data = city, fill = NA, color = "black", linewidth = 0.3) +
+  scale_fill_viridis_c(option = "C", na.value = NA, labels = percent) +
+  labs(title = "GAM予測＋調査済みセル＋縄文住居代表点", fill = "pred") +
+  theme_minimal()
+```
+
+# 24. 住居・埋甕・集石・土坑の共起確認
+
+この分析は立地予測の主モデルではなく、縄文期活動空間の補助的確認です。
+
+```{r cooccurrence}
+cooccur_tbl <- grid10 |>
+  sf::st_drop_geometry() |>
+  filter(surveyed_any | dwelling_presence | umegame_presence | shuseki_presence | dokou_presence) |>
+  summarise(
+    dwelling_cells = sum(dwelling_presence),
+    umgame_cells = sum(umegame_presence),
+    shuseki_cells = sum(shuseki_presence),
+    dokou_cells = sum(dokou_presence),
+    dwelling_umegame = sum(dwelling_presence & umegame_presence),
+    dwelling_shuseki = sum(dwelling_presence & shuseki_presence),
+    dwelling_dokou = sum(dwelling_presence & dokou_presence),
+    shuseki_without_dwelling = sum(shuseki_presence & !dwelling_presence),
+    dokou_without_dwelling = sum(dokou_presence & !dwelling_presence)
+  )
+cooccur_tbl
+
+# 住居・埋甕・集石の点を重ねた確認図
+ggplot() +
+  geom_sf(data = city, fill = NA, color = "black") +
+  geom_sf(data = trenches, fill = NA, color = "gray70", linewidth = 0.1) +
+  geom_sf(data = dw_pt, color = "red", size = 0.5, alpha = 0.8) +
+  geom_sf(data = umegame_pt, color = "purple", size = 1.0, alpha = 0.8) +
+  geom_sf(data = shuseki_pt, color = "brown", size = 0.7, alpha = 0.6) +
+  labs(title = "縄文住居・住居外埋甕・集石遺構の分布確認") +
+  theme_minimal()
+```
+
+# 25. 代表点ベースの住居クラスター確認（DBSCAN相当の簡易処理）
+
+ここでは追加パッケージを増やさず、住居代表点の近接関係を確認する簡易図を作ります。DBSCANを本格的に使う場合は `dbscan` パッケージを追加してください。
+
+```{r dwelling-density-simple}
+# 住居代表点からカーネル密度の代替として、10mセル内住居数を図化
+ggplot() +
+  geom_sf(data = grid10 |> filter(dwelling_count_pt > 0), aes(fill = dwelling_count_pt), color = NA) +
+  geom_sf(data = city, fill = NA, color = "black", linewidth = 0.3) +
+  geom_sf(data = dw_pt, color = "red", size = 0.4) +
+  scale_fill_viridis_c(option = "B") +
+  labs(title = "10mセル内の縄文住居代表点数", fill = "count") +
+  theme_minimal()
+
+# 最近隣距離の概略
+dw_dist <- sf::st_distance(dw_pt)
+diag(dw_dist) <- NA
+nearest_dw <- apply(as.matrix(dw_dist), 1, min, na.rm = TRUE)
+summary(as.numeric(nearest_dw))
+
+tibble(nearest_distance_m = as.numeric(nearest_dw)) |>
+  ggplot(aes(nearest_distance_m)) +
+  geom_histogram(bins = 40) +
+  labs(title = "縄文住居代表点の最近隣距離", x = "distance (m)", y = "住居数") +
+  theme_minimal()
+```
+
+# 26. 結果の書き出し
+
+解析用GeoPackageとCSVを書き出します。
+
+```{r write-results}
+# 古い同名レイヤを上書き
+sf::st_write(grid10, analysis_gpkg, layer = "grid_10m_response_predictors", delete_layer = TRUE)
+sf::st_write(dw_pt, analysis_gpkg, layer = "jdwelling_point", delete_layer = TRUE)
+sf::st_write(dw_poly, analysis_gpkg, layer = "jdwelling_polygon", delete_layer = TRUE)
+sf::st_write(trenches, analysis_gpkg, layer = "trench_polygon", delete_layer = TRUE)
+sf::st_write(city, analysis_gpkg, layer = "kokubunji_city_boundary", delete_layer = TRUE)
+
+# モデルテーブルをCSVで保存
+readr::write_csv(model_table, file.path(processed_dir, "model_table_10m_dem_only.csv"))
+
+# モデルオブジェクト保存
+saveRDS(glm_fit, file.path(processed_dir, "glm_dem_only.rds"))
+saveRDS(gam_fit, file.path(processed_dir, "gam_dem_only.rds"))
+saveRDS(rf_fit, file.path(processed_dir, "rf_dem_only.rds"))
+
+# レイヤ確認
+sf::st_layers(analysis_gpkg)
+```
+
+# 27. 次段階の拡張メモ
+
+このRmdで作成した `grid_10m_response_predictors` に、次の変数を追加していくと、研究計画に沿った立地要素抽出モデルになります。
+
+- 湧水点からの距離
+- 明治期低湿地からの距離
+- 明治期低湿地の100mバッファ内面積率
+- 崖線・谷頭・谷筋からの距離
+- 1m DEM / 0.25m DEMから作成した微地形量
+- 主要集落1遺跡を分離したホールドアウトフラグ
+- 空間ブロック交差検証用fold
+
+# 28. sessionInfo
+
+```{r session-info}
+sessionInfo()
+```
