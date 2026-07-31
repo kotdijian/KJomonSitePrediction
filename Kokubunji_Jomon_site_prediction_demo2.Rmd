@@ -196,3 +196,339 @@ terrain_valley_stack <- c(
 )
 
 terrain_valley_stack
+```
+---
+
+## 2. GeoTIFFで出力
+
+```{r export-valley-indices-geotiff}
+terra::writeRaster(
+  tpi_250m,
+  file.path(processed_dir, "tpi_250m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  tpi_500m,
+  file.path(processed_dir, "tpi_500m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  rel_min_250m,
+  file.path(processed_dir, "rel_min_250m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  rel_min_500m,
+  file.path(processed_dir, "rel_min_500m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+```
+
+---
+
+この4つをQGISで確認します。
+
+| GeoTIFF | 見たいこと |
+|---|---|
+| `tpi_250m.tif` | 小〜中規模の谷地形・段丘縁辺 |
+| `tpi_500m.tif` | より広い谷・台地面構造 |
+| `rel_min_250m.tif` | 近傍谷底からの比高 |
+| `rel_min_500m.tif` | 広域谷底からの比高 |
+
+---
+
+## 3. 谷底・谷斜面フラグを作成
+
+ここでは暫定閾値を使います。  
+後でQGIS表示とpresence重なりを見ながら調整します。
+
+```{r valley-flags}
+library(terra)
+
+# 傾斜ラスタをDEMから再計算
+slope_r <- terra::terrain(
+  dem,
+  v = "slope",
+  unit = "degrees",
+  neighbors = 8
+)
+
+names(slope_r) <- "slope_deg"
+
+# 暫定閾値
+valley_bottom_tpi_threshold <- -1.0
+valley_bottom_relmin_max    <- 2.0
+valley_bottom_slope_max     <- 3.0
+
+valley_slope_dist_max       <- 100
+valley_slope_slope_min      <- 3.0
+valley_slope_relmin_max     <- 10.0
+
+# 谷底候補
+# 広域TPIが低く、周辺最低標高からの比高が小さく、傾斜が緩い場所
+valley_bottom_flag <- terra::ifel(
+  tpi_250m < valley_bottom_tpi_threshold &
+    rel_min_250m < valley_bottom_relmin_max &
+    slope_r < valley_bottom_slope_max,
+  1,
+  0
+)
+
+names(valley_bottom_flag) <- "valley_bottom_flag"
+
+# 谷底候補までの距離
+vb_for_distance <- valley_bottom_flag
+vb_for_distance[vb_for_distance == 0] <- NA
+
+dist_valley_bottom <- terra::distance(vb_for_distance)
+names(dist_valley_bottom) <- "dist_valley_bottom"
+
+# 谷斜面候補
+# 谷底に近く、一定以上の傾斜があり、谷底からの比高が大きすぎない場所
+valley_slope_flag <- terra::ifel(
+  dist_valley_bottom <= valley_slope_dist_max &
+    slope_r >= valley_slope_slope_min &
+    rel_min_250m <= valley_slope_relmin_max &
+    valley_bottom_flag == 0,
+  1,
+  0
+)
+
+names(valley_slope_flag) <- "valley_slope_flag"
+
+# GeoTIFF出力
+terra::writeRaster(
+  valley_bottom_flag,
+  file.path(processed_dir, "valley_bottom_flag.tif"),
+  overwrite = TRUE,
+  datatype = "INT1U",
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  valley_slope_flag,
+  file.path(processed_dir, "valley_slope_flag.tif"),
+  overwrite = TRUE,
+  datatype = "INT1U",
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  dist_valley_bottom,
+  file.path(processed_dir, "dist_valley_bottom.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+c(valley_bottom_flag, valley_slope_flag, dist_valley_bottom)
+```
+
+---
+
+## 4. 10mグリッドへ値を付与
+
+```{r extract-valley-indices-to-grid}
+library(sf)
+library(terra)
+library(dplyr)
+
+valley_stack <- c(
+  tpi_250m,
+  tpi_500m,
+  rel_min_250m,
+  rel_min_500m,
+  valley_bottom_flag,
+  valley_slope_flag,
+  dist_valley_bottom
+)
+
+# grid10の代表点で抽出
+grid10_pts <- sf::st_point_on_surface(grid10)
+grid10_pts <- sf::st_transform(grid10_pts, 6677)
+
+valley_values <- terra::extract(
+  valley_stack,
+  terra::vect(grid10_pts),
+  ID = FALSE
+)
+
+grid10 <- bind_cols(
+  grid10,
+  valley_values
+)
+
+# flagは整数化
+grid10 <- grid10 |>
+  mutate(
+    valley_bottom_flag = as.integer(valley_bottom_flag),
+    valley_slope_flag  = as.integer(valley_slope_flag)
+  )
+
+summary(st_drop_geometry(grid10)[, c(
+  "tpi_250m",
+  "tpi_500m",
+  "rel_min_250m",
+  "rel_min_500m",
+  "valley_bottom_flag",
+  "valley_slope_flag",
+  "dist_valley_bottom"
+)])
+```
+
+---
+
+## 5. presence / absence / no_data との重なり確認
+
+`no_data` は「未調査・不明」なので、統計的な相関というより、**予測対象域にどの程度谷底・谷斜面が含まれるかの確認**として扱うのがよいです。
+
+```{r valley-flag-overlap}
+library(dplyr)
+library(tidyr)
+
+grid10_status <- grid10 |>
+  st_drop_geometry() |>
+  mutate(
+    cell_status = case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    ),
+    valley_bottom_flag = if_else(is.na(valley_bottom_flag), 0L, valley_bottom_flag),
+    valley_slope_flag  = if_else(is.na(valley_slope_flag), 0L, valley_slope_flag)
+  )
+
+# 谷底フラグとのクロス集計
+bottom_tab <- grid10_status |>
+  count(cell_status, valley_bottom_flag) |>
+  group_by(cell_status) |>
+  mutate(
+    ratio_in_status = n / sum(n)
+  ) |>
+  ungroup()
+
+bottom_tab
+
+# 谷斜面フラグとのクロス集計
+slope_tab <- grid10_status |>
+  count(cell_status, valley_slope_flag) |>
+  group_by(cell_status) |>
+  mutate(
+    ratio_in_status = n / sum(n)
+  ) |>
+  ungroup()
+
+slope_tab
+```
+
+---
+
+## 6. presenceとの重なり数を明示的に確認
+
+ここが、マスクにするかどうかの判断点です。
+
+```{r valley-presence-check}
+presence_bottom_n <- grid10_status |>
+  filter(cell_status == "presence", valley_bottom_flag == 1) |>
+  nrow()
+
+presence_slope_n <- grid10_status |>
+  filter(cell_status == "presence", valley_slope_flag == 1) |>
+  nrow()
+
+presence_total_n <- grid10_status |>
+  filter(cell_status == "presence") |>
+  nrow()
+
+cat("presenceセル総数:", presence_total_n, "\n")
+cat("valley_bottom_flag と重なるpresenceセル数:", presence_bottom_n, "\n")
+cat("valley_slope_flag と重なるpresenceセル数:", presence_slope_n, "\n")
+
+cat("valley_bottom_flag presence重なり率:",
+    presence_bottom_n / presence_total_n, "\n")
+
+cat("valley_slope_flag presence重なり率:",
+    presence_slope_n / presence_total_n, "\n")
+```
+
+
+判断基準は次のようにするとよいです。
+
+| 結果 | 判断 |
+|---|---|
+| presenceとの重なりが0 | マスク候補にできる |
+| presenceとの重なりがごく少数 | QGISで個別確認。境界セル・DEMノイズなら閾値調整 |
+| presenceとの重なりが一定数ある | マスクにはしない。説明変数として扱う |
+| absenceに多く、presenceに少ない | 谷地形の負の効果として有効 |
+| no_dataに多い | 未調査域の予測補正に重要 |
+
+---
+
+## 7. presence / absence の統計的確認
+
+推論に使えるのは、基本的に **presence と absence** の比較です。  
+`no_data` は未知なので、ここでは統計検定から外します。
+
+```{r valley-flag-tests}
+analysis_status <- grid10_status |>
+  filter(cell_status %in% c("presence", "absence"))
+
+test_flag_association <- function(df, flag_col) {
+  tab <- table(
+    status = df$cell_status,
+    flag = df[[flag_col]]
+  )
+
+  print(tab)
+
+  # 2x2表のときのみ検定
+  if (all(dim(tab) == c(2, 2))) {
+    if (any(tab < 5)) {
+      test <- fisher.test(tab)
+    } else {
+      test <- chisq.test(tab, correct = FALSE)
+    }
+
+    # phi係数
+    a <- tab[1, 1]
+    b <- tab[1, 2]
+    c <- tab[2, 1]
+    d <- tab[2, 2]
+
+    phi <- as.numeric((a * d - b * c) / sqrt(
+      rowSums(tab)[1] * rowSums(tab)[2] *
+        colSums(tab)[1] * colSums(tab)[2]
+    ))
+
+    list(
+      table = tab,
+      test = test,
+      phi = phi
+    )
+  } else {
+    list(table = tab)
+  }
+}
+
+bottom_test <- test_flag_association(
+  analysis_status,
+  "valley_bottom_flag"
+)
+
+slope_test <- test_flag_association(
+  analysis_status,
+  "valley_slope_flag"
+)
+
+bottom_test$test
+bottom_test$phi
+
+slope_test$test
+slope_test$phi
+```

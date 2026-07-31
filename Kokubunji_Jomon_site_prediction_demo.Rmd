@@ -747,7 +747,9 @@ or_table
 この評価は空間的に独立した検証ではありません。初期の動作確認用です。
 
 ```{r glm-train-eval}
-model_table$pred_glm <- predict(glm_fit, newdata = model_table, type = "response")
+model_table$pred_glm <- as.numeric(
+  predict(glm_fit, newdata = model_table, type = "response")
+)
 
 roc_glm <- pROC::roc(model_table$response, model_table$pred_glm, quiet = TRUE)
 pROC::auc(roc_glm)
@@ -812,7 +814,9 @@ par(mfrow = c(1, 1))
 # 20. GAMの学習データ内評価
 
 ```{r gam-train-eval}
-model_table$pred_gam <- predict(gam_fit, newdata = model_table, type = "response")
+model_table$pred_gam <- as.numeric(
+  predict(gam_fit, newdata = model_table, type = "response")
+)
 
 roc_gam <- pROC::roc(model_table$response, model_table$pred_gam, quiet = TRUE)
 pROC::auc(roc_gam)
@@ -971,7 +975,29 @@ sf::st_write(trenches, analysis_gpkg, layer = "trench_polygon", delete_layer = T
 sf::st_write(city, analysis_gpkg, layer = "kokubunji_city_boundary", delete_layer = TRUE)
 
 # モデルテーブルをCSVで保存
-readr::write_csv(model_table, file.path(processed_dir, "model_table_10m_dem_only.csv"))
+# CSVに書き出せる形に整える
+model_table_csv <- model_table |>
+  dplyr::mutate(
+    pred_glm = as.numeric(pred_glm),
+    pred_gam = as.numeric(pred_gam)
+  )
+
+# list列・matrix列が残っていないか確認
+bad_cols <- names(model_table_csv)[
+  vapply(model_table_csv, function(x) is.list(x) || is.matrix(x), logical(1))
+]
+
+if (length(bad_cols) > 0) {
+  stop(
+    "CSVに書き出せない列があります: ",
+    paste(bad_cols, collapse = ", ")
+  )
+}
+
+readr::write_csv(
+  model_table_csv,
+  file.path(processed_dir, "model_table_10m_dem_only.csv")
+)
 
 # モデルオブジェクト保存
 saveRDS(glm_fit, file.path(processed_dir, "glm_dem_only.rds"))
@@ -998,4 +1024,49 @@ sf::st_layers(analysis_gpkg)
 
 ```{r session-info}
 sessionInfo()
+```
+```{r export-eastness-geotiff}
+library(terra)
+library(sf)
+library(dplyr)
+
+dir.create(processed_dir, showWarnings = FALSE, recursive = TRUE)
+
+# DEMをテンプレートラスタとして使用
+dem_template <- terra::rast(dem_path)
+
+# CRSが欠けている場合のみEPSG:6677を設定
+if (is.na(terra::crs(dem_template)) || terra::crs(dem_template) == "") {
+  terra::crs(dem_template) <- "EPSG:6677"
+}
+
+# grid10をDEMと同じCRSにそろえる
+grid10_export <- grid10 |>
+  st_transform(6677)
+
+# eastness列があるか確認
+if (!"eastness" %in% names(grid10_export)) {
+  stop("grid10 に eastness 列がありません。DEM predictor作成chunkを先に実行してください。")
+}
+
+# sf → terraベクタ
+grid10_vect <- terra::vect(grid10_export)
+
+# eastnessをラスタ化
+eastness_raster <- terra::rasterize(
+  grid10_vect,
+  dem_template,
+  field = "eastness",
+  touches = TRUE
+)
+
+# GeoTIFFとして出力
+terra::writeRaster(
+  eastness_raster,
+  filename = file.path(processed_dir, "eastness_10m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+eastness_raster
 ```
