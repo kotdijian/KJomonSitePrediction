@@ -1,0 +1,3 @@
+model,auc
+GLM baseline,NA
+GAM terrain only,NA

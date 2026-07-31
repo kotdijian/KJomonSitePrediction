@@ -1,0 +1,1586 @@
+---
+title: "Kokubunji Jomon Site Prediction: DEM-derived Valley Evaluation"
+author: "Atsushi Noguchi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# 分析方針
+
+本R Markdownは、国分寺市域における縄文時代住居の立地要因を、10mグリッド単位で検討するためのステップバイステップのワークフローである。
+
+本稿では、予備検討で寄与が小さいと判断された `northness` は最初から説明変数に含めない。地形指標としては、標高、傾斜、局所起伏、eastness、複数スケールのTPI、周辺最低標高からの比高、谷底・谷縁辺候補フラグを作成する。GLMおよびGAMによるモデル化は、これらの指標を作成・評価した後、最後に一回だけ実行する。
+
+`presence` は縄文住居が確認されたセル、`absence` は調査済みだが縄文住居が確認されなかったセル、`no_data` は未調査または住居有無が不明なセルとする。`absence` と `no_data` を明確に区別する。
+
+# 0. 初期設定・データ読み込み
+
+## setup
+
+**Description**  
+使用するRパッケージと補助関数を読み込む。ここでは、円形ウィンドウを作成する関数、GeoPackageへの安全な書き出し関数、AUC計算関数を定義する。
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "sf",
+  "terra",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "mgcv",
+  "readr",
+  "broom"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "不足しているパッケージがあります。先にインストールしてください: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(sf)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mgcv)
+library(readr)
+library(broom)
+
+options(stringsAsFactors = FALSE)
+sf::sf_use_s2(FALSE)
+
+# 円形ウィンドウ作成関数
+# radius_m は投影座標系のメートル単位を想定する。
+make_circle_window <- function(r, radius_m) {
+  res_xy <- terra::res(r)
+
+  if (abs(res_xy[1] - res_xy[2]) > 1e-6) {
+    warning("DEMのX方向・Y方向の解像度が異なります。平均解像度で円形近傍を作成します。")
+  }
+
+  res_m <- mean(res_xy)
+  n <- ceiling(radius_m / res_m)
+
+  coords <- expand.grid(
+    x = -n:n,
+    y = -n:n
+  )
+
+  dist_m <- sqrt(coords$x^2 + coords$y^2) * res_m
+
+  matrix(
+    ifelse(dist_m <= radius_m, 1, NA),
+    nrow = 2 * n + 1,
+    ncol = 2 * n + 1,
+    byrow = FALSE
+  )
+}
+
+# GeoPackageへの書き出し補助関数
+write_gpkg_layer_safe <- function(x, dsn, layer) {
+  if (nrow(x) == 0) {
+    message("スキップ: ", layer, " は0件です。")
+    return(invisible(NULL))
+  }
+
+  sf::st_write(
+    x,
+    dsn = dsn,
+    layer = layer,
+    delete_layer = TRUE,
+    quiet = TRUE
+  )
+
+  message("出力: ", layer, " / ", dsn)
+  invisible(NULL)
+}
+
+# rankベースの簡易AUC計算関数
+calc_auc_rank <- function(truth, score) {
+  ok <- !is.na(truth) & !is.na(score)
+  truth <- as.integer(truth[ok])
+  score <- as.numeric(score[ok])
+
+  n_pos <- sum(truth == 1)
+  n_neg <- sum(truth == 0)
+
+  if (n_pos == 0 || n_neg == 0) {
+    return(NA_real_)
+  }
+
+  r <- rank(score, ties.method = "average")
+  auc <- (sum(r[truth == 1]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  as.numeric(auc)
+}
+```
+
+## paths
+
+**Description**  
+入力データのURL、保存先ディレクトリ、ファイルパス、分析パラメータを設定する。GitHub上のファイルは、通常の `blob` URLではなく `raw.githubusercontent.com` のURLを用いる。
+
+```{r paths}
+# GitHub raw URLs
+# 必要に応じて書き換える。
+gpkg_url <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/Kokubunji_Jomon.gpkg"
+dem_url  <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/10mDEM.tif"
+
+# ディレクトリ
+raw_dir <- "data_raw"
+processed_dir <- "data_processed"
+output_dir <- "outputs"
+
+# ファイルパス
+gpkg_path <- file.path(raw_dir, "Kokubunji_Jomon.gpkg")
+dem_path  <- file.path(raw_dir, "10mDEM.tif")
+
+# 再ダウンロードする場合はTRUE
+force_download <- TRUE
+
+# 座標系
+analysis_crs <- 6677
+
+# グリッドサイズ
+cell_size_m <- 10
+
+# absenceとして扱う最小調査面積比率
+# 0より大きければ調査済みとみなす。境界セルはsurveyed_ratioを重みとして扱う。
+surveyed_ratio_min_for_absence <- 0
+
+# 谷底・谷縁辺フラグの初期閾値
+valley_bottom_tpi_threshold <- -1.0
+valley_bottom_relmin_max    <- 2.0
+valley_bottom_slope_max     <- 3.0
+
+valley_edge_dist_max   <- 100
+valley_edge_slope_min  <- 3.0
+valley_edge_relmin_max <- 10.0
+
+# v2谷底フラグ用閾値
+vb_tpi250_threshold <- -1.0
+vb_tpi500_threshold <- -1.0
+vb_rel250_max <- 2.0
+vb_rel500_max <- 3.0
+vb_slope_max <- 3.0
+min_patch_cells <- 30
+
+# ディレクトリ作成
+dir.create(raw_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(processed_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## download-data
+
+**Description**  
+GeoPackageとDEMをダウンロードする。既にローカルにファイルが存在する場合は、`force_download = TRUE` にしない限り再ダウンロードしない。
+
+```{r download-data}
+if (force_download || !file.exists(gpkg_path)) {
+  download.file(gpkg_url, gpkg_path, mode = "wb")
+}
+
+if (force_download || !file.exists(dem_path)) {
+  download.file(dem_url, dem_path, mode = "wb")
+}
+```
+
+## inspect-input-files
+
+**Description**  
+入力ファイルが正しく存在するか、ファイルサイズが極端に小さくないかを確認する。ダウンロード失敗やGitHub URLの誤りを早期に検出する。
+
+```{r inspect-input-files}
+input_files <- tibble::tibble(
+  file = c(gpkg_path, dem_path),
+  exists = file.exists(c(gpkg_path, dem_path)),
+  size_bytes = ifelse(
+    file.exists(c(gpkg_path, dem_path)),
+    file.info(c(gpkg_path, dem_path))$size,
+    NA_real_
+  )
+)
+
+input_files
+
+if (any(!input_files$exists)) {
+  stop("入力ファイルが見つかりません。download-data chunkを確認してください。")
+}
+```
+
+## inspect-gpkg-layers
+
+**Description**  
+GeoPackage内のレイヤ一覧を確認する。ここで、住居ポリゴン、住居ポイント、調査区ポリゴン、市境界レイヤが存在するかを確認する。
+
+```{r inspect-gpkg-layers}
+gpkg_layers <- sf::st_layers(gpkg_path)
+gpkg_layers
+
+available_layers <- gpkg_layers$name
+available_layers
+```
+
+## read-vector-layers
+
+**Description**  
+分析に用いるベクタレイヤを読み込む。調査区レイヤ名は `trench_polygon` を基本とするが、過去の名称 `trenchi_polygon` が残っている場合にも対応する。全レイヤをEPSG:6677へ変換し、ジオメトリを補正する。
+
+```{r read-vector-layers}
+pick_layer <- function(candidates, available) {
+  hit <- candidates[candidates %in% available]
+  if (length(hit) == 0) {
+    stop("候補レイヤが見つかりません: ", paste(candidates, collapse = ", "))
+  }
+  hit[1]
+}
+
+read_layer_required <- function(path, layer, crs = analysis_crs) {
+  x <- sf::st_read(path, layer = layer, quiet = TRUE)
+  x <- sf::st_zm(x, drop = TRUE, what = "ZM")
+  x <- sf::st_make_valid(x)
+  x <- sf::st_transform(x, crs)
+  x
+}
+
+trench_layer <- pick_layer(c("trench_polygon", "trenchi_polygon"), available_layers)
+city_layer <- pick_layer(c("kokubunji_city_boundary"), available_layers)
+
+jdwelling_polygon <- read_layer_required(gpkg_path, "jdwelling_polygon")
+jdwelling_point   <- read_layer_required(gpkg_path, "jdwelling_point")
+trenches          <- read_layer_required(gpkg_path, trench_layer)
+city_boundary     <- read_layer_required(gpkg_path, city_layer)
+
+# 必要に応じて補助レイヤも読み込む。
+if ("kokubunji_city_buffer" %in% available_layers) {
+  city_buffer <- read_layer_required(gpkg_path, "kokubunji_city_buffer")
+}
+
+list(
+  jdwelling_polygon = nrow(jdwelling_polygon),
+  jdwelling_point = nrow(jdwelling_point),
+  trenches = nrow(trenches),
+  city_boundary = nrow(city_boundary)
+)
+```
+
+## read-dem
+
+**Description**  
+DEMを読み込み、座標系を確認する。座標系が未設定の場合はEPSG:6677を付与する。座標系が異なる場合はEPSG:6677へ投影変換する。
+
+```{r read-dem}
+dem <- terra::rast(dem_path)
+
+if (terra::nlyr(dem) > 1) {
+  dem <- dem[[1]]
+}
+
+names(dem) <- "elev"
+
+if (is.na(terra::crs(dem)) || terra::crs(dem) == "") {
+  terra::crs(dem) <- paste0("EPSG:", analysis_crs)
+}
+
+if (!grepl(as.character(analysis_crs), terra::crs(dem))) {
+  dem <- terra::project(dem, paste0("EPSG:", analysis_crs))
+}
+
+dem
+```
+
+# 1. 10mグリッドと住居有無データの作成
+
+## create-grid-10m
+
+**Description**  
+市域境界をもとに10mグリッドを作成する。グリッドは市域で切り抜き、各セルに `grid_id` と面積を付与する。境界部のセルは10m角より小さくなる場合がある。
+
+```{r create-grid-10m}
+city_union <- city_boundary |>
+  sf::st_union() |>
+  sf::st_as_sf() |>
+  sf::st_set_crs(sf::st_crs(city_boundary)) |>
+  sf::st_transform(analysis_crs)
+
+raw_grid <- sf::st_make_grid(
+  city_union,
+  cellsize = cell_size_m,
+  square = TRUE,
+  what = "polygons"
+)
+
+grid10 <- sf::st_sf(
+  grid_id = seq_along(raw_grid),
+  geometry = raw_grid,
+  crs = sf::st_crs(city_union)
+)
+
+grid10 <- suppressWarnings(sf::st_intersection(grid10, city_union)) |>
+  dplyr::mutate(
+    grid_id = dplyr::row_number(),
+    cell_area = as.numeric(sf::st_area(geometry))
+  )
+
+grid10
+sum(grid10$cell_area) / 1e6
+```
+
+## surveyed-area
+
+**Description**  
+調査区ポリゴンと10mグリッドを重ね、各セルの調査済み面積と調査面積比率を算出する。調査済みだが住居が確認されないセルを `absence` とするための基礎情報である。
+
+```{r surveyed-area}
+trench_union <- trenches |>
+  sf::st_union() |>
+  sf::st_as_sf() |>
+  sf::st_set_crs(sf::st_crs(trenches)) |>
+  sf::st_transform(analysis_crs)
+
+survey_int <- suppressWarnings(
+  sf::st_intersection(
+    grid10 |> dplyr::select(grid_id, cell_area),
+    trench_union
+  )
+)
+
+survey_area_tbl <- survey_int |>
+  dplyr::mutate(surveyed_area = as.numeric(sf::st_area(geometry))) |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(grid_id) |>
+  dplyr::summarise(
+    surveyed_area = sum(surveyed_area, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+grid10 <- grid10 |>
+  dplyr::select(-dplyr::any_of(c("surveyed_area", "surveyed_ratio", "surveyed_any", "surveyed_for_absence"))) |>
+  dplyr::left_join(survey_area_tbl, by = "grid_id") |>
+  dplyr::mutate(
+    surveyed_area = dplyr::if_else(is.na(surveyed_area), 0, surveyed_area),
+    surveyed_ratio = pmin(surveyed_area / cell_area, 1),
+    surveyed_any = surveyed_area > 0,
+    surveyed_for_absence = surveyed_ratio > surveyed_ratio_min_for_absence
+  )
+
+summary(grid10$surveyed_ratio)
+table(grid10$surveyed_for_absence)
+```
+
+## dwelling-response
+
+**Description**  
+縄文住居ポリゴンおよび住居代表点を10mグリッドに割り当てる。住居が確認されたセルを `presence = 1` とし、調査済みで住居が確認されないセルを `absence = 0` とする。未調査セルは `NA` として扱う。
+
+```{r dwelling-response}
+# 住居ポリゴンとの重なり面積
+dwelling_poly_int <- suppressWarnings(
+  sf::st_intersection(
+    grid10 |> dplyr::select(grid_id),
+    jdwelling_polygon |> dplyr::select()
+  )
+)
+
+dwelling_area_tbl <- dwelling_poly_int |>
+  dplyr::mutate(dwelling_area = as.numeric(sf::st_area(geometry))) |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(grid_id) |>
+  dplyr::summarise(
+    dwelling_area = sum(dwelling_area, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 住居代表点のセル内件数
+dwelling_point_join <- sf::st_join(
+  jdwelling_point,
+  grid10 |> dplyr::select(grid_id),
+  join = sf::st_intersects,
+  left = FALSE
+)
+
+dwelling_count_tbl <- dwelling_point_join |>
+  sf::st_drop_geometry() |>
+  dplyr::count(grid_id, name = "dwelling_count_pt")
+
+grid10 <- grid10 |>
+  dplyr::select(-dplyr::any_of(c(
+    "dwelling_area",
+    "dwelling_count_pt",
+    "dwelling_presence",
+    "response"
+  ))) |>
+  dplyr::left_join(dwelling_area_tbl, by = "grid_id") |>
+  dplyr::left_join(dwelling_count_tbl, by = "grid_id") |>
+  dplyr::mutate(
+    dwelling_area = dplyr::if_else(is.na(dwelling_area), 0, dwelling_area),
+    dwelling_count_pt = dplyr::if_else(is.na(dwelling_count_pt), 0L, dwelling_count_pt),
+    dwelling_presence = dwelling_area > 0 | dwelling_count_pt > 0,
+    response = dplyr::case_when(
+      dwelling_presence ~ 1L,
+      surveyed_for_absence ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+table(grid10$response, useNA = "ifany")
+```
+
+## check-response-counts
+
+**Description**  
+`presence`、`absence`、`no_data` のセル数を確認する。以後のモデル化では、`presence` と `absence` のみを学習対象とし、`no_data` は予測対象域として残す。
+
+```{r check-response-counts}
+response_summary <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  ) |>
+  dplyr::count(cell_status) |>
+  dplyr::mutate(ratio = n / sum(n))
+
+response_summary
+```
+
+# 2. 基本地形指標の作成
+
+## basic-terrain-indices
+
+**Description**  
+基本地形指標として、標高、傾斜、50m局所起伏、eastnessを作成する。`northness` は予備検討で寄与が小さいと判断されたため、本Rmdでは作成しない。TPIは次章で複数スケールまとめて作成する。
+
+```{r basic-terrain-indices}
+# 傾斜
+slope_r <- terra::terrain(
+  dem,
+  v = "slope",
+  unit = "degrees",
+  neighbors = 8
+)
+names(slope_r) <- "slope_deg"
+
+# 方位からeastnessを算出
+# aspectは北を0度として時計回りに増加するため、sin(aspect)を東西成分とする。
+aspect_r <- terra::terrain(
+  dem,
+  v = "aspect",
+  unit = "degrees",
+  neighbors = 8
+)
+
+aspect_rad <- aspect_r * pi / 180
+eastness <- sin(aspect_rad)
+
+# ほぼ平坦なセルでは方位が不安定なため、eastnessを中立値0にする。
+eastness <- terra::ifel(slope_r < 1, 0, eastness)
+names(eastness) <- "eastness"
+
+# 50m局所起伏 = 50m範囲の最大標高 - 最小標高
+w50 <- make_circle_window(dem, 50)
+
+max_50 <- terra::focal(
+  dem,
+  w = w50,
+  fun = "max",
+  na.policy = "omit",
+  na.rm = TRUE
+)
+
+min_50 <- terra::focal(
+  dem,
+  w = w50,
+  fun = "min",
+  na.policy = "omit",
+  na.rm = TRUE
+)
+
+relief_50m <- max_50 - min_50
+names(relief_50m) <- "relief_50m"
+
+basic_terrain_stack <- c(
+  dem,
+  slope_r,
+  relief_50m,
+  eastness
+)
+
+basic_terrain_stack
+summary(basic_terrain_stack)
+```
+
+## extract-basic-terrain-to-grid
+
+**Description**  
+基本地形指標を10mグリッドの代表点で抽出し、`grid10` に付与する。以後の集計・モデル化は、グリッド単位の属性テーブル上で行う。
+
+```{r extract-basic-terrain-to-grid}
+grid10_pts <- sf::st_point_on_surface(grid10)
+grid10_pts <- sf::st_transform(grid10_pts, analysis_crs)
+
+basic_values <- terra::extract(
+  basic_terrain_stack,
+  terra::vect(grid10_pts),
+  ID = FALSE
+)
+
+grid10 <- grid10 |>
+  dplyr::select(-dplyr::any_of(names(basic_values))) |>
+  dplyr::bind_cols(basic_values)
+
+summary(
+  sf::st_drop_geometry(grid10)[, c(
+    "elev",
+    "slope_deg",
+    "relief_50m",
+    "eastness"
+  )]
+)
+```
+
+## check-basic-terrain-summary
+
+**Description**  
+`presence`、`absence`、`no_data` 別に基本地形指標の概要を確認する。ここではモデル化は行わず、地形指標の分布と欠損値を確認する。
+
+```{r check-basic-terrain-summary}
+basic_summary_by_status <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  ) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    elev_med = median(elev, na.rm = TRUE),
+    slope_med = median(slope_deg, na.rm = TRUE),
+    relief50_med = median(relief_50m, na.rm = TRUE),
+    eastness_med = median(eastness, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+basic_summary_by_status
+```
+
+# 3. 谷地形指標の作成
+
+## valley-terrain-indices
+
+**Description**  
+谷底・谷縁辺をDEMから評価するため、複数スケールのTPIと周辺最低標高からの比高を作成する。TPIは「対象セルの標高 − 周辺平均標高」であり、負の値は周囲より低い位置を示す。`rel_min_*` は周辺最低標高からの相対高度で、谷底に近いセルほど小さくなる。
+
+```{r valley-terrain-indices}
+# 各スケールの円形ウィンドウ
+w50  <- make_circle_window(dem, 50)
+w100 <- make_circle_window(dem, 100)
+w250 <- make_circle_window(dem, 250)
+w500 <- make_circle_window(dem, 500)
+
+# 周辺平均標高
+mean_50 <- terra::focal(dem, w = w50, fun = "mean", na.policy = "omit", na.rm = TRUE)
+mean_100 <- terra::focal(dem, w = w100, fun = "mean", na.policy = "omit", na.rm = TRUE)
+mean_250 <- terra::focal(dem, w = w250, fun = "mean", na.policy = "omit", na.rm = TRUE)
+mean_500 <- terra::focal(dem, w = w500, fun = "mean", na.policy = "omit", na.rm = TRUE)
+
+# TPI: 対象セル標高 − 周辺平均標高
+tpi_50m  <- dem - mean_50
+tpi_100m <- dem - mean_100
+tpi_250m <- dem - mean_250
+tpi_500m <- dem - mean_500
+
+names(tpi_50m)  <- "tpi_50m"
+names(tpi_100m) <- "tpi_100m"
+names(tpi_250m) <- "tpi_250m"
+names(tpi_500m) <- "tpi_500m"
+
+# 周辺最低標高
+min_250 <- terra::focal(dem, w = w250, fun = "min", na.policy = "omit", na.rm = TRUE)
+min_500 <- terra::focal(dem, w = w500, fun = "min", na.policy = "omit", na.rm = TRUE)
+
+# 周辺最低標高からの比高
+rel_min_250m <- dem - min_250
+rel_min_500m <- dem - min_500
+
+names(rel_min_250m) <- "rel_min_250m"
+names(rel_min_500m) <- "rel_min_500m"
+
+terrain_valley_stack <- c(
+  tpi_50m,
+  tpi_100m,
+  tpi_250m,
+  tpi_500m,
+  rel_min_250m,
+  rel_min_500m
+)
+
+terrain_valley_stack
+summary(terrain_valley_stack)
+```
+
+## export-valley-indices-geotiff
+
+**Description**  
+谷地形指標をGeoTIFFとして出力する。QGIS上で住居分布、調査区、DEM陰影、谷線などと重ね合わせ、TPIや比高が実際の谷底・谷縁辺を適切に表しているか確認する。
+
+```{r export-valley-indices-geotiff}
+terra::writeRaster(
+  terrain_valley_stack,
+  filename = file.path(processed_dir, "valley_terrain_indices.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(tpi_50m,  file.path(processed_dir, "tpi_50m.tif"),  overwrite = TRUE, gdal = c("COMPRESS=LZW"))
+terra::writeRaster(tpi_100m, file.path(processed_dir, "tpi_100m.tif"), overwrite = TRUE, gdal = c("COMPRESS=LZW"))
+terra::writeRaster(tpi_250m, file.path(processed_dir, "tpi_250m.tif"), overwrite = TRUE, gdal = c("COMPRESS=LZW"))
+terra::writeRaster(tpi_500m, file.path(processed_dir, "tpi_500m.tif"), overwrite = TRUE, gdal = c("COMPRESS=LZW"))
+terra::writeRaster(rel_min_250m, file.path(processed_dir, "rel_min_250m.tif"), overwrite = TRUE, gdal = c("COMPRESS=LZW"))
+terra::writeRaster(rel_min_500m, file.path(processed_dir, "rel_min_500m.tif"), overwrite = TRUE, gdal = c("COMPRESS=LZW"))
+```
+
+# 4. 谷底・谷縁辺候補 v1 の作成と評価
+
+## valley-flags-v1
+
+**Description**  
+初期定義として、250mスケールのTPI、250m周辺最低標高からの比高、傾斜を用いて谷底候補を抽出する。谷底候補に近く、一定以上の傾斜をもつセルは、従来の「谷斜面候補」ではなく、ここでは `valley_edge_flag_v1` として扱う。これは谷斜面不適地ではなく、谷縁辺・谷近接地形を拾う可能性があるためである。
+
+```{r valley-flags-v1}
+# 谷底候補 v1
+valley_bottom_flag_v1 <- terra::ifel(
+  tpi_250m < valley_bottom_tpi_threshold &
+    rel_min_250m < valley_bottom_relmin_max &
+    slope_r < valley_bottom_slope_max,
+  1,
+  0
+)
+
+names(valley_bottom_flag_v1) <- "valley_bottom_flag_v1"
+
+terra::writeRaster(
+  valley_bottom_flag_v1,
+  file.path(processed_dir, "valley_bottom_flag_v1.tif"),
+  overwrite = TRUE,
+  datatype = "INT1U",
+  gdal = c("COMPRESS=LZW")
+)
+
+# 谷底候補までの距離
+vb_v1_for_distance <- valley_bottom_flag_v1
+vb_v1_for_distance[vb_v1_for_distance == 0] <- NA
+
+dist_valley_bottom_v1 <- terra::distance(vb_v1_for_distance)
+names(dist_valley_bottom_v1) <- "dist_valley_bottom_v1"
+
+# 谷縁辺候補 v1
+valley_edge_flag_v1 <- terra::ifel(
+  dist_valley_bottom_v1 <= valley_edge_dist_max &
+    slope_r >= valley_edge_slope_min &
+    rel_min_250m <= valley_edge_relmin_max &
+    valley_bottom_flag_v1 == 0,
+  1,
+  0
+)
+
+names(valley_edge_flag_v1) <- "valley_edge_flag_v1"
+
+terra::writeRaster(
+  valley_edge_flag_v1,
+  file.path(processed_dir, "valley_edge_flag_v1.tif"),
+  overwrite = TRUE,
+  datatype = "INT1U",
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  dist_valley_bottom_v1,
+  file.path(processed_dir, "dist_valley_bottom_v1.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+valley_flags_v1_stack <- c(
+  valley_bottom_flag_v1,
+  valley_edge_flag_v1,
+  dist_valley_bottom_v1
+)
+
+valley_flags_v1_stack
+```
+
+## extract-valley-indices-to-grid
+
+**Description**  
+谷地形指標とv1フラグを10mグリッドへ抽出する。以後、`presence`、`absence`、`no_data` との重なりをグリッド単位で確認する。
+
+```{r extract-valley-indices-to-grid}
+valley_v1_stack <- c(
+  terrain_valley_stack,
+  valley_flags_v1_stack
+)
+
+valley_v1_values <- terra::extract(
+  valley_v1_stack,
+  terra::vect(grid10_pts),
+  ID = FALSE
+)
+
+grid10 <- grid10 |>
+  dplyr::select(-dplyr::any_of(names(valley_v1_values))) |>
+  dplyr::bind_cols(valley_v1_values) |>
+  dplyr::mutate(
+    valley_bottom_flag_v1 = as.integer(valley_bottom_flag_v1),
+    valley_edge_flag_v1   = as.integer(valley_edge_flag_v1)
+  )
+
+summary(
+  sf::st_drop_geometry(grid10)[, c(
+    "tpi_50m",
+    "tpi_100m",
+    "tpi_250m",
+    "tpi_500m",
+    "rel_min_250m",
+    "rel_min_500m",
+    "valley_bottom_flag_v1",
+    "valley_edge_flag_v1",
+    "dist_valley_bottom_v1"
+  )]
+)
+```
+
+## valley-flag-overlap
+
+**Description**  
+谷底候補・谷縁辺候補が `presence`、`absence`、`no_data` の各区分にどの程度含まれるかを集計する。`no_data` は未知領域であり、住居がないことを意味しないため、統計検定ではなく分布確認として扱う。
+
+```{r valley-flag-overlap}
+grid10_status_v1 <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    ),
+    valley_bottom_flag_v1 = dplyr::if_else(is.na(valley_bottom_flag_v1), 0L, valley_bottom_flag_v1),
+    valley_edge_flag_v1   = dplyr::if_else(is.na(valley_edge_flag_v1), 0L, valley_edge_flag_v1)
+  )
+
+bottom_overlap_v1 <- grid10_status_v1 |>
+  dplyr::count(cell_status, valley_bottom_flag_v1) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::mutate(ratio_in_status = n / sum(n)) |>
+  dplyr::ungroup()
+
+edge_overlap_v1 <- grid10_status_v1 |>
+  dplyr::count(cell_status, valley_edge_flag_v1) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::mutate(ratio_in_status = n / sum(n)) |>
+  dplyr::ungroup()
+
+bottom_overlap_v1
+edge_overlap_v1
+```
+
+## valley-presence-check
+
+**Description**  
+谷底候補・谷縁辺候補が既知の `presence` セルと重なるかを確認する。presenceとの重なりがある場合、そのフラグを一律の除外マスクとして用いることは避ける。
+
+```{r valley-presence-check}
+presence_total_v1 <- grid10_status_v1 |>
+  dplyr::filter(cell_status == "presence") |>
+  nrow()
+
+presence_bottom_overlap_v1_n <- grid10_status_v1 |>
+  dplyr::filter(cell_status == "presence", valley_bottom_flag_v1 == 1) |>
+  nrow()
+
+presence_edge_overlap_v1_n <- grid10_status_v1 |>
+  dplyr::filter(cell_status == "presence", valley_edge_flag_v1 == 1) |>
+  nrow()
+
+cat("presenceセル総数:", presence_total_v1, "\n")
+cat("valley_bottom_flag_v1 と重なるpresenceセル数:", presence_bottom_overlap_v1_n, "\n")
+cat("valley_edge_flag_v1 と重なるpresenceセル数:", presence_edge_overlap_v1_n, "\n")
+cat("valley_bottom_flag_v1 presence重なり率:", presence_bottom_overlap_v1_n / presence_total_v1, "\n")
+cat("valley_edge_flag_v1 presence重なり率:", presence_edge_overlap_v1_n / presence_total_v1, "\n")
+```
+
+## valley-flag-tests
+
+**Description**  
+`presence` と `absence` のみを対象として、谷底候補・谷縁辺候補との関連を確認する。空間データには空間自己相関があるため、p値だけで判断せず、クロス集計、効果量、QGISでの分布確認を併用する。
+
+```{r valley-flag-tests}
+analysis_status_v1 <- grid10_status_v1 |>
+  dplyr::filter(cell_status %in% c("presence", "absence"))
+
+test_flag_association <- function(df, flag_col) {
+  tab <- table(
+    status = factor(df$cell_status, levels = c("absence", "presence")),
+    flag = factor(df[[flag_col]], levels = c(0, 1))
+  )
+
+  print(tab)
+
+  if (!all(dim(tab) == c(2, 2))) {
+    return(list(table = tab, test = NA, phi = NA_real_))
+  }
+
+  if (any(tab < 5)) {
+    test <- fisher.test(tab)
+  } else {
+    test <- chisq.test(tab, correct = FALSE)
+  }
+
+  a <- tab["absence", "0"]
+  b <- tab["absence", "1"]
+  c <- tab["presence", "0"]
+  d <- tab["presence", "1"]
+
+  phi <- as.numeric((a * d - b * c) / sqrt(
+    rowSums(tab)["absence"] *
+      rowSums(tab)["presence"] *
+      colSums(tab)["0"] *
+      colSums(tab)["1"]
+  ))
+
+  list(
+    table = tab,
+    test = test,
+    phi = phi
+  )
+}
+
+bottom_test_v1 <- test_flag_association(analysis_status_v1, "valley_bottom_flag_v1")
+edge_test_v1   <- test_flag_association(analysis_status_v1, "valley_edge_flag_v1")
+
+bottom_test_v1$test
+bottom_test_v1$phi
+
+edge_test_v1$test
+edge_test_v1$phi
+```
+
+## export-valley-flag-review
+
+**Description**  
+谷底候補・谷縁辺候補と `presence`・`absence` が重なるセルをGeoPackageとして出力する。QGISで確認し、フラグが地形的に妥当か、住居セルを誤って不適地として扱っていないかを検討する。
+
+```{r export-valley-flag-review}
+review_gpkg_v1 <- file.path(processed_dir, "valley_flag_review_v1.gpkg")
+if (file.exists(review_gpkg_v1)) unlink(review_gpkg_v1)
+
+presence_bottom_overlap_v1 <- grid10 |>
+  dplyr::filter(!is.na(response), response == 1, valley_bottom_flag_v1 == 1)
+
+presence_edge_overlap_v1 <- grid10 |>
+  dplyr::filter(!is.na(response), response == 1, valley_edge_flag_v1 == 1)
+
+absence_bottom_cells_v1 <- grid10 |>
+  dplyr::filter(!is.na(response), response == 0, valley_bottom_flag_v1 == 1)
+
+absence_edge_cells_v1 <- grid10 |>
+  dplyr::filter(!is.na(response), response == 0, valley_edge_flag_v1 == 1)
+
+write_gpkg_layer_safe(presence_bottom_overlap_v1, review_gpkg_v1, "presence_valley_bottom_overlap_v1")
+write_gpkg_layer_safe(presence_edge_overlap_v1, review_gpkg_v1, "presence_valley_edge_overlap_v1")
+write_gpkg_layer_safe(absence_bottom_cells_v1, review_gpkg_v1, "absence_valley_bottom_cells_v1")
+write_gpkg_layer_safe(absence_edge_cells_v1, review_gpkg_v1, "absence_valley_edge_cells_v1")
+```
+
+# 5. valley_bottom_flag v1 の診断と v2 の作成
+
+## diagnose-valley-bottom-elevation
+
+**Description**  
+`valley_bottom_flag_v1` に高標高セルが含まれる場合、それは「低地」ではなく「局所的な凹地」を拾っている可能性がある。このchunkでは、v1谷底候補の標高分布を確認し、高標高側の谷底候補セルを抽出してQGIS確認用に出力する。
+
+```{r diagnose-valley-bottom-elevation}
+valley_diag_v1 <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  )
+
+valley_bottom_elev_summary_v1 <- valley_diag_v1 |>
+  dplyr::group_by(valley_bottom_flag_v1) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    elev_min = min(elev, na.rm = TRUE),
+    elev_q25 = quantile(elev, 0.25, na.rm = TRUE),
+    elev_med = median(elev, na.rm = TRUE),
+    elev_q75 = quantile(elev, 0.75, na.rm = TRUE),
+    elev_max = max(elev, na.rm = TRUE),
+    tpi250_med = median(tpi_250m, na.rm = TRUE),
+    tpi500_med = median(tpi_500m, na.rm = TRUE),
+    rel250_med = median(rel_min_250m, na.rm = TRUE),
+    rel500_med = median(rel_min_500m, na.rm = TRUE),
+    slope_med = median(slope_deg, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+valley_bottom_elev_summary_v1
+
+vb_v1_elev_q75 <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(valley_bottom_flag_v1 == 1) |>
+  dplyr::summarise(q75 = quantile(elev, 0.75, na.rm = TRUE)) |>
+  dplyr::pull(q75)
+
+high_elev_valley_bottom_v1 <- grid10 |>
+  dplyr::filter(
+    valley_bottom_flag_v1 == 1,
+    elev >= vb_v1_elev_q75
+  )
+
+diagnosis_gpkg_v1 <- file.path(processed_dir, "valley_bottom_diagnosis_v1.gpkg")
+if (file.exists(diagnosis_gpkg_v1)) unlink(diagnosis_gpkg_v1)
+
+write_gpkg_layer_safe(
+  high_elev_valley_bottom_v1,
+  diagnosis_gpkg_v1,
+  "high_elev_valley_bottom_v1"
+)
+
+cat("高標高 valley_bottom_flag_v1 セル数:", nrow(high_elev_valley_bottom_v1), "\n")
+```
+
+## valley-bottom-flag-v2
+
+**Description**  
+v1では250mスケールの局所的な凹地を広く拾う可能性があるため、v2では500mスケールのTPIと周辺最低標高からの比高も条件に加える。ここでは、まだ小規模孤立パッチの除去は行わず、raw版のv2谷底候補を作成する。
+
+```{r valley-bottom-flag-v2}
+valley_bottom_flag_v2_raw <- terra::ifel(
+  tpi_250m < vb_tpi250_threshold &
+    tpi_500m < vb_tpi500_threshold &
+    rel_min_250m < vb_rel250_max &
+    rel_min_500m < vb_rel500_max &
+    slope_r < vb_slope_max,
+  1,
+  0
+)
+
+names(valley_bottom_flag_v2_raw) <- "valley_bottom_flag_v2_raw"
+
+terra::writeRaster(
+  valley_bottom_flag_v2_raw,
+  file.path(processed_dir, "valley_bottom_flag_v2_raw.tif"),
+  overwrite = TRUE,
+  datatype = "INT1U",
+  gdal = c("COMPRESS=LZW")
+)
+
+valley_bottom_flag_v2_raw
+```
+
+## remove-small-valley-bottom-patches
+
+**Description**  
+v2谷底候補のうち、小規模な孤立パッチを除去する。10mグリッドでは30セルが約3000平方メートルに相当する。これはDEMノイズや高位面上の小さな局所凹地を谷底候補から除くための処理である。続いて、v2谷底候補までの距離と谷縁辺候補を作成する。
+
+```{r remove-small-valley-bottom-patches}
+vb_patch_input <- valley_bottom_flag_v2_raw
+vb_patch_input[vb_patch_input == 0] <- NA
+
+vb_patches <- terra::patches(vb_patch_input, directions = 8)
+
+# terra::freq() は terra のバージョンによって引数が異なるため、
+# useNA は指定しない。NA行が返った場合は後で除外する。
+patch_freq_raw <- terra::freq(vb_patches) |>
+  as.data.frame()
+
+# terra::freq() の戻り列は通常 value/count を含む。
+# 環境により layer 列が付く場合があるため、必要列だけを明示的に取り出す。
+if (nrow(patch_freq_raw) > 0 && all(c("value", "count") %in% names(patch_freq_raw))) {
+  patch_freq <- patch_freq_raw |>
+    dplyr::filter(!is.na(.data$value)) |>
+    dplyr::transmute(
+      patch_id = .data$value,
+      cell_count = .data$count
+    )
+} else {
+  patch_freq <- tibble::tibble(
+    patch_id = numeric(0),
+    cell_count = numeric(0)
+  )
+}
+
+valley_bottom_flag_v2 <- valley_bottom_flag_v2_raw
+
+if (nrow(patch_freq) > 0) {
+  small_patch_ids <- patch_freq$patch_id[
+    patch_freq$cell_count < min_patch_cells
+  ]
+
+  if (length(small_patch_ids) > 0) {
+    small_patch_mask <- terra::classify(
+      vb_patches,
+      rcl = cbind(small_patch_ids, 1),
+      others = NA
+    )
+
+    valley_bottom_flag_v2 <- terra::ifel(
+      !is.na(small_patch_mask),
+      0,
+      valley_bottom_flag_v2_raw
+    )
+  }
+}
+
+names(valley_bottom_flag_v2) <- "valley_bottom_flag_v2"
+
+vb_v2_sum <- terra::global(valley_bottom_flag_v2, "sum", na.rm = TRUE)[1, 1]
+
+if (is.na(vb_v2_sum) || vb_v2_sum == 0) {
+  stop("valley_bottom_flag_v2 が0件です。閾値または min_patch_cells を調整してください。")
+}
+
+# v2谷底までの距離
+vb_v2_for_distance <- valley_bottom_flag_v2
+vb_v2_for_distance[vb_v2_for_distance == 0] <- NA
+
+dist_valley_bottom_v2 <- terra::distance(vb_v2_for_distance)
+names(dist_valley_bottom_v2) <- "dist_valley_bottom_v2"
+
+# v2谷縁辺候補
+valley_edge_flag_v2 <- terra::ifel(
+  dist_valley_bottom_v2 <= valley_edge_dist_max &
+    slope_r >= valley_edge_slope_min &
+    rel_min_250m <= valley_edge_relmin_max &
+    valley_bottom_flag_v2 == 0,
+  1,
+  0
+)
+
+names(valley_edge_flag_v2) <- "valley_edge_flag_v2"
+
+terra::writeRaster(
+  valley_bottom_flag_v2,
+  file.path(processed_dir, "valley_bottom_flag_v2.tif"),
+  overwrite = TRUE,
+  datatype = "INT1U",
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  valley_edge_flag_v2,
+  file.path(processed_dir, "valley_edge_flag_v2.tif"),
+  overwrite = TRUE,
+  datatype = "INT1U",
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  dist_valley_bottom_v2,
+  file.path(processed_dir, "dist_valley_bottom_v2.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+valley_flags_v2_stack <- c(
+  valley_bottom_flag_v2,
+  valley_edge_flag_v2,
+  dist_valley_bottom_v2
+)
+
+valley_flags_v2_stack
+```
+
+## extract-valley-v2-to-grid
+
+**Description**  
+v2の谷底候補、谷縁辺候補、谷底からの距離を10mグリッドへ抽出する。最終モデルでは、基本地形指標、谷地形指標、v2フラグを説明変数候補として用いる。
+
+```{r extract-valley-v2-to-grid}
+valley_v2_values <- terra::extract(
+  valley_flags_v2_stack,
+  terra::vect(grid10_pts),
+  ID = FALSE
+)
+
+grid10 <- grid10 |>
+  dplyr::select(-dplyr::any_of(names(valley_v2_values))) |>
+  dplyr::bind_cols(valley_v2_values) |>
+  dplyr::mutate(
+    valley_bottom_flag_v2 = as.integer(valley_bottom_flag_v2),
+    valley_edge_flag_v2   = as.integer(valley_edge_flag_v2)
+  )
+
+summary(
+  sf::st_drop_geometry(grid10)[, c(
+    "valley_bottom_flag_v2",
+    "valley_edge_flag_v2",
+    "dist_valley_bottom_v2"
+  )]
+)
+```
+
+## valley-v2-presence-check
+
+**Description**  
+v2フラグについて、`presence`、`absence`、`no_data` との重なりを確認する。presenceとの重なりがある場合は、除外マスクとしては使わず、説明変数として扱う。
+
+```{r valley-v2-presence-check}
+grid10_status_v2 <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    ),
+    valley_bottom_flag_v2 = dplyr::if_else(is.na(valley_bottom_flag_v2), 0L, valley_bottom_flag_v2),
+    valley_edge_flag_v2   = dplyr::if_else(is.na(valley_edge_flag_v2), 0L, valley_edge_flag_v2)
+  )
+
+bottom_overlap_v2 <- grid10_status_v2 |>
+  dplyr::count(cell_status, valley_bottom_flag_v2) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::mutate(ratio_in_status = n / sum(n)) |>
+  dplyr::ungroup()
+
+edge_overlap_v2 <- grid10_status_v2 |>
+  dplyr::count(cell_status, valley_edge_flag_v2) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::mutate(ratio_in_status = n / sum(n)) |>
+  dplyr::ungroup()
+
+bottom_overlap_v2
+edge_overlap_v2
+
+analysis_status_v2 <- grid10_status_v2 |>
+  dplyr::filter(cell_status %in% c("presence", "absence"))
+
+bottom_test_v2 <- test_flag_association(analysis_status_v2, "valley_bottom_flag_v2")
+edge_test_v2   <- test_flag_association(analysis_status_v2, "valley_edge_flag_v2")
+
+bottom_test_v2$test
+bottom_test_v2$phi
+edge_test_v2$test
+edge_test_v2$phi
+
+presence_total_v2 <- grid10_status_v2 |>
+  dplyr::filter(cell_status == "presence") |>
+  nrow()
+
+presence_bottom_overlap_v2_n <- grid10_status_v2 |>
+  dplyr::filter(cell_status == "presence", valley_bottom_flag_v2 == 1) |>
+  nrow()
+
+presence_edge_overlap_v2_n <- grid10_status_v2 |>
+  dplyr::filter(cell_status == "presence", valley_edge_flag_v2 == 1) |>
+  nrow()
+
+cat("presenceセル総数:", presence_total_v2, "\n")
+cat("valley_bottom_flag_v2 と重なるpresenceセル数:", presence_bottom_overlap_v2_n, "\n")
+cat("valley_edge_flag_v2 と重なるpresenceセル数:", presence_edge_overlap_v2_n, "\n")
+cat("valley_bottom_flag_v2 presence重なり率:", presence_bottom_overlap_v2_n / presence_total_v2, "\n")
+cat("valley_edge_flag_v2 presence重なり率:", presence_edge_overlap_v2_n / presence_total_v2, "\n")
+
+use_valley_bottom_v2_as_mask <- presence_bottom_overlap_v2_n == 0
+use_valley_edge_v2_as_mask <- presence_edge_overlap_v2_n == 0
+
+cat("valley_bottom_flag_v2 を制約マスク候補にできる:", use_valley_bottom_v2_as_mask, "\n")
+cat("valley_edge_flag_v2 を制約マスク候補にできる:", use_valley_edge_v2_as_mask, "\n")
+
+review_gpkg_v2 <- file.path(processed_dir, "valley_flag_review_v2.gpkg")
+if (file.exists(review_gpkg_v2)) unlink(review_gpkg_v2)
+
+write_gpkg_layer_safe(
+  grid10 |> dplyr::filter(!is.na(response), response == 1, valley_bottom_flag_v2 == 1),
+  review_gpkg_v2,
+  "presence_valley_bottom_overlap_v2"
+)
+
+write_gpkg_layer_safe(
+  grid10 |> dplyr::filter(!is.na(response), response == 1, valley_edge_flag_v2 == 1),
+  review_gpkg_v2,
+  "presence_valley_edge_overlap_v2"
+)
+
+write_gpkg_layer_safe(
+  grid10 |> dplyr::filter(!is.na(response), response == 0, valley_bottom_flag_v2 == 1),
+  review_gpkg_v2,
+  "absence_valley_bottom_cells_v2"
+)
+
+write_gpkg_layer_safe(
+  grid10 |> dplyr::filter(!is.na(response), response == 0, valley_edge_flag_v2 == 1),
+  review_gpkg_v2,
+  "absence_valley_edge_cells_v2"
+)
+```
+
+# 6. 最終モデル用データセットの作成
+
+## build-model-table-final
+
+**Description**  
+最終モデルに投入するデータテーブルを作成する。対象は `presence` と `absence` のみで、`no_data` は学習から除外する。`northness` は含めない。谷底・谷縁辺フラグは、制約マスクとしてではなく説明変数として扱う。
+
+```{r build-model-table-final}
+continuous_predictors_final <- c(
+  "elev",
+  "slope_deg",
+  "relief_50m",
+  "eastness",
+  "tpi_50m",
+  "tpi_100m",
+  "tpi_250m",
+  "tpi_500m",
+  "rel_min_250m",
+  "rel_min_500m",
+  "dist_valley_bottom_v2"
+)
+
+factor_predictors_final <- c(
+  "valley_bottom_flag_v2",
+  "valley_edge_flag_v2"
+)
+
+predictors_final <- c(
+  continuous_predictors_final,
+  factor_predictors_final
+)
+
+model_table_final <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(response)) |>
+  dplyr::filter(dplyr::if_all(dplyr::all_of(predictors_final), ~ !is.na(.x))) |>
+  dplyr::mutate(
+    response = as.integer(response),
+    model_weight = dplyr::case_when(
+      response == 1 & surveyed_ratio == 0 ~ 1,
+      TRUE ~ pmax(surveyed_ratio, 0.01)
+    ),
+    valley_bottom_flag_v2 = factor(valley_bottom_flag_v2),
+    valley_edge_flag_v2 = factor(valley_edge_flag_v2)
+  )
+
+nrow(model_table_final)
+table(model_table_final$response)
+summary(model_table_final[, continuous_predictors_final])
+```
+
+# 7. GLM / GAM の検証
+
+## glm-final
+
+**Description**  
+最終変数セットを用いてGLM、すなわちロジスティック回帰を実行する。GLMは効果の方向を把握しやすいが、地形要因の非線形効果は表現しにくい。そのため、次のchunkでGAMも実行する。
+
+```{r glm-final}
+glm_formula_final <- stats::as.formula(
+  paste(
+    "response ~",
+    paste(predictors_final, collapse = " + ")
+  )
+)
+
+glm_final <- stats::glm(
+  glm_formula_final,
+  data = model_table_final,
+  family = binomial(link = "logit"),
+  weights = model_weight
+)
+
+summary(glm_final)
+
+glm_coef_final <- broom::tidy(
+  glm_final,
+  exponentiate = TRUE,
+  conf.int = TRUE
+)
+
+glm_coef_final
+```
+
+## gam-final
+
+**Description**  
+最終変数セットを用いてGAMを実行する。GAMでは、標高、傾斜、TPI、比高、谷底からの距離などの非線形効果を推定できる。`northness` は含めず、`eastness` と谷地形指標を用いる。
+
+```{r gam-final}
+gam_final <- mgcv::gam(
+  response ~
+    s(elev, k = 5) +
+    s(slope_deg, k = 5) +
+    s(relief_50m, k = 5) +
+    s(eastness, k = 5) +
+    s(tpi_50m, k = 5) +
+    s(tpi_100m, k = 5) +
+    s(tpi_250m, k = 5) +
+    s(tpi_500m, k = 5) +
+    s(rel_min_250m, k = 5) +
+    s(rel_min_500m, k = 5) +
+    s(dist_valley_bottom_v2, k = 5) +
+    valley_bottom_flag_v2 +
+    valley_edge_flag_v2,
+  data = model_table_final,
+  weights = model_weight,
+  family = binomial(link = "logit"),
+  method = "REML"
+)
+
+summary(gam_final)
+
+plot(gam_final, pages = 1, shade = TRUE, scale = 0)
+```
+
+## model-validation-final
+
+**Description**  
+GLMとGAMの予測性能を比較する。AIC、Brier score、AUCを算出する。AUCは順位にもとづく簡易計算であり、空間自己相関を考慮した厳密な外部検証ではない。最終報告では、空間ブロック交差検証や遺跡単位ホールドアウトを追加することが望ましい。
+
+```{r model-validation-final}
+model_table_final <- model_table_final |>
+  dplyr::mutate(
+    pred_glm_final = as.numeric(stats::predict(glm_final, newdata = model_table_final, type = "response")),
+    pred_gam_final = as.numeric(stats::predict(gam_final, newdata = model_table_final, type = "response"))
+  )
+
+validation_table <- tibble::tibble(
+  model = c("GLM final", "GAM final"),
+  AIC = c(AIC(glm_final), AIC(gam_final)),
+  brier_score = c(
+    mean((model_table_final$response - model_table_final$pred_glm_final)^2, na.rm = TRUE),
+    mean((model_table_final$response - model_table_final$pred_gam_final)^2, na.rm = TRUE)
+  ),
+  AUC = c(
+    calc_auc_rank(model_table_final$response, model_table_final$pred_glm_final),
+    calc_auc_rank(model_table_final$response, model_table_final$pred_gam_final)
+  )
+)
+
+validation_table
+
+# GAMの基底次元と残差診断
+mgcv::gam.check(gam_final)
+
+# 説明変数間の非線形な重複の目安
+mgcv::concurvity(gam_final, full = TRUE)
+```
+
+# 8. 最終予測と出力
+
+## predict-gam-final
+
+**Description**  
+最終GAMを用いて、10mグリッド全体に予測確率を付与する。`no_data` セルにも地形指標が揃っていれば予測値が与えられる。presenceと重ならないことが確認された谷底フラグのみ、必要に応じて制約マスクとして使う。
+
+```{r predict-gam-final}
+grid10_pred <- grid10
+
+grid10_pred$pred_gam_final <- NA_real_
+
+predict_data_all <- grid10_pred |>
+  sf::st_drop_geometry()
+
+complete_rows_final <- stats::complete.cases(
+  predict_data_all[, predictors_final]
+)
+
+predict_data_complete <- predict_data_all[complete_rows_final, ] |>
+  dplyr::mutate(
+    valley_bottom_flag_v2 = factor(
+      valley_bottom_flag_v2,
+      levels = levels(model_table_final$valley_bottom_flag_v2)
+    ),
+    valley_edge_flag_v2 = factor(
+      valley_edge_flag_v2,
+      levels = levels(model_table_final$valley_edge_flag_v2)
+    )
+  )
+
+grid10_pred$pred_gam_final[complete_rows_final] <- as.numeric(
+  stats::predict(
+    gam_final,
+    newdata = predict_data_complete,
+    type = "response"
+  )
+)
+
+# 制約付き予測。presenceと重ならないフラグのみ使用する。
+grid10_pred$pred_gam_final_constrained <- grid10_pred$pred_gam_final
+
+if (exists("use_valley_bottom_v2_as_mask") && isTRUE(use_valley_bottom_v2_as_mask)) {
+  grid10_pred$pred_gam_final_constrained[
+    grid10_pred$valley_bottom_flag_v2 == 1
+  ] <- 0
+}
+
+# valley_edge_flagはpresenceと重なる可能性が高いため、通常はマスクしない。
+# ただし、presenceと重ならないことが明確な場合のみ下記が実行される。
+if (exists("use_valley_edge_v2_as_mask") && isTRUE(use_valley_edge_v2_as_mask)) {
+  grid10_pred$pred_gam_final_constrained[
+    grid10_pred$valley_edge_flag_v2 == 1
+  ] <- 0
+}
+
+summary(grid10_pred$pred_gam_final)
+summary(grid10_pred$pred_gam_final_constrained)
+```
+
+## export-final-geotiffs
+
+**Description**  
+最終予測確率、制約付き予測確率、谷底・谷縁辺フラグをGeoTIFFとして出力する。QGISでDEM陰影、住居分布、調査区と重ね合わせ、谷底部の過大評価が抑制されているか確認する。
+
+```{r export-final-geotiffs}
+# DEMをテンプレートにして10mグリッド属性をラスタ化する関数
+rasterize_grid_field <- function(grid_sf, template, field_name, out_name, datatype = NULL) {
+  r <- terra::rasterize(
+    terra::vect(sf::st_transform(grid_sf, analysis_crs)),
+    template,
+    field = field_name,
+    touches = TRUE
+  )
+
+  out_path <- file.path(processed_dir, out_name)
+
+  if (is.null(datatype)) {
+    terra::writeRaster(
+      r,
+      out_path,
+      overwrite = TRUE,
+      gdal = c("COMPRESS=LZW")
+    )
+  } else {
+    terra::writeRaster(
+      r,
+      out_path,
+      overwrite = TRUE,
+      datatype = datatype,
+      gdal = c("COMPRESS=LZW")
+    )
+  }
+
+  message("出力: ", out_path)
+  r
+}
+
+pred_gam_final_r <- rasterize_grid_field(
+  grid10_pred,
+  dem,
+  "pred_gam_final",
+  "pred_gam_final_10m.tif"
+)
+
+pred_gam_final_constrained_r <- rasterize_grid_field(
+  grid10_pred,
+  dem,
+  "pred_gam_final_constrained",
+  "pred_gam_final_constrained_10m.tif"
+)
+
+valley_bottom_flag_v2_r <- rasterize_grid_field(
+  grid10_pred,
+  dem,
+  "valley_bottom_flag_v2",
+  "valley_bottom_flag_v2_grid10.tif",
+  datatype = "INT1U"
+)
+
+valley_edge_flag_v2_r <- rasterize_grid_field(
+  grid10_pred,
+  dem,
+  "valley_edge_flag_v2",
+  "valley_edge_flag_v2_grid10.tif",
+  datatype = "INT1U"
+)
+```
+
+## write-results
+
+**Description**  
+最終成果をCSV、RDS、GeoPackageとして保存する。モデル用テーブル、検証指標、10mグリッド属性、最終モデルを保存し、後で再利用できるようにする。
+
+```{r write-results}
+# モデルテーブルと検証結果
+readr::write_csv(
+  model_table_final,
+  file.path(output_dir, "model_table_final.csv")
+)
+
+readr::write_csv(
+  validation_table,
+  file.path(output_dir, "model_validation_final.csv")
+)
+
+readr::write_csv(
+  bottom_overlap_v1,
+  file.path(output_dir, "valley_bottom_overlap_v1.csv")
+)
+
+readr::write_csv(
+  edge_overlap_v1,
+  file.path(output_dir, "valley_edge_overlap_v1.csv")
+)
+
+readr::write_csv(
+  bottom_overlap_v2,
+  file.path(output_dir, "valley_bottom_overlap_v2.csv")
+)
+
+readr::write_csv(
+  edge_overlap_v2,
+  file.path(output_dir, "valley_edge_overlap_v2.csv")
+)
+
+# モデル保存
+saveRDS(glm_final, file.path(output_dir, "glm_final.rds"))
+saveRDS(gam_final, file.path(output_dir, "gam_final.rds"))
+
+# 予測属性付きグリッドをGeoPackageで保存
+grid_gpkg_final <- file.path(output_dir, "grid10_final_prediction.gpkg")
+if (file.exists(grid_gpkg_final)) unlink(grid_gpkg_final)
+
+sf::st_write(
+  grid10_pred,
+  grid_gpkg_final,
+  layer = "grid10_final_prediction",
+  quiet = TRUE
+)
+
+cat("出力完了:\n")
+cat("- ", file.path(output_dir, "model_table_final.csv"), "\n")
+cat("- ", file.path(output_dir, "model_validation_final.csv"), "\n")
+cat("- ", file.path(output_dir, "glm_final.rds"), "\n")
+cat("- ", file.path(output_dir, "gam_final.rds"), "\n")
+cat("- ", grid_gpkg_final, "\n")
+cat("- ", file.path(processed_dir, "pred_gam_final_10m.tif"), "\n")
+cat("- ", file.path(processed_dir, "pred_gam_final_constrained_10m.tif"), "\n")
+```
+
+# 結果解釈のメモ
+
+本Rmdでは、`northness` は予備検討結果に基づき最初から除外した。谷底・谷縁辺については、地形分類図や明治期低湿地データではなく、DEMから一貫して作成した指標を用いた。これは、外部地形分類データと10m DEMとの位置ずれや縮尺差を避けるためである。
+
+`valley_bottom_flag_v1` は、局所的な低まりを広く拾う可能性があるため、高標高セルの混入を診断したうえで、`tpi_500m` と `rel_min_500m` を加えた `valley_bottom_flag_v2` を作成した。`valley_edge_flag` は、住居立地に不適な谷斜面を直接意味するのではなく、谷底に近接する段丘縁辺・谷近接地形を表す可能性があるため、presenceとの重なりを確認したうえで説明変数として扱う。
+
+GLMとGAMは、基本地形指標と谷地形指標をすべて作成・評価した後、最終変数セットに対して一回だけ実行する構成とした。

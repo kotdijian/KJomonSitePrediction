@@ -1,0 +1,1461 @@
+---
+title: "国分寺市縄文住居跡立地予測：地形GAM・谷底補正版"
+author: "Atsushi Noguchi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# 分析方針
+
+本R Markdownは、国分寺市域における縄文時代住居跡の立地を、10mグリッド単位で評価するためのワークフローである。
+
+前段階の検討で、谷底・谷縁辺をGAMの説明変数に直接入れると、モデルが「谷底そのもの」と「谷縁辺・段丘縁辺」を十分に分離できず、谷底に過大な高予測値が出ることが確認された。そのため、この版では以下の方針に変更する。
+
+1. `presence` は縄文住居跡が確認されたセル、`absence` は十分に調査されているが縄文住居跡が確認されなかったセル、`no_data` は未調査または有無不明のセルとする。
+2. `northness` は予備分析で寄与が小さかったため用いない。
+3. GAM本体には、標高・傾斜・起伏・TPI・比高・eastnessのみを入れる。
+4. `valley_bottom_flag_v2` と `valley_edge_flag_v2` は、モデルの説明変数ではなく、診断・後処理レイヤとして扱う。
+5. 谷底は一律に0へマスクせず、まずは減衰係数をかけた「谷底補正済み相対適地スコア」として扱う。
+6. 最終図は、既調査域を含む「存在確率図」ではなく、`no_data` 領域内の相対的な地形適合度・優先度として表示する。
+
+# 0. 初期設定
+
+## setup
+
+使用するパッケージと補助関数を読み込む。
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "sf", "terra", "dplyr", "tidyr", "ggplot2",
+  "mgcv", "readr", "broom", "tibble"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "不足しているパッケージがあります。先にインストールしてください: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(sf)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mgcv)
+library(readr)
+library(broom)
+library(tibble)
+
+options(stringsAsFactors = FALSE)
+sf::sf_use_s2(FALSE)
+
+make_circle_window <- function(r, radius_m) {
+  res_xy <- terra::res(r)
+
+  if (abs(res_xy[1] - res_xy[2]) > 1e-6) {
+    warning("DEMのX方向・Y方向の解像度が異なります。平均解像度で円形近傍を作成します。")
+  }
+
+  res_m <- mean(res_xy)
+  n <- ceiling(radius_m / res_m)
+
+  coords <- expand.grid(
+    x = -n:n,
+    y = -n:n
+  )
+
+  dist_m <- sqrt(coords$x^2 + coords$y^2) * res_m
+
+  matrix(
+    ifelse(dist_m <= radius_m, 1, NA),
+    nrow = 2 * n + 1,
+    ncol = 2 * n + 1,
+    byrow = FALSE
+  )
+}
+
+write_gpkg_layer_safe <- function(x, dsn, layer) {
+  dir.create(dirname(dsn), showWarnings = FALSE, recursive = TRUE)
+
+  if (nrow(x) == 0) {
+    message("スキップ: ", layer, " は0件です。")
+    return(invisible(NULL))
+  }
+
+  x <- sf::st_make_valid(x)
+
+  sf::st_write(
+    x,
+    dsn = dsn,
+    layer = layer,
+    driver = "GPKG",
+    delete_layer = TRUE,
+    quiet = TRUE
+  )
+
+  message("出力: ", layer, " / ", dsn)
+  invisible(NULL)
+}
+
+calc_auc_rank <- function(truth, score) {
+  ok <- !is.na(truth) & !is.na(score)
+  truth <- as.integer(truth[ok])
+  score <- as.numeric(score[ok])
+
+  n_pos <- sum(truth == 1)
+  n_neg <- sum(truth == 0)
+
+  if (n_pos == 0 || n_neg == 0) {
+    return(NA_real_)
+  }
+
+  r <- rank(score, ties.method = "average")
+  auc <- (sum(r[truth == 1]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  as.numeric(auc)
+}
+```
+
+## paths
+
+入力データ、出力先、分析パラメータを設定する。
+
+```{r paths}
+gpkg_url <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/Kokubunji_Jomon.gpkg"
+dem_url  <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/10mDEM.tif"
+
+raw_dir <- "data_raw"
+processed_dir <- "data_processed"
+output_dir <- "outputs"
+
+# 自己相関分析用Rmdで processed_dir が上書きされる事故を避けるため、地形GAM用に明示する。
+terrain_processed_dir <- processed_dir
+
+gpkg_path <- file.path(raw_dir, "Kokubunji_Jomon.gpkg")
+dem_path  <- file.path(raw_dir, "10mDEM.tif")
+
+force_download <- FALSE
+analysis_crs <- 6677
+cell_size_m <- 10
+
+# absenceとして扱う最小調査面積比率。
+# 0では境界にわずかにかかったセルまでabsenceになるため、この版では0.25を初期値とする。
+surveyed_ratio_min_for_absence <- 0.25
+
+# 谷底・谷縁辺候補抽出パラメータ。
+vb_tpi250_threshold <- -1.0
+vb_tpi500_threshold <- -1.0
+vb_rel250_max <- 2.0
+vb_rel500_max <- 3.0
+vb_slope_max <- 3.0
+min_patch_cells <- 30
+
+valley_edge_dist_max <- 100
+valley_edge_slope_min <- 3.0
+valley_edge_relmin_max <- 10.0
+
+# 谷底補正係数。0にしないことで、既知presenceと重なる谷底候補を完全除外しない。
+valley_bottom_penalty_factor <- 0.20
+
+# 最終分類用分位。
+nodata_class_probs <- c(0.80, 0.90, 0.95, 0.99)
+
+dir.create(raw_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(processed_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(terrain_processed_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# 1. データ読み込み
+
+## download-data
+
+GeoPackageとDEMをダウンロードする。
+
+```{r download-data}
+if (force_download || !file.exists(gpkg_path)) {
+  download.file(gpkg_url, gpkg_path, mode = "wb")
+}
+
+if (force_download || !file.exists(dem_path)) {
+  download.file(dem_url, dem_path, mode = "wb")
+}
+```
+
+## inspect-input-files
+
+入力ファイルの存在とサイズを確認する。
+
+```{r inspect-input-files}
+input_files <- tibble::tibble(
+  file = c(gpkg_path, dem_path),
+  exists = file.exists(c(gpkg_path, dem_path)),
+  size_bytes = ifelse(
+    file.exists(c(gpkg_path, dem_path)),
+    file.info(c(gpkg_path, dem_path))$size,
+    NA_real_
+  )
+)
+
+input_files
+
+if (any(!input_files$exists)) {
+  stop("入力ファイルが見つかりません。download-data chunkを確認してください。")
+}
+```
+
+## inspect-gpkg-layers
+
+GeoPackage内のレイヤ名を確認する。
+
+```{r inspect-gpkg-layers}
+gpkg_layers <- sf::st_layers(gpkg_path)
+gpkg_layers
+
+available_layers <- gpkg_layers$name
+available_layers
+```
+
+## read-vector-layers
+
+住居跡、調査区、市境界を読み込む。
+
+```{r read-vector-layers}
+pick_layer <- function(candidates, available) {
+  hit <- candidates[candidates %in% available]
+  if (length(hit) == 0) {
+    stop("候補レイヤが見つかりません: ", paste(candidates, collapse = ", "))
+  }
+  hit[1]
+}
+
+read_layer_required <- function(path, layer, crs = analysis_crs) {
+  x <- sf::st_read(path, layer = layer, quiet = TRUE)
+  x <- sf::st_zm(x, drop = TRUE, what = "ZM")
+  x <- sf::st_make_valid(x)
+  x <- sf::st_transform(x, crs)
+  x
+}
+
+trench_layer <- pick_layer(c("trench_polygon", "trenchi_polygon"), available_layers)
+city_layer <- pick_layer("kokubunji_city_boundary", available_layers)
+
+jdwelling_polygon <- read_layer_required(gpkg_path, "jdwelling_polygon")
+jdwelling_point <- read_layer_required(gpkg_path, "jdwelling_point")
+trench_polygon <- read_layer_required(gpkg_path, trench_layer)
+city_boundary <- read_layer_required(gpkg_path, city_layer)
+
+list(
+  dwelling_polygon_n = nrow(jdwelling_polygon),
+  dwelling_point_n = nrow(jdwelling_point),
+  trench_n = nrow(trench_polygon),
+  city_boundary_n = nrow(city_boundary)
+)
+```
+
+## read-dem
+
+DEMを読み込み、分析範囲に切り出す。
+
+```{r read-dem}
+dem <- terra::rast(dem_path)
+
+if (is.na(terra::crs(dem))) {
+  terra::crs(dem) <- paste0("EPSG:", analysis_crs)
+}
+
+city_vect <- terra::vect(city_boundary)
+dem_city <- terra::crop(dem, city_vect)
+dem_city <- terra::mask(dem_city, city_vect)
+names(dem_city) <- "elev"
+
+dem_city
+terra::res(dem_city)
+terra::crs(dem_city)
+```
+
+# 2. 10mグリッドと目的変数
+
+## create-grid-10m
+
+DEMセルに対応する10mグリッドを作成する。
+
+```{r create-grid-10m}
+grid10 <- terra::as.polygons(
+  dem_city,
+  values = FALSE,
+  na.rm = TRUE
+) |>
+  sf::st_as_sf() |>
+  sf::st_make_valid() |>
+  sf::st_transform(analysis_crs)
+
+grid10 <- grid10 |>
+  dplyr::mutate(
+    grid_id = dplyr::row_number()
+  )
+
+grid10$cell_area_m2 <- as.numeric(sf::st_area(grid10))
+
+grid10 <- grid10 |>
+  dplyr::select(grid_id, cell_area_m2, geometry)
+
+grid10
+```
+
+## surveyed-area
+
+調査区ポリゴンとの交差面積から、各グリッドセルの調査済み面積比率を計算する。
+
+```{r surveyed-area, message=FALSE, warning=FALSE}
+trench_union_geom <- sf::st_union(
+  sf::st_geometry(sf::st_make_valid(trench_polygon))
+)
+
+trench_union <- sf::st_sf(
+  geometry = trench_union_geom
+)
+
+sf::st_crs(trench_union) <- sf::st_crs(grid10)
+
+survey_intersections <- suppressWarnings(
+  sf::st_intersection(
+    grid10 |> dplyr::select(grid_id),
+    trench_union
+  )
+)
+
+survey_intersections$surveyed_area_m2 <- as.numeric(sf::st_area(survey_intersections))
+
+survey_area_by_grid <- survey_intersections |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(grid_id) |>
+  dplyr::summarise(
+    surveyed_area_m2 = sum(surveyed_area_m2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+grid10 <- grid10 |>
+  dplyr::left_join(survey_area_by_grid, by = "grid_id") |>
+  dplyr::mutate(
+    surveyed_area_m2 = tidyr::replace_na(surveyed_area_m2, 0),
+    surveyed_ratio = pmin(surveyed_area_m2 / cell_area_m2, 1),
+    surveyed_flag = surveyed_ratio >= surveyed_ratio_min_for_absence
+  )
+
+grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    surveyed_cells = sum(surveyed_flag, na.rm = TRUE),
+    surveyed_ratio_min = min(surveyed_ratio, na.rm = TRUE),
+    surveyed_ratio_med = median(surveyed_ratio, na.rm = TRUE),
+    surveyed_ratio_max = max(surveyed_ratio, na.rm = TRUE)
+  )
+```
+
+## dwelling-response
+
+住居跡ポリゴンと重なるセルを `presence = 1` とし、十分に調査済みで住居跡がないセルを `absence = 0` とする。
+
+```{r dwelling-response}
+dwelling_union_geom <- sf::st_union(
+  sf::st_geometry(sf::st_make_valid(jdwelling_polygon))
+)
+
+dwelling_union <- sf::st_sf(
+  geometry = dwelling_union_geom
+)
+
+sf::st_crs(dwelling_union) <- sf::st_crs(grid10)
+
+dwelling_hit <- lengths(sf::st_intersects(grid10, dwelling_union)) > 0
+
+grid10 <- grid10 |>
+  dplyr::mutate(
+    dwelling_presence = as.integer(dwelling_hit),
+    response = dplyr::case_when(
+      dwelling_presence == 1 ~ 1L,
+      dwelling_presence == 0 & surveyed_flag ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(response) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    dwelling_presence_n = sum(dwelling_presence, na.rm = TRUE),
+    surveyed_ratio_med = median(surveyed_ratio, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## export-response-check
+
+presence / absence / no_data の確認用レイヤを書き出す。
+
+```{r export-response-check}
+response_check_gpkg <- file.path(terrain_processed_dir, "response_grid_check.gpkg")
+
+response_grid_out <- grid10 |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  ) |>
+  dplyr::select(
+    grid_id, cell_status, response, dwelling_presence,
+    surveyed_ratio, surveyed_area_m2, cell_area_m2
+  )
+
+write_gpkg_layer_safe(
+  response_grid_out,
+  response_check_gpkg,
+  "response_grid"
+)
+```
+
+# 3. 地形指標
+
+## basic-terrain-indices
+
+標高、傾斜、局所起伏、eastnessを作成する。eastnessは、東向き斜面を正、西向き斜面を負とする。
+
+```{r basic-terrain-indices}
+slope_r <- terra::terrain(dem_city, v = "slope", unit = "degrees")
+aspect_r <- terra::terrain(dem_city, v = "aspect", unit = "degrees")
+
+names(slope_r) <- "slope_deg"
+names(aspect_r) <- "aspect_deg"
+
+eastness_r <- sin(aspect_r * pi / 180)
+eastness_r <- terra::ifel(slope_r < 1, 0, eastness_r)
+names(eastness_r) <- "eastness"
+
+w50 <- make_circle_window(dem_city, 50)
+relief_50m <- terra::focal(dem_city, w = w50, fun = max, na.rm = TRUE) -
+  terra::focal(dem_city, w = w50, fun = min, na.rm = TRUE)
+names(relief_50m) <- "relief_50m"
+
+basic_terrain_stack <- c(dem_city, slope_r, eastness_r, relief_50m)
+basic_terrain_stack
+```
+
+## valley-terrain-indices
+
+谷底・谷縁辺評価用に、複数スケールのTPIと周辺最低標高からの比高を作成する。
+
+```{r valley-terrain-indices}
+w100 <- make_circle_window(dem_city, 100)
+w250 <- make_circle_window(dem_city, 250)
+w500 <- make_circle_window(dem_city, 500)
+
+tpi_100m <- dem_city - terra::focal(dem_city, w = w100, fun = mean, na.rm = TRUE)
+tpi_250m <- dem_city - terra::focal(dem_city, w = w250, fun = mean, na.rm = TRUE)
+tpi_500m <- dem_city - terra::focal(dem_city, w = w500, fun = mean, na.rm = TRUE)
+
+names(tpi_100m) <- "tpi_100m"
+names(tpi_250m) <- "tpi_250m"
+names(tpi_500m) <- "tpi_500m"
+
+rel_min_250m <- dem_city - terra::focal(dem_city, w = w250, fun = min, na.rm = TRUE)
+rel_min_500m <- dem_city - terra::focal(dem_city, w = w500, fun = min, na.rm = TRUE)
+
+names(rel_min_250m) <- "rel_min_250m"
+names(rel_min_500m) <- "rel_min_500m"
+
+valley_index_stack <- c(
+  tpi_100m,
+  tpi_250m,
+  tpi_500m,
+  rel_min_250m,
+  rel_min_500m
+)
+
+valley_index_stack
+```
+
+## export-terrain-indices-geotiff
+
+作成した地形指標をGeoTIFFとして書き出す。
+
+```{r export-terrain-indices-geotiff}
+terrain_index_stack <- c(basic_terrain_stack, valley_index_stack)
+
+terrain_index_path <- file.path(terrain_processed_dir, "terrain_indices_10m.tif")
+
+terra::writeRaster(
+  terrain_index_stack,
+  terrain_index_path,
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+cat("出力:", terrain_index_path, "\n")
+```
+
+## extract-terrain-to-grid
+
+地形指標を10mグリッドに付与する。
+
+```{r extract-terrain-to-grid}
+grid10_points <- sf::st_point_on_surface(grid10)
+
+terrain_values <- terra::extract(
+  terrain_index_stack,
+  terra::vect(grid10_points)
+)
+
+terrain_values <- terrain_values |>
+  dplyr::select(-ID)
+
+grid10 <- dplyr::bind_cols(grid10, terrain_values)
+
+grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::select(
+    elev, slope_deg, relief_50m, eastness,
+    tpi_100m, tpi_250m, tpi_500m,
+    rel_min_250m, rel_min_500m
+  ) |>
+  summary()
+```
+
+# 4. 谷底・谷縁辺フラグの作成と診断
+
+## valley-bottom-flag-v2
+
+谷底候補を、TPI、比高、傾斜の組み合わせで抽出する。ここでのフラグはGAMの説明変数には入れず、診断と後処理に用いる。
+
+```{r valley-bottom-flag-v2}
+valley_bottom_flag_v2_raw <- terra::ifel(
+  tpi_250m < vb_tpi250_threshold &
+    tpi_500m < vb_tpi500_threshold &
+    rel_min_250m < vb_rel250_max &
+    rel_min_500m < vb_rel500_max &
+    slope_r < vb_slope_max,
+  1,
+  0
+)
+
+names(valley_bottom_flag_v2_raw) <- "valley_bottom_flag_v2_raw"
+
+valley_bottom_flag_v2_raw
+```
+
+## remove-small-valley-bottom-patches
+
+小さな孤立パッチを除外する。
+
+```{r remove-small-valley-bottom-patches}
+vb_patch_input <- valley_bottom_flag_v2_raw
+vb_patch_input[vb_patch_input == 0] <- NA
+
+vb_patches <- terra::patches(vb_patch_input, directions = 8)
+
+patch_freq_raw <- terra::freq(vb_patches) |>
+  as.data.frame()
+
+if (nrow(patch_freq_raw) > 0 && all(c("value", "count") %in% names(patch_freq_raw))) {
+  patch_freq <- patch_freq_raw |>
+    dplyr::filter(!is.na(.data$value)) |>
+    dplyr::transmute(
+      patch_id = .data$value,
+      cell_count = .data$count
+    )
+} else {
+  patch_freq <- tibble::tibble(
+    patch_id = numeric(0),
+    cell_count = numeric(0)
+  )
+}
+
+valley_bottom_flag_v2 <- valley_bottom_flag_v2_raw
+
+if (nrow(patch_freq) > 0) {
+  small_patch_ids <- patch_freq$patch_id[patch_freq$cell_count < min_patch_cells]
+
+  if (length(small_patch_ids) > 0) {
+    small_patch_mask <- terra::ifel(vb_patches %in% small_patch_ids, 1, NA)
+    valley_bottom_flag_v2 <- terra::ifel(
+      !is.na(small_patch_mask),
+      0,
+      valley_bottom_flag_v2_raw
+    )
+  }
+}
+
+names(valley_bottom_flag_v2) <- "valley_bottom_flag_v2"
+
+patch_freq |>
+  dplyr::arrange(dplyr::desc(cell_count)) |>
+  dplyr::slice_head(n = 20)
+```
+
+## valley-edge-flag-v2
+
+谷底候補からの距離、傾斜、比高に基づき、谷縁辺候補を作成する。
+
+```{r valley-edge-flag-v2}
+vb_for_distance <- valley_bottom_flag_v2
+vb_for_distance[vb_for_distance == 0] <- NA
+
+dist_valley_bottom_v2 <- terra::distance(vb_for_distance)
+names(dist_valley_bottom_v2) <- "dist_valley_bottom_v2"
+
+valley_edge_flag_v2 <- terra::ifel(
+  dist_valley_bottom_v2 <= valley_edge_dist_max &
+    slope_r >= valley_edge_slope_min &
+    rel_min_500m <= valley_edge_relmin_max &
+    valley_bottom_flag_v2 == 0,
+  1,
+  0
+)
+
+names(valley_edge_flag_v2) <- "valley_edge_flag_v2"
+
+valley_flag_stack <- c(
+  valley_bottom_flag_v2,
+  dist_valley_bottom_v2,
+  valley_edge_flag_v2
+)
+
+valley_flag_stack
+```
+
+## export-valley-flags-geotiff
+
+谷底・谷縁辺候補フラグをGeoTIFFとして書き出す。
+
+```{r export-valley-flags-geotiff}
+valley_flags_path <- file.path(terrain_processed_dir, "valley_flags_v2_10m.tif")
+
+terra::writeRaster(
+  valley_flag_stack,
+  valley_flags_path,
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+cat("出力:", valley_flags_path, "\n")
+```
+
+## extract-valley-flags-to-grid
+
+谷底・谷縁辺候補フラグを10mグリッドへ付与する。
+
+```{r extract-valley-flags-to-grid}
+valley_flag_values <- terra::extract(
+  valley_flag_stack,
+  terra::vect(grid10_points)
+)
+
+valley_flag_values <- valley_flag_values |>
+  dplyr::select(-ID)
+
+grid10 <- dplyr::bind_cols(grid10, valley_flag_values)
+
+grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  ) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    valley_bottom_ratio = mean(valley_bottom_flag_v2 == 1, na.rm = TRUE),
+    valley_edge_ratio = mean(valley_edge_flag_v2 == 1, na.rm = TRUE),
+    dist_valley_bottom_med = median(dist_valley_bottom_v2, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## valley-flag-overlap-tests
+
+presence / absence と谷底・谷縁辺フラグの重なりを確認する。
+
+```{r valley-flag-overlap-tests}
+model_status_for_flags <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(response)) |>
+  dplyr::mutate(
+    status = dplyr::if_else(response == 1, "presence", "absence")
+  )
+
+bottom_table <- table(
+  status = model_status_for_flags$status,
+  valley_bottom = model_status_for_flags$valley_bottom_flag_v2
+)
+
+edge_table <- table(
+  status = model_status_for_flags$status,
+  valley_edge = model_status_for_flags$valley_edge_flag_v2
+)
+
+bottom_table
+edge_table
+
+if (all(dim(bottom_table) == c(2, 2))) {
+  print(fisher.test(bottom_table))
+}
+
+if (all(dim(edge_table) == c(2, 2))) {
+  print(chisq.test(edge_table))
+}
+```
+
+# 5. モデル用データセット
+
+## build-model-table-final
+
+GAMに投入する表を作成する。谷底・谷縁辺フラグは、モデルの説明変数には含めず、診断用に保持する。
+
+```{r build-model-table-final}
+model_vars <- c(
+  "response",
+  "surveyed_ratio",
+  "elev",
+  "slope_deg",
+  "relief_50m",
+  "tpi_100m",
+  "tpi_500m",
+  "rel_min_500m",
+  "eastness",
+  "valley_bottom_flag_v2",
+  "valley_edge_flag_v2",
+  "dist_valley_bottom_v2"
+)
+
+model_table_final <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::select(dplyr::all_of(model_vars)) |>
+  dplyr::filter(!is.na(response)) |>
+  tidyr::drop_na(
+    elev, slope_deg, relief_50m,
+    tpi_100m, tpi_500m, rel_min_500m,
+    eastness
+  ) |>
+  dplyr::mutate(
+    response = as.integer(response),
+    model_weight = dplyr::case_when(
+      response == 1 ~ 1,
+      TRUE ~ pmin(pmax(surveyed_ratio, surveyed_ratio_min_for_absence), 1)
+    )
+  )
+
+model_table_final |>
+  dplyr::group_by(response) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    weight_med = median(model_weight, na.rm = TRUE),
+    elev_med = median(elev, na.rm = TRUE),
+    slope_med = median(slope_deg, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## check-predictor-ranges
+
+学習データと全グリッドの値域を比較し、no_data領域への外挿リスクを確認する。
+
+```{r check-predictor-ranges}
+predictor_vars_terrain_only <- c(
+  "elev",
+  "slope_deg",
+  "relief_50m",
+  "tpi_100m",
+  "tpi_500m",
+  "rel_min_500m",
+  "eastness"
+)
+
+range_table <- function(df, vars, prefix) {
+  dplyr::bind_rows(lapply(vars, function(v) {
+    tibble::tibble(
+      variable = v,
+      min_value = min(df[[v]], na.rm = TRUE),
+      max_value = max(df[[v]], na.rm = TRUE)
+    ) |>
+      dplyr::rename(
+        !!paste0(prefix, "_min") := min_value,
+        !!paste0(prefix, "_max") := max_value
+      )
+  }))
+}
+
+training_ranges <- range_table(
+  model_table_final,
+  predictor_vars_terrain_only,
+  "train"
+)
+
+all_ranges <- range_table(
+  sf::st_drop_geometry(grid10),
+  predictor_vars_terrain_only,
+  "all"
+)
+
+range_check <- training_ranges |>
+  dplyr::left_join(all_ranges, by = "variable") |>
+  dplyr::mutate(
+    lower_extrapolation = all_min < train_min,
+    upper_extrapolation = all_max > train_max
+  )
+
+range_check
+```
+
+# 6. 地形GAM
+
+## glm-baseline
+
+比較用にGLMを作成する。
+
+```{r glm-baseline}
+glm_baseline <- glm(
+  response ~
+    elev +
+    slope_deg +
+    relief_50m +
+    tpi_100m +
+    tpi_500m +
+    rel_min_500m +
+    eastness,
+  data = model_table_final,
+  weights = model_weight,
+  family = binomial(link = "logit")
+)
+
+summary(glm_baseline)
+```
+
+## gam-final-terrain-only
+
+谷底・谷縁辺フラグを説明変数に入れず、地形指標のみでGAMを作成する。過剰な曲がりを抑えるため、`k = 4`、`select = TRUE`、`gamma = 1.6` を用いる。
+
+```{r gam-final-terrain-only}
+terrain_vars <- c(
+  "elev",
+  "slope_deg",
+  "relief_50m",
+  "tpi_100m",
+  "tpi_500m",
+  "rel_min_500m",
+  "eastness"
+)
+
+model_table_terrain <- model_table_final |>
+  dplyr::select(
+    response,
+    surveyed_ratio,
+    dplyr::all_of(terrain_vars)
+  ) |>
+  dplyr::filter(
+    !is.na(response),
+    dplyr::if_all(
+      dplyr::all_of(terrain_vars),
+      ~ !is.na(.x) & is.finite(.x)
+    )
+  ) |>
+  dplyr::mutate(
+    response = as.integer(response),
+    w_survey = pmax(surveyed_ratio, 0.01)
+  )
+
+unique_counts <- vapply(
+  model_table_terrain[terrain_vars],
+  function(x) {
+    x <- x[is.finite(x)]
+    length(unique(x))
+  },
+  integer(1)
+)
+
+print(unique_counts)
+
+smooth_vars <- names(unique_counts[unique_counts >= 5])
+linear_vars <- names(unique_counts[unique_counts >= 2 & unique_counts < 5])
+dropped_vars <- names(unique_counts[unique_counts < 2])
+
+cat("smooth項として使用:", paste(smooth_vars, collapse = ", "), "\n")
+cat("線形項として使用:", paste(linear_vars, collapse = ", "), "\n")
+cat("除外:", paste(dropped_vars, collapse = ", "), "\n")
+
+gam_terms <- c(
+  paste0("s(", smooth_vars, ", k = 4)"),
+  linear_vars
+)
+
+if (length(gam_terms) == 0) {
+  stop("GAMに使用できる説明変数がありません。地形指標の抽出結果を確認してください。")
+}
+
+terrain_vars_used <- c(smooth_vars, linear_vars)
+
+gam_formula <- as.formula(
+  paste("response ~", paste(gam_terms, collapse = " + "))
+)
+
+print(gam_formula)
+
+gam_final_terrain_only <- mgcv::gam(
+  formula = gam_formula,
+  data = model_table_terrain,
+  weights = w_survey,
+  family = binomial(link = "logit"),
+  method = "REML",
+  select = TRUE,
+  gamma = 1.6
+)
+
+summary(gam_final_terrain_only)
+```
+
+## gam-concurvity
+
+GAM項間の非線形共線性を確認する。
+
+```{r gam-concurvity}
+# 実際にGAMモデル内に残っているsmooth項を確認
+smooth_labels <- vapply(
+  gam_final_terrain_only$smooth,
+  function(x) x$label,
+  character(1)
+)
+
+cat("GAM内のsmooth項:\n")
+print(smooth_labels)
+
+# concurvityは診断用。モデル構造によって失敗することがあるため安全に実行する。
+if (length(smooth_labels) >= 2) {
+
+  concurvity_result <- tryCatch(
+    {
+      mgcv::concurvity(
+        gam_final_terrain_only,
+        full = TRUE
+      )
+    },
+    error = function(e) {
+      message("concurvity(full = TRUE) は失敗しました: ", e$message)
+      message("full = FALSE で再試行します。")
+
+      tryCatch(
+        {
+          mgcv::concurvity(
+            gam_final_terrain_only,
+            full = FALSE
+          )
+        },
+        error = function(e2) {
+          message("concurvity(full = FALSE) も失敗しました: ", e2$message)
+          NULL
+        }
+      )
+    }
+  )
+
+  if (!is.null(concurvity_result)) {
+    print(concurvity_result)
+  } else {
+    cat("concurvity診断はスキップしました。\n")
+  }
+
+} else {
+  cat("smooth項が2未満のため、concurvity診断はスキップします。\n")
+}
+
+# 代替診断：使用変数間の通常の相関
+# concurvityが失敗した場合でも、強い共線性の目安として確認する。
+cor_vars <- intersect(
+  terrain_vars_used,
+  names(model_table_terrain)
+)
+
+if (length(cor_vars) >= 2) {
+  cor_matrix <- model_table_terrain |>
+    dplyr::select(dplyr::all_of(cor_vars)) |>
+    stats::cor(
+      use = "pairwise.complete.obs",
+      method = "spearman"
+    )
+
+  print(round(cor_matrix, 3))
+} else {
+  cat("相関行列を作成できる変数が2未満です。\n")
+}
+
+if (exists("gam_final_simplified")) {
+  print(AIC(gam_final_simplified, gam_final_terrain_only))
+} else {
+  print(AIC(gam_final_terrain_only))
+}
+```
+
+## model-validation-final
+
+学習データ上のAUCと、presence / absence別の予測値分布を確認する。
+
+```{r model-validation-final}
+model_table_final <- model_table_final |>
+  dplyr::mutate(
+    pred_glm_baseline = as.numeric(
+      predict(glm_baseline, newdata = model_table_final, type = "response")
+    ),
+    pred_gam_terrain_only = as.numeric(
+      predict(gam_final_terrain_only, newdata = model_table_final, type = "response")
+    )
+  )
+
+validation_summary <- tibble::tibble(
+  model = c("GLM baseline", "GAM terrain only"),
+  auc = c(
+    calc_auc_rank(model_table_final$response, model_table_final$pred_glm_baseline),
+    calc_auc_rank(model_table_final$response, model_table_final$pred_gam_terrain_only)
+  )
+)
+
+validation_summary
+
+model_table_final |>
+  dplyr::group_by(response) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    pred_min = min(pred_gam_terrain_only, na.rm = TRUE),
+    pred_q25 = quantile(pred_gam_terrain_only, 0.25, na.rm = TRUE),
+    pred_med = median(pred_gam_terrain_only, na.rm = TRUE),
+    pred_q75 = quantile(pred_gam_terrain_only, 0.75, na.rm = TRUE),
+    pred_q95 = quantile(pred_gam_terrain_only, 0.95, na.rm = TRUE),
+    pred_q99 = quantile(pred_gam_terrain_only, 0.99, na.rm = TRUE),
+    pred_max = max(pred_gam_terrain_only, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+# 7. 全域予測と谷底補正
+
+## predict-gam-terrain-only
+
+市域全体に対して、地形GAMを適用する。ここでの値は既調査域にも入るが、これはモデル評価のためであり、最終表示では `no_data` のみに限定する。
+
+```{r predict-gam-terrain-only}
+grid10_pred <- grid10
+
+grid10_pred$pred_gam_terrain_only <- NA_real_
+
+grid10_pred_for_predict <- grid10_pred |>
+  sf::st_drop_geometry()
+
+complete_rows <- complete.cases(
+  grid10_pred_for_predict[, predictor_vars_terrain_only]
+)
+
+grid10_pred$pred_gam_terrain_only[complete_rows] <- as.numeric(
+  predict(
+    gam_final_terrain_only,
+    newdata = grid10_pred_for_predict[complete_rows, ],
+    type = "response"
+  )
+)
+
+grid10_pred |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  ) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    pred_min = min(pred_gam_terrain_only, na.rm = TRUE),
+    pred_q25 = quantile(pred_gam_terrain_only, 0.25, na.rm = TRUE),
+    pred_med = median(pred_gam_terrain_only, na.rm = TRUE),
+    pred_q75 = quantile(pred_gam_terrain_only, 0.75, na.rm = TRUE),
+    pred_q95 = quantile(pred_gam_terrain_only, 0.95, na.rm = TRUE),
+    pred_q99 = quantile(pred_gam_terrain_only, 0.99, na.rm = TRUE),
+    pred_max = max(pred_gam_terrain_only, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## create-terrain-score-valley-penalty
+
+谷底候補セルに減衰係数をかけ、谷底補正済み相対適地スコアを作成する。谷縁辺候補は除外しない。
+
+```{r create-terrain-score-valley-penalty}
+grid10_pred <- grid10_pred |>
+  dplyr::mutate(
+    pred_gam_terrain_penalized = dplyr::case_when(
+      valley_bottom_flag_v2 == 1 ~ pred_gam_terrain_only * valley_bottom_penalty_factor,
+      TRUE ~ pred_gam_terrain_only
+    )
+  )
+
+grid10_pred |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  ) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    pred_min = min(pred_gam_terrain_penalized, na.rm = TRUE),
+    pred_q25 = quantile(pred_gam_terrain_penalized, 0.25, na.rm = TRUE),
+    pred_med = median(pred_gam_terrain_penalized, na.rm = TRUE),
+    pred_q75 = quantile(pred_gam_terrain_penalized, 0.75, na.rm = TRUE),
+    pred_q95 = quantile(pred_gam_terrain_penalized, 0.95, na.rm = TRUE),
+    pred_q99 = quantile(pred_gam_terrain_penalized, 0.99, na.rm = TRUE),
+    pred_max = max(pred_gam_terrain_penalized, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## diagnose-high-prediction-cells
+
+既知presenceの最大値を超えるabsence / no_dataセルを抽出し、谷底・谷縁辺への集中を確認する。
+
+```{r diagnose-high-prediction-cells}
+presence_max_pred <- grid10_pred |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(response), response == 1) |>
+  dplyr::summarise(mx = max(pred_gam_terrain_penalized, na.rm = TRUE)) |>
+  dplyr::pull(mx)
+
+over_presence_max_cells <- grid10_pred |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  ) |>
+  dplyr::filter(
+    cell_status != "presence",
+    pred_gam_terrain_penalized > presence_max_pred
+  )
+
+cat("presence最大値:", presence_max_pred, "\n")
+cat("presence最大値を超えるabsence / no_dataセル数:", nrow(over_presence_max_cells), "\n")
+
+over_presence_max_cells |>
+  sf::st_drop_geometry() |>
+  dplyr::count(cell_status)
+
+over_presence_max_cells |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    valley_bottom_ratio = mean(valley_bottom_flag_v2 == 1, na.rm = TRUE),
+    valley_edge_ratio = mean(valley_edge_flag_v2 == 1, na.rm = TRUE),
+    elev_med = median(elev, na.rm = TRUE),
+    slope_med = median(slope_deg, na.rm = TRUE),
+    tpi500_med = median(tpi_500m, na.rm = TRUE),
+    relmin500_med = median(rel_min_500m, na.rm = TRUE)
+  )
+```
+
+## export-high-prediction-check-layers
+
+高予測値セルの確認用GeoPackageを書き出す。
+
+```{r export-high-prediction-check-layers}
+high_prediction_check_gpkg <- file.path(
+  terrain_processed_dir,
+  "high_prediction_check_layers.gpkg"
+)
+
+if (file.exists(high_prediction_check_gpkg)) {
+  unlink(high_prediction_check_gpkg)
+}
+
+if (nrow(over_presence_max_cells) > 0) {
+  over_presence_max_cells_out <- over_presence_max_cells |>
+    dplyr::select(
+      dplyr::any_of(c(
+        "grid_id", "cell_status", "response",
+        "pred_gam_terrain_only", "pred_gam_terrain_penalized",
+        "elev", "slope_deg", "relief_50m",
+        "tpi_100m", "tpi_500m", "rel_min_500m",
+        "valley_bottom_flag_v2", "valley_edge_flag_v2",
+        "dist_valley_bottom_v2"
+      ))
+    )
+
+  write_gpkg_layer_safe(
+    over_presence_max_cells_out,
+    high_prediction_check_gpkg,
+    "over_presence_max_cells"
+  )
+}
+
+false_positive_absence <- grid10_pred |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1 ~ "presence",
+      !is.na(response) & response == 0 ~ "absence",
+      TRUE ~ "no_data"
+    )
+  ) |>
+  dplyr::filter(
+    response == 0,
+    pred_gam_terrain_penalized >= 0.5
+  )
+
+if (nrow(false_positive_absence) > 0) {
+  false_positive_absence_out <- false_positive_absence |>
+    dplyr::select(
+      dplyr::any_of(c(
+        "grid_id", "cell_status", "response",
+        "pred_gam_terrain_only", "pred_gam_terrain_penalized",
+        "elev", "slope_deg", "relief_50m",
+        "tpi_100m", "tpi_500m", "rel_min_500m",
+        "valley_bottom_flag_v2", "valley_edge_flag_v2",
+        "dist_valley_bottom_v2"
+      ))
+    )
+
+  write_gpkg_layer_safe(
+    false_positive_absence_out,
+    high_prediction_check_gpkg,
+    "absence_pred_over_0_5"
+  )
+}
+
+cat("出力:", high_prediction_check_gpkg, "\n")
+```
+
+# 8. no_data領域の最終スコア分類
+
+## classify-final-nodata-terrain-score
+
+未調査域のみを対象に、谷底補正済みスコアを分位で分類する。
+
+```{r classify-final-nodata-terrain-score}
+grid10_pred <- grid10_pred |>
+  dplyr::mutate(
+    final_score_nodata_only = dplyr::if_else(
+      is.na(response),
+      pred_gam_terrain_penalized,
+      NA_real_
+    )
+  )
+
+nodata_q <- quantile(
+  grid10_pred$final_score_nodata_only,
+  probs = nodata_class_probs,
+  na.rm = TRUE
+)
+
+grid10_pred <- grid10_pred |>
+  dplyr::mutate(
+    final_score_class = dplyr::case_when(
+      is.na(final_score_nodata_only) ~ NA_character_,
+      final_score_nodata_only >= nodata_q[["99%"]] ~ "Very high",
+      final_score_nodata_only >= nodata_q[["95%"]] ~ "High",
+      final_score_nodata_only >= nodata_q[["90%"]] ~ "Medium-high",
+      final_score_nodata_only >= nodata_q[["80%"]] ~ "Medium",
+      TRUE ~ "Low"
+    ),
+    final_score_class_id = dplyr::case_when(
+      final_score_class == "Very high" ~ 5L,
+      final_score_class == "High" ~ 4L,
+      final_score_class == "Medium-high" ~ 3L,
+      final_score_class == "Medium" ~ 2L,
+      final_score_class == "Low" ~ 1L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+nodata_q
+
+grid10_pred |>
+  sf::st_drop_geometry() |>
+  dplyr::count(final_score_class, final_score_class_id)
+```
+
+## final-score-summary
+
+最終スコア分類ごとに、谷底・谷縁辺フラグとの関係を確認する。
+
+```{r final-score-summary}
+grid10_pred |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(final_score_class)) |>
+  dplyr::group_by(final_score_class, final_score_class_id) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    score_min = min(final_score_nodata_only, na.rm = TRUE),
+    score_med = median(final_score_nodata_only, na.rm = TRUE),
+    score_max = max(final_score_nodata_only, na.rm = TRUE),
+    valley_bottom_ratio = mean(valley_bottom_flag_v2 == 1, na.rm = TRUE),
+    valley_edge_ratio = mean(valley_edge_flag_v2 == 1, na.rm = TRUE),
+    elev_med = median(elev, na.rm = TRUE),
+    slope_med = median(slope_deg, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(final_score_class_id))
+```
+
+# 9. 出力
+
+## export-final-geotiffs
+
+GAMの地形スコア、谷底補正済みスコア、未調査域限定スコア、分類IDをGeoTIFFとして出力する。
+
+```{r export-final-geotiffs}
+raster_template <- dem_city
+
+rasterize_grid_field <- function(grid_sf, field_name, template, out_path) {
+  r <- terra::rasterize(
+    terra::vect(grid_sf),
+    template,
+    field = field_name,
+    fun = "mean"
+  )
+  names(r) <- field_name
+
+  terra::writeRaster(
+    r,
+    out_path,
+    overwrite = TRUE,
+    gdal = c("COMPRESS=LZW")
+  )
+
+  message("出力: ", out_path)
+  invisible(r)
+}
+
+pred_terrain_only_r <- rasterize_grid_field(
+  grid10_pred,
+  "pred_gam_terrain_only",
+  raster_template,
+  file.path(terrain_processed_dir, "pred_gam_terrain_only_10m.tif")
+)
+
+pred_terrain_penalized_r <- rasterize_grid_field(
+  grid10_pred,
+  "pred_gam_terrain_penalized",
+  raster_template,
+  file.path(terrain_processed_dir, "pred_gam_terrain_penalized_10m.tif")
+)
+
+final_score_nodata_r <- rasterize_grid_field(
+  grid10_pred,
+  "final_score_nodata_only",
+  raster_template,
+  file.path(terrain_processed_dir, "final_score_nodata_only_10m.tif")
+)
+
+final_class_id_r <- rasterize_grid_field(
+  grid10_pred,
+  "final_score_class_id",
+  raster_template,
+  file.path(terrain_processed_dir, "final_score_class_id_10m.tif")
+)
+```
+
+## export-final-gpkg
+
+最終確認用のグリッドをGeoPackageで出力する。
+
+```{r export-final-gpkg}
+final_grid_gpkg <- file.path(terrain_processed_dir, "final_terrain_gam_grid.gpkg")
+
+if (file.exists(final_grid_gpkg)) {
+  unlink(final_grid_gpkg)
+}
+
+final_grid_out <- grid10_pred |>
+  dplyr::select(
+    dplyr::any_of(c(
+      "grid_id", "response", "dwelling_presence",
+      "surveyed_ratio", "cell_area_m2", "surveyed_area_m2",
+      "elev", "slope_deg", "relief_50m", "eastness",
+      "tpi_100m", "tpi_500m", "rel_min_500m",
+      "valley_bottom_flag_v2", "valley_edge_flag_v2", "dist_valley_bottom_v2",
+      "pred_gam_terrain_only", "pred_gam_terrain_penalized",
+      "final_score_nodata_only", "final_score_class", "final_score_class_id"
+    ))
+  )
+
+write_gpkg_layer_safe(
+  final_grid_out,
+  final_grid_gpkg,
+  "final_terrain_gam_grid"
+)
+
+cat("出力:", final_grid_gpkg, "\n")
+```
+
+## export-final-csv
+
+ジオメトリを除いた属性テーブルをCSVとして出力する。
+
+```{r export-final-csv}
+final_csv <- file.path(output_dir, "final_terrain_gam_grid_attributes.csv")
+
+final_grid_out |>
+  sf::st_drop_geometry() |>
+  readr::write_csv(final_csv)
+
+cat("出力:", final_csv, "\n")
+```
+
+## export-model-summaries
+
+モデル評価と分位閾値をCSVとして出力する。
+
+```{r export-model-summaries}
+validation_csv <- file.path(output_dir, "model_validation_summary.csv")
+nodata_quantile_csv <- file.path(output_dir, "nodata_score_quantiles.csv")
+
+validation_summary |>
+  readr::write_csv(validation_csv)
+
+tibble::tibble(
+  quantile = names(nodata_q),
+  value = as.numeric(nodata_q)
+) |>
+  readr::write_csv(nodata_quantile_csv)
+
+cat("出力:", validation_csv, "\n")
+cat("出力:", nodata_quantile_csv, "\n")
+```
+
+# 10. 解釈メモ
+
+このRmdの最終出力では、`pred_gam_terrain_only` は地形GAMが返す `response = 1` 側の推定値である。ただし、観察済みpresenceが少なく、absence・no_dataの一部に高値が出るため、絶対的な「存在確率」としては扱わない。
+
+実務的には、次の3層を分けて解釈する。
+
+| 出力 | 解釈 |
+|---|---|
+| `pred_gam_terrain_only_10m.tif` | 谷底補正前の地形GAMスコア。モデル診断用。 |
+| `pred_gam_terrain_penalized_10m.tif` | 谷底候補を減衰した相対的地形適合度。 |
+| `final_score_nodata_only_10m.tif` | 未調査域のみの最終候補スコア。 |
+| `final_score_class_id_10m.tif` | 未調査域内での分位分類。1=Low、5=Very high。 |
+
+谷縁辺は不適地として除外せず、有望な段丘縁辺・谷頭周辺を含む可能性があるため、QGIS上で `valley_edge_flag_v2` と重ねて確認する。一方、谷底候補はGAMに直接学習させず、後処理で減衰することで、谷底と谷縁辺の混同による過大推定を抑制する。

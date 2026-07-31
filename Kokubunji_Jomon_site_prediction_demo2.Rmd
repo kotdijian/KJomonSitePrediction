@@ -203,6 +203,20 @@ terrain_valley_stack
 
 ```{r export-valley-indices-geotiff}
 terra::writeRaster(
+  tpi_50m,
+  file.path(processed_dir, "tpi_50m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  tpi_100m,
+  file.path(processed_dir, "tpi_100m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
   tpi_250m,
   file.path(processed_dir, "tpi_250m.tif"),
   overwrite = TRUE,
@@ -229,6 +243,7 @@ terra::writeRaster(
   overwrite = TRUE,
   gdal = c("COMPRESS=LZW")
 )
+
 ```
 
 ---
