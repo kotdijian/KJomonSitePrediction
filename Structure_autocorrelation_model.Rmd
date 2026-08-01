@@ -222,10 +222,7 @@ for (d in c(
 }
 
 gpkg_path <- file.path(raw_dir, "Kokubunji_Jomon.gpkg")
-dem_path <- file.path(raw_dir, "10mDEM.tif")
-
 raw_gpkg_url <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/Kokubunji_Jomon.gpkg"
-raw_dem_url <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/10mDEM.tif"
 
 final_gpkg <- file.path(final_gpkg_dir, "supported_autocorrelation_outputs.gpkg")
 
@@ -234,10 +231,12 @@ cat("interim_dir:", interim_dir, "\n")
 cat("final_dir:", final_dir, "\n")
 ```
 
+
+
 ## download-data
 
 **目的**：必要な入力ファイルがローカルにない場合にGitHubから取得する。  
-**達成指標**：`Kokubunji_Jomon.gpkg` と `10mDEM.tif` が `data_raw` に存在する。
+**達成指標**：`Kokubunji_Jomon.gpkg` が `data_raw` に存在する。
 
 ```{r download-data}
 if (!file.exists(gpkg_path)) {
@@ -245,22 +244,14 @@ if (!file.exists(gpkg_path)) {
   utils::download.file(raw_gpkg_url, gpkg_path, mode = "wb", quiet = FALSE)
 }
 
-if (!file.exists(dem_path)) {
-  cat("DEMをダウンロードします。\n")
-  utils::download.file(raw_dem_url, dem_path, mode = "wb", quiet = FALSE)
-}
-
 if (!file.exists(gpkg_path)) {
   stop("GPKGが見つかりません: ", gpkg_path)
 }
 
-if (!file.exists(dem_path)) {
-  stop("DEMが見つかりません: ", dem_path)
-}
-
 file.info(gpkg_path)
-file.info(dem_path)
 ```
+
+
 
 # Stage 1: Read data and create observation frame
 
@@ -276,8 +267,8 @@ gpkg_layers$name
 
 ## read-data
 
-**目的**：trenchポリゴン、住居点、市域境界、DEMを読み込む。  
-**達成指標**：`trench_polygon`、`dwelling_points`、`city_boundary`、`dem_r` が作成される。
+**目的**：trenchポリゴン、住居点、市域境界を読み込む。  
+**達成指標**：`trench_polygon`、`dwelling_points`、`city_boundary` が作成され、CRSが統一される。
 
 ```{r read-data}
 read_layer_flexible <- function(gpkg, candidates, object_label) {
@@ -314,9 +305,12 @@ city_boundary <- read_layer_flexible(
   "city_boundary"
 )
 
-dem_r <- terra::rast(dem_path)
+target_crs <- sf::st_crs(city_boundary)
 
-target_crs <- sf::st_crs(terra::crs(dem_r))
+if (is.na(target_crs)) {
+  target_crs <- sf::st_crs(6677)
+  city_boundary <- sf::st_set_crs(city_boundary, target_crs)
+}
 
 trench_polygon <- trench_polygon |>
   sf::st_make_valid() |>
@@ -333,42 +327,40 @@ city_boundary <- city_boundary |>
 cat("trench count:", nrow(trench_polygon), "\n")
 cat("dwelling point count:", nrow(dwelling_points), "\n")
 cat("city boundary count:", nrow(city_boundary), "\n")
-print(dem_r)
+cat("target CRS EPSG:", target_crs$epsg, "\n")
 ```
+
+
 
 ## create-analysis-grid
 
-**目的**：DEMテンプレートに沿って、市域内の10m解析グリッドを作成する。  
-**達成指標**：`grid10` が10mセル単位で作成され、セル数が市域面積として妥当である。
+**目的**：市域境界から10m解析グリッドと同一解像度のラスタテンプレートを作成する。  
+**達成指標**：`grid10`、`city_mask_r`、`template_r` が作成され、セル数とセル面積が市域面積として妥当である。
 
 ```{r create-analysis-grid}
-city_mask_r <- terra::rasterize(
-  terra::vect(city_boundary),
-  dem_r[[1]],
-  field = 1,
-  background = NA,
-  touches = TRUE
-)
+grid_cell_size_m <- 10
 
-names(city_mask_r) <- "city_mask"
-template_r <- city_mask_r
+city_union <- city_boundary |>
+  sf::st_make_valid() |>
+  sf::st_union() |>
+  sf::st_as_sf() |>
+  dplyr::mutate(city_mask = 1L)
 
-cell_id_r <- terra::init(city_mask_r, "cell")
-cell_id_r <- terra::mask(cell_id_r, city_mask_r)
-names(cell_id_r) <- "raster_cell_id"
-
-grid10 <- terra::as.polygons(
-  cell_id_r,
-  values = TRUE,
-  na.rm = TRUE,
-  dissolve = FALSE
+# 市域外接矩形から10m正方グリッドを作成し、市域と交差するセルだけを残す。
+grid_all <- sf::st_make_grid(
+  city_union,
+  cellsize = c(grid_cell_size_m, grid_cell_size_m),
+  square = TRUE,
+  what = "polygons"
 ) |>
   sf::st_as_sf() |>
-  sf::st_make_valid()
+  sf::st_set_crs(sf::st_crs(city_union)) |>
+  dplyr::mutate(raster_cell_id = dplyr::row_number())
 
-names(grid10)[1] <- "raster_cell_id"
+city_intersects <- lengths(sf::st_intersects(grid_all, city_union)) > 0
 
-grid10 <- grid10 |>
+grid10 <- grid_all[city_intersects, ] |>
+  sf::st_make_valid() |>
   dplyr::mutate(
     grid_id = dplyr::row_number()
   )
@@ -384,9 +376,37 @@ grid10 <- grid10 |>
     cell_area_m2
   )
 
+# grid_allの範囲に合わせた10mラスタテンプレートを作成する。
+grid_all_bbox <- sf::st_bbox(grid_all)
+
+template_r <- terra::rast(
+  xmin = as.numeric(grid_all_bbox["xmin"]),
+  xmax = as.numeric(grid_all_bbox["xmax"]),
+  ymin = as.numeric(grid_all_bbox["ymin"]),
+  ymax = as.numeric(grid_all_bbox["ymax"]),
+  resolution = grid_cell_size_m,
+  crs = sf::st_crs(grid10)$wkt
+)
+
+city_mask_r <- terra::rasterize(
+  terra::vect(city_union),
+  template_r,
+  field = "city_mask",
+  background = NA,
+  touches = TRUE
+)
+
+names(city_mask_r) <- "city_mask"
+template_r <- city_mask_r
+
 cat("grid10 cell count:", nrow(grid10), "\n")
+cat("template resolution:", terra::res(template_r), "\n")
+cat("template extent:\n")
+print(terra::ext(template_r))
 summary(grid10$cell_area_m2)
 ```
+
+
 
 ## assign-grid-response
 
