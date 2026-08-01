@@ -1908,3 +1908,668 @@ list.files(processed_dir, full.names = TRUE)
 - `absence_included` は、既調査非検出域にもスコアを内挿した診断出力です。ここでabsenceセルに高スコアが多い場合、自己相関モデルは過大推定している可能性があります。
 - absenceは「調査済みだが住居が確認されていない」範囲であり、未調査地と同じ意味ではありません。
 - スコアは絶対確率ではなく、近接・密度・調査面積補正・absence負の証拠を合成した相対指標です。
+
+---
+
+# appendix. trench polygon check
+
+```{r diagnose-absence-detection-from-trenches}
+# trenchポリゴンからabsenceセルが正しく作られているかを診断する。
+# このchunkは診断専用で、既存のスコアや分類は変更しない。
+
+if (!exists("grid10")) {
+  stop("grid10 が存在しません。assign-grid-response chunkを先に実行してください。")
+}
+
+if (!exists("trench_polygon")) {
+  stop("trench_polygon が存在しません。read-vector-layers chunkを確認してください。")
+}
+
+if (!exists("dwelling_points")) {
+  if (exists("jdwelling_point")) {
+    dwelling_points <- jdwelling_point
+  } else {
+    stop("dwelling_points が存在しません。住居点レイヤを確認してください。")
+  }
+}
+
+if (!exists("processed_dir")) {
+  processed_dir <- "data_processed_autocorrelation"
+}
+
+diagnostic_dir <- file.path(processed_dir, "diagnostics")
+dir.create(diagnostic_dir, showWarnings = FALSE, recursive = TRUE)
+
+# grid10にcell_statusを明示的に付与
+grid10_diag <- grid10 |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1L ~ "presence",
+      !is.na(response) & response == 0L ~ "absence",
+      is.na(response) ~ "no_data",
+      TRUE ~ "unknown"
+    ),
+    absence_area_m2_vector = dplyr::if_else(
+      cell_status == "absence",
+      cell_area_m2,
+      0
+    )
+  )
+
+cat("grid10 response / cell_status summary:\n")
+print(table(grid10_diag$cell_status, useNA = "ifany"))
+
+print(
+  grid10_diag |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(cell_status) |>
+    dplyr::summarise(
+      n = dplyr::n(),
+      cell_area_sum_m2 = sum(cell_area_m2, na.rm = TRUE),
+      surveyed_area_sum_m2 = sum(surveyed_area_m2, na.rm = TRUE),
+      absence_area_vector_sum_m2 = sum(absence_area_m2_vector, na.rm = TRUE),
+      surveyed_ratio_min = min(surveyed_ratio, na.rm = TRUE),
+      surveyed_ratio_med = median(surveyed_ratio, na.rm = TRUE),
+      surveyed_ratio_max = max(surveyed_ratio, na.rm = TRUE),
+      dwelling_count_sum = sum(dwelling_count, na.rm = TRUE),
+      .groups = "drop"
+    )
+)
+
+# absence_area_r が存在する場合、grid10のabsenceセルとラスタ値が対応しているか確認
+if (exists("absence_area_r")) {
+  absence_area_r_for_extract <- absence_area_r
+  names(absence_area_r_for_extract) <- "absence_area_r_value"
+
+  grid10_diag_points <- sf::st_point_on_surface(grid10_diag)
+
+  absence_raster_values <- terra::extract(
+    absence_area_r_for_extract,
+    terra::vect(grid10_diag_points),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  if (!"absence_area_r_value" %in% names(absence_raster_values)) {
+    names(absence_raster_values)[1] <- "absence_area_r_value"
+  }
+
+  grid10_diag$absence_area_r_value <- absence_raster_values$absence_area_r_value
+
+  cat("\nabsence_area_r extraction by cell_status:\n")
+  print(
+    grid10_diag |>
+      sf::st_drop_geometry() |>
+      dplyr::group_by(cell_status) |>
+      dplyr::summarise(
+        n = dplyr::n(),
+        raster_value_min = min(absence_area_r_value, na.rm = TRUE),
+        raster_value_med = median(absence_area_r_value, na.rm = TRUE),
+        raster_value_max = max(absence_area_r_value, na.rm = TRUE),
+        raster_value_sum = sum(absence_area_r_value, na.rm = TRUE),
+        raster_positive_cells = sum(absence_area_r_value > 0, na.rm = TRUE),
+        .groups = "drop"
+      )
+  )
+} else {
+  grid10_diag$absence_area_r_value <- NA_real_
+  cat("\nabsence_area_r が存在しないため、ラスタ抽出診断はスキップします。\n")
+}
+
+# local_absence_ratio_50m と absence_penalty_50m の値も、grid10代表点へ抽出
+if (
+  exists("local_absence_ratio_rasters") &&
+  "50" %in% names(local_absence_ratio_rasters)
+) {
+  local_absence_ratio_50m_r <- local_absence_ratio_rasters[["50"]]
+  names(local_absence_ratio_50m_r) <- "local_absence_ratio_50m_value"
+
+  local_absence_ratio_values <- terra::extract(
+    local_absence_ratio_50m_r,
+    terra::vect(sf::st_point_on_surface(grid10_diag)),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  if (!"local_absence_ratio_50m_value" %in% names(local_absence_ratio_values)) {
+    names(local_absence_ratio_values)[1] <- "local_absence_ratio_50m_value"
+  }
+
+  grid10_diag$local_absence_ratio_50m_value <- local_absence_ratio_values$local_absence_ratio_50m_value
+} else {
+  grid10_diag$local_absence_ratio_50m_value <- NA_real_
+}
+
+if (exists("absence_penalty_50m_r")) {
+  absence_penalty_50m_for_extract <- absence_penalty_50m_r
+  names(absence_penalty_50m_for_extract) <- "absence_penalty_50m_value"
+
+  absence_penalty_values <- terra::extract(
+    absence_penalty_50m_for_extract,
+    terra::vect(sf::st_point_on_surface(grid10_diag)),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  if (!"absence_penalty_50m_value" %in% names(absence_penalty_values)) {
+    names(absence_penalty_values)[1] <- "absence_penalty_50m_value"
+  }
+
+  grid10_diag$absence_penalty_50m_value <- absence_penalty_values$absence_penalty_50m_value
+} else {
+  grid10_diag$absence_penalty_50m_value <- NA_real_
+}
+
+cat("\nlocal absence / penalty values by cell_status:\n")
+print(
+  grid10_diag |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(cell_status) |>
+    dplyr::summarise(
+      n = dplyr::n(),
+      local_absence_ratio_50m_min = min(local_absence_ratio_50m_value, na.rm = TRUE),
+      local_absence_ratio_50m_med = median(local_absence_ratio_50m_value, na.rm = TRUE),
+      local_absence_ratio_50m_max = max(local_absence_ratio_50m_value, na.rm = TRUE),
+      absence_penalty_50m_min = min(absence_penalty_50m_value, na.rm = TRUE),
+      absence_penalty_50m_med = median(absence_penalty_50m_value, na.rm = TRUE),
+      absence_penalty_50m_max = max(absence_penalty_50m_value, na.rm = TRUE),
+      .groups = "drop"
+    )
+)
+
+# trenchごとに、中心点が入るgridセルのresponseを集計する
+trench_diag <- trench_polygon |>
+  sf::st_transform(sf::st_crs(grid10_diag)) |>
+  sf::st_make_valid() |>
+  dplyr::mutate(
+    trench_diag_id = dplyr::row_number()
+  )
+
+trench_diag$trench_area_m2 <- as.numeric(
+  sf::st_area(sf::st_geometry(trench_diag))
+)
+
+grid10_centers_for_join <- grid10_diag |>
+  dplyr::select(
+    grid_id,
+    response,
+    cell_status,
+    surveyed_ratio,
+    dwelling_count,
+    cell_area_m2,
+    absence_area_r_value,
+    local_absence_ratio_50m_value,
+    absence_penalty_50m_value
+  ) |>
+  sf::st_point_on_surface()
+
+trench_grid_join <- sf::st_join(
+  grid10_centers_for_join,
+  trench_diag |> dplyr::select(trench_diag_id),
+  join = sf::st_intersects,
+  left = FALSE
+)
+
+if (nrow(trench_grid_join) > 0) {
+  trench_cell_summary <- trench_grid_join |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(trench_diag_id) |>
+    dplyr::summarise(
+      total_center_cells = dplyr::n(),
+      presence_center_cells = sum(cell_status == "presence", na.rm = TRUE),
+      absence_center_cells = sum(cell_status == "absence", na.rm = TRUE),
+      no_data_center_cells = sum(cell_status == "no_data", na.rm = TRUE),
+      dwelling_count_in_center_cells = sum(dwelling_count, na.rm = TRUE),
+      surveyed_ratio_med = median(surveyed_ratio, na.rm = TRUE),
+      surveyed_ratio_max = max(surveyed_ratio, na.rm = TRUE),
+      absence_area_r_sum = sum(absence_area_r_value, na.rm = TRUE),
+      local_absence_ratio_50m_med = median(local_absence_ratio_50m_value, na.rm = TRUE),
+      absence_penalty_50m_med = median(absence_penalty_50m_value, na.rm = TRUE),
+      .groups = "drop"
+    )
+} else {
+  trench_cell_summary <- tibble::tibble(
+    trench_diag_id = integer(0),
+    total_center_cells = integer(0),
+    presence_center_cells = integer(0),
+    absence_center_cells = integer(0),
+    no_data_center_cells = integer(0),
+    dwelling_count_in_center_cells = integer(0),
+    surveyed_ratio_med = numeric(0),
+    surveyed_ratio_max = numeric(0),
+    absence_area_r_sum = numeric(0),
+    local_absence_ratio_50m_med = numeric(0),
+    absence_penalty_50m_med = numeric(0)
+  )
+}
+
+# 住居点が各trenchに何点入るかを集計
+dwelling_points_diag <- dwelling_points |>
+  sf::st_transform(sf::st_crs(trench_diag)) |>
+  sf::st_make_valid() |>
+  dplyr::mutate(
+    dwelling_point_id = dplyr::row_number()
+  )
+
+dwelling_trench_join <- sf::st_join(
+  dwelling_points_diag |> dplyr::select(dwelling_point_id),
+  trench_diag |> dplyr::select(trench_diag_id),
+  join = sf::st_intersects,
+  left = FALSE
+)
+
+if (nrow(dwelling_trench_join) > 0) {
+  dwelling_by_trench <- dwelling_trench_join |>
+    sf::st_drop_geometry() |>
+    dplyr::count(
+      trench_diag_id,
+      name = "dwelling_points_in_trench"
+    )
+} else {
+  dwelling_by_trench <- tibble::tibble(
+    trench_diag_id = integer(0),
+    dwelling_points_in_trench = integer(0)
+  )
+}
+
+trench_summary <- trench_diag |>
+  dplyr::left_join(
+    trench_cell_summary,
+    by = "trench_diag_id"
+  ) |>
+  dplyr::left_join(
+    dwelling_by_trench,
+    by = "trench_diag_id"
+  )
+
+trench_summary <- trench_summary |>
+  dplyr::mutate(
+    total_center_cells = tidyr::replace_na(total_center_cells, 0L),
+    presence_center_cells = tidyr::replace_na(presence_center_cells, 0L),
+    absence_center_cells = tidyr::replace_na(absence_center_cells, 0L),
+    no_data_center_cells = tidyr::replace_na(no_data_center_cells, 0L),
+    dwelling_count_in_center_cells = tidyr::replace_na(dwelling_count_in_center_cells, 0L),
+    dwelling_points_in_trench = tidyr::replace_na(dwelling_points_in_trench, 0L),
+    absence_area_r_sum = tidyr::replace_na(absence_area_r_sum, 0),
+    absence_cell_ratio = dplyr::if_else(
+      total_center_cells > 0,
+      absence_center_cells / total_center_cells,
+      NA_real_
+    )
+  )
+
+large_trench_threshold_m2 <- stats::quantile(
+  trench_summary$trench_area_m2,
+  probs = 0.75,
+  na.rm = TRUE
+)
+
+problem_candidate_trenches <- trench_summary |>
+  dplyr::filter(
+    trench_area_m2 >= large_trench_threshold_m2,
+    dwelling_points_in_trench <= 1,
+    total_center_cells >= 5
+  ) |>
+  dplyr::arrange(
+    absence_cell_ratio,
+    dplyr::desc(trench_area_m2)
+  )
+
+cat("\nLarge trench candidates with <= 1 dwelling point:\n")
+print(
+  problem_candidate_trenches |>
+    sf::st_drop_geometry() |>
+    dplyr::select(
+      trench_diag_id,
+      trench_area_m2,
+      total_center_cells,
+      presence_center_cells,
+      absence_center_cells,
+      no_data_center_cells,
+      absence_cell_ratio,
+      dwelling_points_in_trench,
+      dwelling_count_in_center_cells,
+      surveyed_ratio_med,
+      surveyed_ratio_max,
+      absence_area_r_sum,
+      local_absence_ratio_50m_med,
+      absence_penalty_50m_med
+    ) |>
+    utils::head(30)
+)
+
+# 診断用GPKGを書き出し
+diagnostic_gpkg <- file.path(
+  diagnostic_dir,
+  "absence_detection_diagnostics.gpkg"
+)
+
+if (file.exists(diagnostic_gpkg)) {
+  unlink(diagnostic_gpkg)
+}
+
+write_diag_layer <- function(x, layer_name) {
+  if (is.null(x) || nrow(x) == 0) {
+    message("スキップ: ", layer_name, " は0件です。")
+    return(invisible(NULL))
+  }
+
+  x <- sf::st_make_valid(x)
+
+  sf::st_write(
+    x,
+    dsn = diagnostic_gpkg,
+    layer = layer_name,
+    delete_layer = TRUE,
+    quiet = TRUE
+  )
+
+  message("出力: ", layer_name)
+  invisible(NULL)
+}
+
+write_diag_layer(
+  trench_summary,
+  "trench_absence_summary"
+)
+
+write_diag_layer(
+  problem_candidate_trenches,
+  "problem_candidate_trenches"
+)
+
+write_diag_layer(
+  grid10_diag |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      surveyed_ratio,
+      dwelling_count,
+      cell_area_m2,
+      surveyed_area_m2,
+      absence_area_m2_vector,
+      absence_area_r_value,
+      local_absence_ratio_50m_value,
+      absence_penalty_50m_value
+    ),
+  "grid10_absence_diagnostic_cells"
+)
+
+write_diag_layer(
+  grid10_diag |>
+    dplyr::filter(cell_status == "absence") |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      surveyed_ratio,
+      dwelling_count,
+      cell_area_m2,
+      surveyed_area_m2,
+      absence_area_m2_vector,
+      absence_area_r_value,
+      local_absence_ratio_50m_value,
+      absence_penalty_50m_value
+    ),
+  "absence_cells_only"
+)
+
+cat("\n診断用GeoPackageを出力しました:\n")
+cat(diagnostic_gpkg, "\n")
+```
+
+```{r extract-component-scores-for-target-trench}
+# 対象trench内のセルについて、スコア構成成分を抽出する。
+# 既存スコアは変更せず、診断用テーブルを作成する。
+
+if (!exists("target_trench_diag_id")) {
+  target_trench_diag_id <- 1015
+}
+
+if (!exists("grid10")) {
+  stop("grid10 が存在しません。assign-grid-response chunkまで再実行してください。")
+}
+
+if (!exists("trench_summary")) {
+  stop("trench_summary が存在しません。diagnose-absence-detection-from-trenches chunkを先に実行してください。")
+}
+
+if (!exists("grid10_diag")) {
+  grid10_diag <- grid10 |>
+    dplyr::mutate(
+      cell_status = dplyr::case_when(
+        !is.na(response) & response == 1L ~ "presence",
+        !is.na(response) & response == 0L ~ "absence",
+        is.na(response) ~ "no_data",
+        TRUE ~ "unknown"
+      )
+    )
+}
+
+# 念のため、診断に必要な基本列を補う
+if (!"dwelling_count" %in% names(grid10_diag)) {
+  grid10_diag$dwelling_count <- 0L
+}
+
+if (!"surveyed_ratio" %in% names(grid10_diag)) {
+  grid10_diag$surveyed_ratio <- NA_real_
+}
+
+required_rasters <- c(
+  "nearest_dwelling_score_r",
+  "density_score_50m_r",
+  "cluster_score_r",
+  "open_no_data_score_100m_r",
+  "absence_penalty_50m_r",
+  "continuity_score_r"
+)
+
+missing_rasters <- required_rasters[
+  !vapply(required_rasters, exists, logical(1))
+]
+
+if (length(missing_rasters) > 0) {
+  stop(
+    "必要なラスタオブジェクトが存在しません: ",
+    paste(missing_rasters, collapse = ", "),
+    "\nbuild-continuity-score chunkまで再実行してください。"
+  )
+}
+
+target_trench <- trench_summary |>
+  dplyr::filter(trench_diag_id == target_trench_diag_id) |>
+  dplyr::select(trench_diag_id)
+
+if (nrow(target_trench) == 0) {
+  stop("対象trenchが見つかりません: trench_diag_id = ", target_trench_diag_id)
+}
+
+target_grid_cells <- sf::st_join(
+  grid10_diag,
+  target_trench,
+  join = sf::st_intersects,
+  left = FALSE
+)
+
+if (nrow(target_grid_cells) == 0) {
+  stop("対象trenchに重なるgrid10セルがありません。trench_diag_idを確認してください。")
+}
+
+# 既に同名のスコア列が target_grid_cells 側にあると bind_cols 後に ...9 などへリネームされる。
+# そのため、抽出前に既存の成分列を削除する。
+component_column_names <- c(
+  "nearest_dwelling_score",
+  "density_score_50m",
+  "cluster_proximity_score",
+  "open_no_data_score_100m",
+  "absence_penalty_50m",
+  "continuity_score_all_cells"
+)
+
+target_grid_cells_base <- target_grid_cells |>
+  dplyr::select(
+    -dplyr::any_of(component_column_names)
+  )
+
+target_grid_points <- suppressWarnings(
+  sf::st_point_on_surface(target_grid_cells_base)
+)
+
+extract_one_component <- function(r, value_name) {
+  r_tmp <- r
+
+  if (terra::nlyr(r_tmp) != 1) {
+    stop(value_name, " に対応するラスタが複数バンドです。単一バンドのSpatRasterを指定してください。")
+  }
+
+  names(r_tmp) <- value_name
+
+  values_tmp <- terra::extract(
+    r_tmp,
+    terra::vect(target_grid_points),
+    ID = FALSE
+  )
+
+  values_tmp <- tibble::as_tibble(values_tmp)
+
+  if (ncol(values_tmp) < 1) {
+    stop(value_name, " の抽出結果が空です。")
+  }
+
+  values_tmp <- values_tmp[, 1, drop = FALSE]
+  names(values_tmp) <- value_name
+
+  values_tmp
+}
+
+component_values <- dplyr::bind_cols(
+  extract_one_component(nearest_dwelling_score_r, "nearest_dwelling_score"),
+  extract_one_component(density_score_50m_r, "density_score_50m"),
+  extract_one_component(cluster_score_r, "cluster_proximity_score"),
+  extract_one_component(open_no_data_score_100m_r, "open_no_data_score_100m"),
+  extract_one_component(absence_penalty_50m_r, "absence_penalty_50m"),
+  extract_one_component(continuity_score_r, "continuity_score_all_cells")
+)
+
+cat("抽出された成分列:\n")
+print(names(component_values))
+
+target_grid_component_values <- dplyr::bind_cols(
+  target_grid_cells_base,
+  component_values
+)
+
+# 必要列がすべて存在するか確認
+required_output_cols <- c(
+  "grid_id",
+  "trench_diag_id",
+  "cell_status",
+  "response",
+  "dwelling_count",
+  "surveyed_ratio",
+  "nearest_dwelling_score",
+  "density_score_50m",
+  "cluster_proximity_score",
+  "open_no_data_score_100m",
+  "absence_penalty_50m",
+  "continuity_score_all_cells"
+)
+
+missing_output_cols <- setdiff(
+  required_output_cols,
+  names(target_grid_component_values)
+)
+
+if (length(missing_output_cols) > 0) {
+  stop(
+    "target_grid_component_values に必要列がありません: ",
+    paste(missing_output_cols, collapse = ", ")
+  )
+}
+
+target_grid_component_values |>
+  sf::st_drop_geometry() |>
+  dplyr::select(
+    dplyr::all_of(required_output_cols)
+  )
+```
+```{r decompose-weighted-score-target-trench}
+# 対象trench内セルの continuity_score を重み付き寄与に分解する。
+# このchunkは診断専用で、既存スコアは変更しない。
+
+if (!exists("target_grid_component_values")) {
+  stop("target_grid_component_values が存在しません。extract-component-scores-for-target-trench chunkを先に実行してください。")
+}
+
+required_component_cols <- c(
+  "cell_status",
+  "nearest_dwelling_score",
+  "density_score_50m",
+  "cluster_proximity_score",
+  "open_no_data_score_100m",
+  "absence_penalty_50m",
+  "continuity_score_all_cells"
+)
+
+missing_component_cols <- setdiff(
+  required_component_cols,
+  names(target_grid_component_values)
+)
+
+if (length(missing_component_cols) > 0) {
+  stop(
+    "target_grid_component_values に必要列がありません: ",
+    paste(missing_component_cols, collapse = ", ")
+  )
+}
+
+target_grid_contributions <- target_grid_component_values |>
+  dplyr::mutate(
+    contrib_nearest = 0.25 * nearest_dwelling_score,
+    contrib_density = 0.30 * density_score_50m,
+    contrib_cluster = 0.30 * cluster_proximity_score,
+    contrib_open_no_data = 0.15 * open_no_data_score_100m,
+    contrib_absence_penalty = -0.25 * absence_penalty_50m,
+    positive_sum =
+      contrib_nearest +
+      contrib_density +
+      contrib_cluster +
+      contrib_open_no_data,
+    negative_sum = contrib_absence_penalty,
+    reconstructed_score = positive_sum + negative_sum,
+    reconstructed_score = dplyr::case_when(
+      reconstructed_score < 0 ~ 0,
+      reconstructed_score > 1 ~ 1,
+      TRUE ~ reconstructed_score
+    ),
+    score_difference =
+      continuity_score_all_cells - reconstructed_score
+  )
+
+target_contribution_summary <- target_grid_contributions |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(cell_status) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+
+    contrib_nearest_med = median(contrib_nearest, na.rm = TRUE),
+    contrib_density_med = median(contrib_density, na.rm = TRUE),
+    contrib_cluster_med = median(contrib_cluster, na.rm = TRUE),
+    contrib_open_no_data_med = median(contrib_open_no_data, na.rm = TRUE),
+    contrib_absence_penalty_med = median(contrib_absence_penalty, na.rm = TRUE),
+
+    positive_sum_med = median(positive_sum, na.rm = TRUE),
+    negative_sum_med = median(negative_sum, na.rm = TRUE),
+
+    reconstructed_score_med = median(reconstructed_score, na.rm = TRUE),
+    actual_score_med = median(continuity_score_all_cells, na.rm = TRUE),
+    score_difference_med = median(score_difference, na.rm = TRUE),
+
+    actual_score_min = min(continuity_score_all_cells, na.rm = TRUE),
+    actual_score_max = max(continuity_score_all_cells, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+target_contribution_summary
+```
