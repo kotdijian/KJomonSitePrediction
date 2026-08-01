@@ -1,0 +1,1918 @@
+---
+title: "Kokubunji Jomon Settlement Autocorrelation: Cluster-Supported Continuity Model"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# 目的
+
+このRmdは、縄文住居分布の自己相関を用いて、未調査領域における住居分布の継続可能性を評価するためのものです。従来の「既知住居点からの距離」中心のスコア式では、1〜2軒程度の単独・孤立的住居も密集集落と同様に周辺へ高スコアを発生させるため、考古学的解釈と合わない場合があります。
+
+本Rmdでは、以下の方針を採用します。
+
+1. 密集範囲と孤立的住居をまず識別する。
+2. そのためのパラメータを複数評価し、判断基準付きのテーブルを出力する。
+3. 検証ゲートを通過した場合のみ、全体モデルへ進む。
+4. 最終的な自己相関モデルは離散クラスではなく連続値スコアとして出力する。
+
+出力先は以下です。
+
+```text
+auto-cor-results/
+  interim/
+    csv/
+    raster/
+  final/
+    csv/
+    raster/
+    gpkg/
+```
+
+GeoPackageは `final/gpkg` にまとめ、途中検証用レイヤはレイヤ名に `interim_` を付けます。
+
+# Stage 0: Setup
+
+## setup
+
+**目的**：必要パッケージ、基本設定、補助関数を準備する。  
+**達成指標**：以後のchunkで使う関数が定義され、必要パッケージが読み込まれる。
+
+```{r setup}
+required_packages <- c(
+  "sf", "terra", "dplyr", "tidyr", "readr", "tibble", "purrr", "ggplot2"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "不足しているパッケージがあります。先にインストールしてください: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(sf)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+
+options(stringsAsFactors = FALSE)
+sf::sf_use_s2(FALSE)
+
+clamp01_numeric <- function(x) {
+  x <- as.numeric(x)
+  x[x < 0] <- 0
+  x[x > 1] <- 1
+  x
+}
+
+clamp01_raster <- function(r) {
+  terra::clamp(r, lower = 0, upper = 1, values = TRUE)
+}
+
+align_to_template <- function(r, template, method = "near") {
+  if (is.null(r)) {
+    stop("align_to_template に NULL が渡されました。")
+  }
+
+  if (!terra::compareGeom(r, template, stopOnError = FALSE)) {
+    r <- terra::resample(r, template, method = method)
+  }
+
+  r
+}
+
+make_circle_window <- function(r, radius_m) {
+  res_xy <- terra::res(r)
+
+  if (abs(res_xy[1] - res_xy[2]) > 1e-6) {
+    warning("ラスタのX方向・Y方向の解像度が異なります。平均解像度で円形近傍を作成します。")
+  }
+
+  res_m <- mean(res_xy)
+  n <- ceiling(radius_m / res_m)
+
+  coords <- expand.grid(x = -n:n, y = -n:n)
+  dist_m <- sqrt(coords$x^2 + coords$y^2) * res_m
+
+  matrix(
+    ifelse(dist_m <= radius_m, 1, 0),
+    nrow = 2 * n + 1,
+    ncol = 2 * n + 1,
+    byrow = FALSE
+  )
+}
+
+focal_sum_circle <- function(r, radius_m) {
+  w <- make_circle_window(r, radius_m)
+
+  terra::focal(
+    r,
+    w = w,
+    fun = "sum",
+    na.policy = "all",
+    fillvalue = 0,
+    na.rm = TRUE
+  )
+}
+
+rasterize_grid_field <- function(grid_sf, field_name, template_r, background = NA, touches = FALSE) {
+  if (!inherits(grid_sf, "sf")) {
+    stop("grid_sf は sf オブジェクトである必要があります。")
+  }
+
+  if (!field_name %in% names(grid_sf)) {
+    stop("grid_sfにフィールドがありません: ", field_name)
+  }
+
+  out <- terra::rasterize(
+    terra::vect(grid_sf),
+    template_r,
+    field = field_name,
+    background = background,
+    touches = touches,
+    fun = "max"
+  )
+
+  names(out) <- field_name
+  out
+}
+
+write_gpkg_layer_safe <- function(x, dsn, layer) {
+  if (is.null(x) || nrow(x) == 0) {
+    message("スキップ: ", layer, " は0件です。")
+    return(invisible(NULL))
+  }
+
+  x <- sf::st_make_valid(x)
+
+  sf::st_write(
+    x,
+    dsn = dsn,
+    layer = layer,
+    delete_layer = TRUE,
+    quiet = TRUE
+  )
+
+  message("出力: ", layer, " / ", dsn)
+  invisible(NULL)
+}
+
+safe_global <- function(r, funs = c("min", "max", "mean"), label = NULL) {
+  if (!is.null(label)) {
+    cat("\n---", label, "---\n")
+  }
+
+  if (is.null(r)) {
+    cat("NULLです。\n")
+    return(invisible(NULL))
+  }
+
+  print(terra::global(r, funs, na.rm = TRUE))
+}
+
+safe_ratio_raster <- function(numerator, denominator, min_denominator = 1) {
+  denominator_safe <- terra::ifel(
+    is.na(denominator) | denominator < min_denominator,
+    min_denominator,
+    denominator
+  )
+  numerator / denominator_safe
+}
+```
+
+## paths
+
+**目的**：入力ファイルと出力フォルダを定義する。  
+**達成指標**：`auto-cor-results/interim` と `auto-cor-results/final` 以下に必要なサブフォルダが作成される。
+
+```{r paths}
+raw_dir <- "data_raw"
+results_dir <- "auto-cor-results"
+interim_dir <- file.path(results_dir, "interim")
+final_dir <- file.path(results_dir, "final")
+
+interim_csv_dir <- file.path(interim_dir, "csv")
+interim_raster_dir <- file.path(interim_dir, "raster")
+final_csv_dir <- file.path(final_dir, "csv")
+final_raster_dir <- file.path(final_dir, "raster")
+final_gpkg_dir <- file.path(final_dir, "gpkg")
+
+for (d in c(
+  raw_dir,
+  results_dir,
+  interim_dir,
+  final_dir,
+  interim_csv_dir,
+  interim_raster_dir,
+  final_csv_dir,
+  final_raster_dir,
+  final_gpkg_dir
+)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+gpkg_path <- file.path(raw_dir, "Kokubunji_Jomon.gpkg")
+dem_path <- file.path(raw_dir, "10mDEM.tif")
+
+raw_gpkg_url <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/Kokubunji_Jomon.gpkg"
+raw_dem_url <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/10mDEM.tif"
+
+final_gpkg <- file.path(final_gpkg_dir, "supported_autocorrelation_outputs.gpkg")
+
+cat("results_dir:", results_dir, "\n")
+cat("interim_dir:", interim_dir, "\n")
+cat("final_dir:", final_dir, "\n")
+```
+
+## download-data
+
+**目的**：必要な入力ファイルがローカルにない場合にGitHubから取得する。  
+**達成指標**：`Kokubunji_Jomon.gpkg` と `10mDEM.tif` が `data_raw` に存在する。
+
+```{r download-data}
+if (!file.exists(gpkg_path)) {
+  cat("GPKGをダウンロードします。\n")
+  utils::download.file(raw_gpkg_url, gpkg_path, mode = "wb", quiet = FALSE)
+}
+
+if (!file.exists(dem_path)) {
+  cat("DEMをダウンロードします。\n")
+  utils::download.file(raw_dem_url, dem_path, mode = "wb", quiet = FALSE)
+}
+
+if (!file.exists(gpkg_path)) {
+  stop("GPKGが見つかりません: ", gpkg_path)
+}
+
+if (!file.exists(dem_path)) {
+  stop("DEMが見つかりません: ", dem_path)
+}
+
+file.info(gpkg_path)
+file.info(dem_path)
+```
+
+# Stage 1: Read data and create observation frame
+
+## inspect-gpkg-layers
+
+**目的**：GPKG内のレイヤ名を確認する。  
+**達成指標**：trench、住居点、市域境界に相当するレイヤ名が確認できる。
+
+```{r inspect-gpkg-layers}
+gpkg_layers <- sf::st_layers(gpkg_path)
+gpkg_layers$name
+```
+
+## read-data
+
+**目的**：trenchポリゴン、住居点、市域境界、DEMを読み込む。  
+**達成指標**：`trench_polygon`、`dwelling_points`、`city_boundary`、`dem_r` が作成される。
+
+```{r read-data}
+read_layer_flexible <- function(gpkg, candidates, object_label) {
+  available_layers <- sf::st_layers(gpkg)$name
+  hit <- candidates[candidates %in% available_layers]
+
+  if (length(hit) == 0) {
+    stop(
+      object_label, " に対応するレイヤが見つかりません。候補: ",
+      paste(candidates, collapse = ", "),
+      " / 利用可能レイヤ: ",
+      paste(available_layers, collapse = ", ")
+    )
+  }
+
+  sf::st_read(gpkg, layer = hit[1], quiet = TRUE)
+}
+
+trench_polygon <- read_layer_flexible(
+  gpkg_path,
+  c("trench_polygon", "trenchi_polygon"),
+  "trench_polygon"
+)
+
+dwelling_points <- read_layer_flexible(
+  gpkg_path,
+  c("jdwelling_point", "dwelling_point", "dwelling_points"),
+  "dwelling_points"
+)
+
+city_boundary <- read_layer_flexible(
+  gpkg_path,
+  c("kokubunji_city_boundary", "city_boundary", "kokubunji_city_buffer"),
+  "city_boundary"
+)
+
+dem_r <- terra::rast(dem_path)
+
+target_crs <- sf::st_crs(terra::crs(dem_r))
+
+trench_polygon <- trench_polygon |>
+  sf::st_make_valid() |>
+  sf::st_transform(target_crs)
+
+dwelling_points <- dwelling_points |>
+  sf::st_make_valid() |>
+  sf::st_transform(target_crs)
+
+city_boundary <- city_boundary |>
+  sf::st_make_valid() |>
+  sf::st_transform(target_crs)
+
+cat("trench count:", nrow(trench_polygon), "\n")
+cat("dwelling point count:", nrow(dwelling_points), "\n")
+cat("city boundary count:", nrow(city_boundary), "\n")
+print(dem_r)
+```
+
+## create-analysis-grid
+
+**目的**：DEMテンプレートに沿って、市域内の10m解析グリッドを作成する。  
+**達成指標**：`grid10` が10mセル単位で作成され、セル数が市域面積として妥当である。
+
+```{r create-analysis-grid}
+city_mask_r <- terra::rasterize(
+  terra::vect(city_boundary),
+  dem_r[[1]],
+  field = 1,
+  background = NA,
+  touches = TRUE
+)
+
+names(city_mask_r) <- "city_mask"
+template_r <- city_mask_r
+
+cell_id_r <- terra::init(city_mask_r, "cell")
+cell_id_r <- terra::mask(cell_id_r, city_mask_r)
+names(cell_id_r) <- "raster_cell_id"
+
+grid10 <- terra::as.polygons(
+  cell_id_r,
+  values = TRUE,
+  na.rm = TRUE,
+  dissolve = FALSE
+) |>
+  sf::st_as_sf() |>
+  sf::st_make_valid()
+
+names(grid10)[1] <- "raster_cell_id"
+
+grid10 <- grid10 |>
+  dplyr::mutate(
+    grid_id = dplyr::row_number()
+  )
+
+grid10$cell_area_m2 <- as.numeric(
+  sf::st_area(sf::st_geometry(grid10))
+)
+
+grid10 <- grid10 |>
+  dplyr::select(
+    grid_id,
+    raster_cell_id,
+    cell_area_m2
+  )
+
+cat("grid10 cell count:", nrow(grid10), "\n")
+summary(grid10$cell_area_m2)
+```
+
+## assign-grid-response
+
+**目的**：10mグリッドに `response = 1 / 0 / NA` を付与する。  
+**達成指標**：presence、absence、no_data がそれぞれ作成され、presenceセル数と住居点数の関係が確認できる。
+
+```{r assign-grid-response}
+surveyed_ratio_min_for_absence <- 0.25
+
+trench_valid <- trench_polygon |>
+  sf::st_make_valid()
+
+surveyed_union_geom <- sf::st_union(sf::st_geometry(trench_valid))
+
+surveyed_union <- sf::st_sf(
+  surveyed_dummy = 1L,
+  geometry = surveyed_union_geom,
+  crs = sf::st_crs(grid10)
+)
+
+dwelling_points_for_join <- dwelling_points |>
+  sf::st_make_valid() |>
+  dplyr::mutate(dwelling_dummy = 1L) |>
+  dplyr::select(dwelling_dummy)
+
+dwelling_join <- sf::st_join(
+  grid10,
+  dwelling_points_for_join,
+  join = sf::st_intersects,
+  left = TRUE
+)
+
+dwelling_presence_by_grid <- dwelling_join |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(grid_id) |>
+  dplyr::summarise(
+    dwelling_presence = as.integer(any(!is.na(dwelling_dummy))),
+    dwelling_count = sum(!is.na(dwelling_dummy)),
+    .groups = "drop"
+  )
+
+grid10_for_intersection <- grid10 |>
+  dplyr::select(grid_id, cell_area_m2)
+
+grid10_intersection <- suppressWarnings(
+  sf::st_intersection(
+    grid10_for_intersection,
+    surveyed_union
+  )
+)
+
+if (nrow(grid10_intersection) > 0) {
+  grid10_intersection <- grid10_intersection |>
+    sf::st_make_valid()
+
+  grid10_intersection$surveyed_area_m2 <- as.numeric(
+    sf::st_area(sf::st_geometry(grid10_intersection))
+  )
+
+  surveyed_area_by_grid <- grid10_intersection |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(grid_id) |>
+    dplyr::summarise(
+      surveyed_area_m2 = sum(surveyed_area_m2, na.rm = TRUE),
+      .groups = "drop"
+    )
+} else {
+  surveyed_area_by_grid <- tibble::tibble(
+    grid_id = integer(0),
+    surveyed_area_m2 = numeric(0)
+  )
+}
+
+grid10 <- grid10 |>
+  dplyr::left_join(dwelling_presence_by_grid, by = "grid_id") |>
+  dplyr::left_join(surveyed_area_by_grid, by = "grid_id") |>
+  dplyr::mutate(
+    dwelling_presence = tidyr::replace_na(dwelling_presence, 0L),
+    dwelling_count = tidyr::replace_na(dwelling_count, 0L),
+    surveyed_area_m2 = tidyr::replace_na(surveyed_area_m2, 0),
+    surveyed_ratio = pmin(surveyed_area_m2 / cell_area_m2, 1),
+    response = dplyr::case_when(
+      dwelling_presence == 1L ~ 1L,
+      surveyed_ratio >= surveyed_ratio_min_for_absence ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    cell_status = dplyr::case_when(
+      response == 1L ~ "presence",
+      response == 0L ~ "absence",
+      is.na(response) ~ "no_data",
+      TRUE ~ "unknown"
+    )
+  )
+
+response_summary <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    presence_cells = sum(response == 1L, na.rm = TRUE),
+    absence_cells = sum(response == 0L, na.rm = TRUE),
+    no_data_cells = sum(is.na(response)),
+    dwelling_points_in_grid = sum(dwelling_count, na.rm = TRUE),
+    surveyed_area_total_m2 = sum(surveyed_area_m2, na.rm = TRUE),
+    surveyed_ratio_min = min(surveyed_ratio, na.rm = TRUE),
+    surveyed_ratio_med = median(surveyed_ratio, na.rm = TRUE),
+    surveyed_ratio_max = max(surveyed_ratio, na.rm = TRUE)
+  )
+
+print(table(grid10$response, useNA = "ifany"))
+print(response_summary)
+
+readr::write_csv(
+  response_summary,
+  file.path(interim_csv_dir, "interim_grid_response_summary.csv")
+)
+```
+
+## rasterize-status-layers
+
+**目的**：presence、absence、no_data、surveyed areaをラスタ化する。  
+**達成指標**：`absence_area_r` と `surveyed_area_r` が非ゼロで、`local_absence_ratio` の分子・分母として整合的に使える。
+
+```{r rasterize-status-layers}
+grid10_status <- grid10 |>
+  dplyr::mutate(
+    presence_flag = dplyr::if_else(response == 1L, 1L, 0L, missing = 0L),
+    absence_flag = dplyr::if_else(response == 0L, 1L, 0L, missing = 0L),
+    no_data_flag = dplyr::if_else(is.na(response), 1L, 0L),
+    city_area_m2 = cell_area_m2,
+    presence_area_m2 = dplyr::if_else(presence_flag == 1L, surveyed_area_m2, 0),
+    absence_area_m2 = dplyr::if_else(absence_flag == 1L, surveyed_area_m2, 0),
+    no_data_area_m2 = dplyr::if_else(no_data_flag == 1L, cell_area_m2, 0),
+    surveyed_area_m2 = tidyr::replace_na(surveyed_area_m2, 0)
+  )
+
+status_summary <- grid10_status |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    presence_cells = sum(presence_flag, na.rm = TRUE),
+    absence_cells = sum(absence_flag, na.rm = TRUE),
+    no_data_cells = sum(no_data_flag, na.rm = TRUE),
+    presence_area_sum_m2 = sum(presence_area_m2, na.rm = TRUE),
+    absence_area_sum_m2 = sum(absence_area_m2, na.rm = TRUE),
+    no_data_area_sum_m2 = sum(no_data_area_m2, na.rm = TRUE),
+    surveyed_area_sum_m2 = sum(surveyed_area_m2, na.rm = TRUE)
+  )
+
+print(status_summary)
+
+presence_binary_r <- rasterize_grid_field(
+  grid10_status,
+  "presence_flag",
+  template_r,
+  background = 0
+)
+names(presence_binary_r) <- "presence_binary"
+
+dwelling_count_r <- rasterize_grid_field(
+  grid10_status,
+  "dwelling_count",
+  template_r,
+  background = 0
+)
+names(dwelling_count_r) <- "dwelling_count"
+
+presence_area_r <- rasterize_grid_field(
+  grid10_status,
+  "presence_area_m2",
+  template_r,
+  background = 0
+)
+names(presence_area_r) <- "presence_area_m2"
+
+absence_area_r <- rasterize_grid_field(
+  grid10_status,
+  "absence_area_m2",
+  template_r,
+  background = 0
+)
+names(absence_area_r) <- "absence_area_m2"
+
+no_data_area_r <- rasterize_grid_field(
+  grid10_status,
+  "no_data_area_m2",
+  template_r,
+  background = 0
+)
+names(no_data_area_r) <- "no_data_area_m2"
+
+surveyed_area_r <- rasterize_grid_field(
+  grid10_status,
+  "surveyed_area_m2",
+  template_r,
+  background = 0
+)
+names(surveyed_area_r) <- "surveyed_area_m2"
+
+city_area_r <- rasterize_grid_field(
+  grid10_status,
+  "city_area_m2",
+  template_r,
+  background = 0
+)
+names(city_area_r) <- "city_area_m2"
+
+safe_global(absence_area_r, c("min", "max", "mean", "sum"), "absence_area_r")
+safe_global(surveyed_area_r, c("min", "max", "mean", "sum"), "surveyed_area_r")
+
+readr::write_csv(
+  status_summary,
+  file.path(interim_csv_dir, "interim_status_area_summary.csv")
+)
+```
+
+# Stage 2: Parameters for dense / isolated distinction
+
+## dwelling-neighbor-distances
+
+**目的**：住居点間の最近傍距離を算出し、密集範囲の通常隣接距離を推定するための基礎分布を作る。  
+**達成指標**：最近傍距離、第2近傍距離の分位テーブルが出力される。
+
+```{r dwelling-neighbor-distances}
+dwelling_points_analysis <- dwelling_points |>
+  sf::st_transform(sf::st_crs(grid10)) |>
+  sf::st_make_valid() |>
+  dplyr::mutate(
+    dwelling_id = dplyr::row_number()
+  )
+
+coords <- sf::st_coordinates(dwelling_points_analysis)
+
+if (nrow(coords) < 3) {
+  stop("住居点が少なすぎるため、自己相関分析を実行できません。")
+}
+
+dist_mat <- as.matrix(stats::dist(coords))
+diag(dist_mat) <- Inf
+
+nn1_m <- apply(dist_mat, 1, min, na.rm = TRUE)
+nn2_m <- apply(dist_mat, 1, function(x) sort(x, partial = 2)[2])
+
+neighbor_distance_table <- tibble::tibble(
+  dwelling_id = dwelling_points_analysis$dwelling_id,
+  nn1_m = nn1_m,
+  nn2_m = nn2_m
+)
+
+neighbor_distance_quantiles <- tibble::tibble(
+  metric = c("nn1_m", "nn2_m"),
+  q10 = c(
+    stats::quantile(nn1_m, 0.10, na.rm = TRUE),
+    stats::quantile(nn2_m, 0.10, na.rm = TRUE)
+  ),
+  q25 = c(
+    stats::quantile(nn1_m, 0.25, na.rm = TRUE),
+    stats::quantile(nn2_m, 0.25, na.rm = TRUE)
+  ),
+  q50 = c(
+    stats::quantile(nn1_m, 0.50, na.rm = TRUE),
+    stats::quantile(nn2_m, 0.50, na.rm = TRUE)
+  ),
+  q75 = c(
+    stats::quantile(nn1_m, 0.75, na.rm = TRUE),
+    stats::quantile(nn2_m, 0.75, na.rm = TRUE)
+  ),
+  q90 = c(
+    stats::quantile(nn1_m, 0.90, na.rm = TRUE),
+    stats::quantile(nn2_m, 0.90, na.rm = TRUE)
+  ),
+  q95 = c(
+    stats::quantile(nn1_m, 0.95, na.rm = TRUE),
+    stats::quantile(nn2_m, 0.95, na.rm = TRUE)
+  )
+)
+
+print(neighbor_distance_quantiles)
+
+readr::write_csv(
+  neighbor_distance_table,
+  file.path(interim_csv_dir, "interim_dwelling_neighbor_distances.csv")
+)
+
+readr::write_csv(
+  neighbor_distance_quantiles,
+  file.path(interim_csv_dir, "interim_neighbor_distance_quantiles.csv")
+)
+```
+
+## define-clustering-functions
+
+**目的**：DBSCAN相当の密度ベースクラスタリング関数と評価関数を定義する。  
+**達成指標**：`run_dbscan_like()` と `evaluate_clustering_params()` が利用可能になる。
+
+```{r define-clustering-functions}
+run_dbscan_like <- function(coords, eps_m, min_pts) {
+  n <- nrow(coords)
+
+  if (n < 1) {
+    return(list(
+      cluster_id = integer(0),
+      is_core = logical(0),
+      neighbor_count = integer(0)
+    ))
+  }
+
+  d <- as.matrix(stats::dist(coords))
+  neighbor_count <- rowSums(d <= eps_m, na.rm = TRUE)
+  is_core <- neighbor_count >= min_pts
+  cluster_id <- rep(0L, n)
+  visited_core <- rep(FALSE, n)
+  current_cluster <- 0L
+
+  for (i in which(is_core)) {
+    if (visited_core[i]) {
+      next
+    }
+
+    current_cluster <- current_cluster + 1L
+    queue <- i
+    visited_core[i] <- TRUE
+    cluster_id[i] <- current_cluster
+
+    while (length(queue) > 0) {
+      q <- queue[1]
+      queue <- queue[-1]
+
+      core_neighbors <- which(d[q, ] <= eps_m & is_core)
+      new_core_neighbors <- core_neighbors[!visited_core[core_neighbors]]
+
+      if (length(new_core_neighbors) > 0) {
+        visited_core[new_core_neighbors] <- TRUE
+        cluster_id[new_core_neighbors] <- current_cluster
+        queue <- c(queue, new_core_neighbors)
+      }
+    }
+  }
+
+  non_core <- which(!is_core)
+  core_indices <- which(is_core)
+
+  if (length(non_core) > 0 && length(core_indices) > 0) {
+    for (i in non_core) {
+      core_within <- core_indices[d[i, core_indices] <= eps_m]
+
+      if (length(core_within) > 0) {
+        nearest_core <- core_within[which.min(d[i, core_within])]
+        cluster_id[i] <- cluster_id[nearest_core]
+      }
+    }
+  }
+
+  list(
+    cluster_id = cluster_id,
+    is_core = is_core,
+    neighbor_count = neighbor_count
+  )
+}
+
+get_within_cluster_nn <- function(coords, cluster_id, target_clusters) {
+  out <- numeric(0)
+
+  for (cid in target_clusters) {
+    idx <- which(cluster_id == cid)
+
+    if (length(idx) < 2) {
+      next
+    }
+
+    d_sub <- as.matrix(stats::dist(coords[idx, , drop = FALSE]))
+    diag(d_sub) <- Inf
+    out <- c(out, apply(d_sub, 1, min, na.rm = TRUE))
+  }
+
+  out
+}
+
+evaluate_clustering_params <- function(coords, eps_m, min_pts, dense_cluster_min_n = 5) {
+  cl <- run_dbscan_like(coords, eps_m = eps_m, min_pts = min_pts)
+  cluster_id <- cl$cluster_id
+
+  cluster_sizes <- tibble::tibble(cluster_id = cluster_id) |>
+    dplyr::filter(cluster_id > 0) |>
+    dplyr::count(cluster_id, name = "cluster_size")
+
+  n_points <- nrow(coords)
+  n_clustered_points <- sum(cluster_id > 0)
+  n_noise_points <- sum(cluster_id == 0)
+  n_clusters <- nrow(cluster_sizes)
+  dense_clusters <- cluster_sizes |>
+    dplyr::filter(cluster_size >= dense_cluster_min_n)
+
+  dense_cluster_ids <- dense_clusters$cluster_id
+  dense_clustered_points <- sum(dense_clusters$cluster_size, na.rm = TRUE)
+
+  within_dense_nn <- get_within_cluster_nn(
+    coords,
+    cluster_id,
+    dense_cluster_ids
+  )
+
+  largest_cluster_n <- if (nrow(cluster_sizes) > 0) {
+    max(cluster_sizes$cluster_size, na.rm = TRUE)
+  } else {
+    0L
+  }
+
+  tibble::tibble(
+    eps_m = eps_m,
+    min_pts = min_pts,
+    n_points = n_points,
+    n_clusters = n_clusters,
+    n_clustered_points = n_clustered_points,
+    n_noise_points = n_noise_points,
+    clustered_point_ratio = n_clustered_points / n_points,
+    noise_point_ratio = n_noise_points / n_points,
+    dense_cluster_min_n = dense_cluster_min_n,
+    dense_cluster_count = nrow(dense_clusters),
+    dense_clustered_points = dense_clustered_points,
+    dense_clustered_point_ratio = dense_clustered_points / n_points,
+    largest_cluster_n = largest_cluster_n,
+    largest_cluster_point_ratio = largest_cluster_n / n_points,
+    cluster_size_median = if (nrow(cluster_sizes) > 0) median(cluster_sizes$cluster_size) else NA_real_,
+    dense_nn_median = if (length(within_dense_nn) > 0) median(within_dense_nn, na.rm = TRUE) else NA_real_,
+    dense_nn_q75 = if (length(within_dense_nn) > 0) stats::quantile(within_dense_nn, 0.75, na.rm = TRUE) else NA_real_,
+    dense_nn_q90 = if (length(within_dense_nn) > 0) stats::quantile(within_dense_nn, 0.90, na.rm = TRUE) else NA_real_
+  )
+}
+```
+
+## parameter-sweep-clustering
+
+**目的**：複数の `eps` と `minPts` を評価し、密集・孤立識別に使える候補を比較する。  
+**達成指標**：パラメータ評価テーブルがCSV出力され、過分割・過結合・密集検出不足の判断材料が得られる。
+
+```{r parameter-sweep-clustering}
+small_cluster_max_n <- 2
+dense_cluster_min_n <- 5
+
+fixed_eps_candidates <- c(20, 30, 40, 50, 60, 75, 100)
+data_eps_candidates <- c(
+  stats::quantile(nn1_m, c(0.50, 0.75, 0.90, 0.95), na.rm = TRUE),
+  stats::quantile(nn2_m, c(0.50, 0.75, 0.90, 0.95), na.rm = TRUE)
+)
+
+eps_candidates_m <- sort(unique(round(c(fixed_eps_candidates, data_eps_candidates) / 5) * 5))
+eps_candidates_m <- eps_candidates_m[is.finite(eps_candidates_m)]
+eps_candidates_m <- eps_candidates_m[eps_candidates_m >= 10 & eps_candidates_m <= 150]
+
+min_pts_candidates <- c(3, 4, 5)
+
+parameter_grid <- tidyr::expand_grid(
+  eps_m = eps_candidates_m,
+  min_pts = min_pts_candidates
+)
+
+parameter_evaluation <- purrr::map2_dfr(
+  parameter_grid$eps_m,
+  parameter_grid$min_pts,
+  function(eps_value, min_pts_value) {
+    evaluate_clustering_params(
+      coords,
+      eps_m = eps_value,
+      min_pts = min_pts_value,
+      dense_cluster_min_n = dense_cluster_min_n
+    )
+  }
+)
+
+parameter_evaluation <- parameter_evaluation |>
+  dplyr::mutate(
+    check_dense_detected = dense_cluster_count >= 1,
+    check_dense_ratio = dense_clustered_point_ratio >= 0.25 & dense_clustered_point_ratio <= 0.90,
+    check_noise_not_excessive = noise_point_ratio <= 0.60,
+    check_overmerge_not_severe = largest_cluster_point_ratio <= 0.60,
+    check_d_adj_available = is.finite(dense_nn_q90),
+    criteria_score =
+      as.integer(check_dense_detected) +
+      as.integer(check_dense_ratio) +
+      as.integer(check_noise_not_excessive) +
+      as.integer(check_overmerge_not_severe) +
+      as.integer(check_d_adj_available),
+    interpretation = dplyr::case_when(
+      !check_dense_detected ~ "密集クラスターが検出されないため不適",
+      !check_noise_not_excessive ~ "noiseが多く、密集範囲を拾いきれていない可能性",
+      !check_overmerge_not_severe ~ "最大クラスターが大きく、過結合の可能性",
+      criteria_score >= 4 ~ "候補として有望。QGISで密集・孤立の分離を確認",
+      TRUE ~ "要確認"
+    )
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(criteria_score),
+    min_pts,
+    eps_m
+  )
+
+parameter_interpretation_guide <- tibble::tibble(
+  item = c(
+    "dense_cluster_count",
+    "dense_clustered_point_ratio",
+    "noise_point_ratio",
+    "largest_cluster_point_ratio",
+    "dense_nn_q90"
+  ),
+  judgement = c(
+    "1以上であること。0の場合は密集範囲を識別できていない。",
+    "0.25〜0.90程度を目安とする。低すぎると拾い漏れ、高すぎると過結合。",
+    "0.60以下を目安とする。高すぎる場合はepsが小さすぎる可能性。",
+    "0.60以下を目安とする。高すぎる場合は別集落を結合している可能性。",
+    "密集範囲内の通常隣接距離 d_adj の候補。孤立判定リングの基準に使う。"
+  )
+)
+
+print(parameter_evaluation)
+print(parameter_interpretation_guide)
+
+readr::write_csv(
+  parameter_evaluation,
+  file.path(interim_csv_dir, "interim_parameter_evaluation.csv")
+)
+
+readr::write_csv(
+  parameter_interpretation_guide,
+  file.path(interim_csv_dir, "interim_parameter_interpretation_guide.csv")
+)
+```
+
+## select-candidate-parameters
+
+**目的**：候補パラメータを自動提示する。ただし最終採用前にQGISで必ず確認する。  
+**達成指標**：`selected_eps_m`、`selected_min_pts`、`selected_d_adj_m` が仮設定され、判断表が出力される。
+
+```{r select-candidate-parameters}
+recommended_params <- parameter_evaluation |>
+  dplyr::filter(criteria_score == max(criteria_score, na.rm = TRUE)) |>
+  dplyr::arrange(
+    dplyr::desc(check_overmerge_not_severe),
+    dplyr::desc(check_dense_ratio),
+    eps_m,
+    min_pts
+  )
+
+if (nrow(recommended_params) == 0) {
+  stop("推奨パラメータ候補を作成できませんでした。parameter_evaluationを確認してください。")
+}
+
+selected_eps_m <- recommended_params$eps_m[1]
+selected_min_pts <- recommended_params$min_pts[1]
+selected_d_adj_m <- recommended_params$dense_nn_q90[1]
+
+if (!is.finite(selected_d_adj_m)) {
+  selected_d_adj_m <- selected_eps_m
+}
+
+isolation_ring_inner_m <- selected_d_adj_m
+isolation_ring_outer_m <- max(3 * selected_d_adj_m, 50)
+
+selected_parameters <- tibble::tibble(
+  selected_eps_m = selected_eps_m,
+  selected_min_pts = selected_min_pts,
+  dense_cluster_min_n = dense_cluster_min_n,
+  small_cluster_max_n = small_cluster_max_n,
+  selected_d_adj_m = selected_d_adj_m,
+  isolation_ring_inner_m = isolation_ring_inner_m,
+  isolation_ring_outer_m = isolation_ring_outer_m,
+  note = "自動推奨値。QGISで密集・孤立識別を確認後、必要なら手動修正する。"
+)
+
+print(selected_parameters)
+
+readr::write_csv(
+  recommended_params,
+  file.path(interim_csv_dir, "interim_recommended_parameter_candidates.csv")
+)
+
+readr::write_csv(
+  selected_parameters,
+  file.path(interim_csv_dir, "interim_selected_parameters_initial.csv")
+)
+```
+
+## build-interim-cluster-layers
+
+**目的**：仮選択パラメータで住居点を密集クラスター・小規模群・noiseへ分類し、QGIS確認用レイヤを作る。  
+**達成指標**：`interim_` レイヤがGPKGに出力され、密集範囲と孤立候補を視覚確認できる。
+
+```{r build-interim-cluster-layers}
+build_group_ids <- function(cluster_id) {
+  max_cluster <- max(cluster_id, na.rm = TRUE)
+  if (!is.finite(max_cluster)) {
+    max_cluster <- 0L
+  }
+
+  out <- character(length(cluster_id))
+  noise_counter <- 0L
+
+  for (i in seq_along(cluster_id)) {
+    if (cluster_id[i] > 0) {
+      out[i] <- paste0("C", cluster_id[i])
+    } else {
+      noise_counter <- noise_counter + 1L
+      out[i] <- paste0("N", noise_counter)
+    }
+  }
+
+  out
+}
+
+build_group_geometries <- function(point_sf, group_col = "group_id") {
+  group_ids <- sort(unique(point_sf[[group_col]]))
+
+  geom_list <- vector("list", length(group_ids))
+  out_rows <- vector("list", length(group_ids))
+
+  for (i in seq_along(group_ids)) {
+    gid <- group_ids[i]
+    pts <- point_sf[point_sf[[group_col]] == gid, ]
+    geom_union <- sf::st_union(sf::st_geometry(pts))
+    hull <- sf::st_convex_hull(geom_union)
+    hull_buffered <- sf::st_buffer(hull, 1)
+
+    geom_list[[i]] <- hull_buffered[[1]]
+
+    out_rows[[i]] <- tibble::tibble(
+      group_id = gid,
+      n_dwellings = nrow(pts),
+      dbscan_cluster_id = if (all(pts$dbscan_cluster_id > 0)) unique(pts$dbscan_cluster_id)[1] else 0L,
+      has_noise_point = any(pts$dbscan_cluster_id == 0),
+      n_core_points = sum(pts$is_core, na.rm = TRUE),
+      mean_neighbor_count = mean(pts$neighbor_count, na.rm = TRUE)
+    )
+  }
+
+  attr_df <- dplyr::bind_rows(out_rows)
+
+  sf::st_sf(
+    attr_df,
+    geometry = sf::st_sfc(geom_list, crs = sf::st_crs(point_sf))
+  ) |>
+    sf::st_make_valid()
+}
+
+selected_clustering <- run_dbscan_like(
+  coords,
+  eps_m = selected_eps_m,
+  min_pts = selected_min_pts
+)
+
+dwelling_points_grouped <- dwelling_points_analysis |>
+  dplyr::mutate(
+    dbscan_cluster_id = selected_clustering$cluster_id,
+    is_core = selected_clustering$is_core,
+    neighbor_count = selected_clustering$neighbor_count,
+    group_id = build_group_ids(dbscan_cluster_id)
+  )
+
+group_sizes <- dwelling_points_grouped |>
+  sf::st_drop_geometry() |>
+  dplyr::count(group_id, name = "group_size")
+
+dwelling_points_grouped <- dwelling_points_grouped |>
+  dplyr::left_join(group_sizes, by = "group_id") |>
+  dplyr::mutate(
+    interim_group_type = dplyr::case_when(
+      group_size >= dense_cluster_min_n ~ "dense_candidate",
+      group_size <= small_cluster_max_n ~ "small_or_isolated_candidate",
+      TRUE ~ "intermediate_candidate"
+    )
+  )
+
+group_geometries_interim <- build_group_geometries(
+  dwelling_points_grouped,
+  group_col = "group_id"
+) |>
+  dplyr::mutate(
+    interim_group_type = dplyr::case_when(
+      n_dwellings >= dense_cluster_min_n ~ "dense_candidate",
+      n_dwellings <= small_cluster_max_n ~ "small_or_isolated_candidate",
+      TRUE ~ "intermediate_candidate"
+    ),
+    selected_eps_m = selected_eps_m,
+    selected_min_pts = selected_min_pts
+  )
+
+interim_cluster_summary <- group_geometries_interim |>
+  sf::st_drop_geometry()
+
+print(interim_cluster_summary)
+
+readr::write_csv(
+  interim_cluster_summary,
+  file.path(interim_csv_dir, "interim_selected_group_summary.csv")
+)
+
+if (file.exists(final_gpkg)) {
+  unlink(final_gpkg)
+}
+
+write_gpkg_layer_safe(
+  dwelling_points_grouped,
+  final_gpkg,
+  "interim_dwelling_points_grouped"
+)
+
+write_gpkg_layer_safe(
+  group_geometries_interim,
+  final_gpkg,
+  "interim_group_geometries"
+)
+
+write_gpkg_layer_safe(
+  grid10 |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      dwelling_count,
+      surveyed_ratio,
+      surveyed_area_m2,
+      cell_area_m2
+    ),
+  final_gpkg,
+  "interim_grid_response"
+)
+
+cat("中間検証用GPKG:", final_gpkg, "\n")
+```
+
+## interim-local-absence-and-open-ratios
+
+**目的**：最終スコアの基礎となるabsence比率、no_data開放度、調査面積補正密度を事前計算する。  
+**達成指標**：`absence_penalty_50m_r` と `open_no_data_score_100m_r` が0〜1の連続値として作成される。
+
+```{r interim-local-absence-and-open-ratios}
+local_radii_m <- c(50, 100)
+
+local_surveyed_area_rasters <- list()
+local_absence_area_rasters <- list()
+local_absence_ratio_rasters <- list()
+local_no_data_ratio_rasters <- list()
+
+for (radius_m in local_radii_m) {
+  radius_key <- as.character(radius_m)
+
+  local_surveyed <- focal_sum_circle(surveyed_area_r, radius_m)
+  names(local_surveyed) <- paste0("local_surveyed_area_", radius_m, "m")
+
+  local_absence <- focal_sum_circle(absence_area_r, radius_m)
+  names(local_absence) <- paste0("local_absence_area_", radius_m, "m")
+
+  local_no_data <- focal_sum_circle(no_data_area_r, radius_m)
+  names(local_no_data) <- paste0("local_no_data_area_", radius_m, "m")
+
+  local_city <- focal_sum_circle(city_area_r, radius_m)
+  names(local_city) <- paste0("local_city_area_", radius_m, "m")
+
+  local_absence_ratio <- safe_ratio_raster(
+    local_absence,
+    local_surveyed,
+    min_denominator = 1
+  )
+  local_absence_ratio <- clamp01_raster(local_absence_ratio)
+  names(local_absence_ratio) <- paste0("local_absence_ratio_", radius_m, "m")
+
+  local_no_data_ratio <- safe_ratio_raster(
+    local_no_data,
+    local_city,
+    min_denominator = 1
+  )
+  local_no_data_ratio <- clamp01_raster(local_no_data_ratio)
+  names(local_no_data_ratio) <- paste0("local_no_data_ratio_", radius_m, "m")
+
+  local_surveyed_area_rasters[[radius_key]] <- local_surveyed
+  local_absence_area_rasters[[radius_key]] <- local_absence
+  local_absence_ratio_rasters[[radius_key]] <- local_absence_ratio
+  local_no_data_ratio_rasters[[radius_key]] <- local_no_data_ratio
+}
+
+absence_penalty_50m_r <- local_absence_ratio_rasters[["50"]]
+names(absence_penalty_50m_r) <- "absence_penalty_50m"
+
+open_no_data_score_100m_r <- local_no_data_ratio_rasters[["100"]]
+names(open_no_data_score_100m_r) <- "open_no_data_score_100m"
+
+safe_global(absence_penalty_50m_r, c("min", "max", "mean"), "absence_penalty_50m_r")
+safe_global(open_no_data_score_100m_r, c("min", "max", "mean"), "open_no_data_score_100m_r")
+
+terra::writeRaster(
+  absence_penalty_50m_r,
+  file.path(interim_raster_dir, "interim_absence_penalty_50m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  open_no_data_score_100m_r,
+  file.path(interim_raster_dir, "interim_open_no_data_score_100m.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+```
+
+## manual-validation-gate
+
+**目的**：中間検証を明示的に行い、検証が通った場合のみ最終モデルへ進む。  
+**達成指標**：QGISで `interim_dwelling_points_grouped` と `interim_group_geometries` を確認し、`proceed_to_final_model` を手動で `TRUE` にする。
+
+```{r manual-validation-gate}
+# 初回実行時は必ず FALSE のままにしてください。
+# 以下を確認した後に TRUE へ変更します。
+# 1. dense_candidate が実際の密集住居群を十分拾えているか。
+# 2. small_or_isolated_candidate が単独・少数住居を過不足なく拾えているか。
+# 3. eps/minPts によって別集落が過結合していないか。
+# 4. selected_d_adj_m が密集範囲内の通常住居間距離として妥当か。
+
+proceed_to_final_model <- FALSE
+
+validation_checklist <- tibble::tibble(
+  check_item = c(
+    "dense_candidate は密集住居群を拾えている",
+    "small_or_isolated_candidate は単独・少数住居を拾えている",
+    "別集落の過結合がない",
+    "selected_d_adj_m は密集範囲内の通常隣接距離として妥当",
+    "検証後に proceed_to_final_model を TRUE に変更した"
+  ),
+  status = c(
+    "QGISで確認",
+    "QGISで確認",
+    "QGISで確認",
+    "パラメータ表とQGISで確認",
+    as.character(proceed_to_final_model)
+  )
+)
+
+print(selected_parameters)
+print(validation_checklist)
+
+readr::write_csv(
+  validation_checklist,
+  file.path(interim_csv_dir, "interim_manual_validation_checklist.csv")
+)
+```
+
+# Stage 3: Final supported model
+
+## compute-isolation-and-support
+
+**目的**：検証済みパラメータに基づき、各住居群の孤立度 `isolation_score` と、密集集落継続性への寄与度 `cluster_support` を算出する。  
+**達成指標**：小規模で、密集内通常距離より離れ、周囲が調査済みabsenceに囲まれる群ほど `isolation_score` が高くなる。
+
+```{r compute-isolation-and-support}
+if (!proceed_to_final_model) {
+  message("proceed_to_final_model = FALSE のため、最終モデル構築をスキップします。中間検証後に TRUE へ変更してください。")
+} else {
+  min_surveyed_ring_coverage <- 0.30
+
+  group_nearest_other_distance <- function(point_sf, group_col = "group_id") {
+    pts_coords <- sf::st_coordinates(point_sf)
+    groups <- point_sf[[group_col]]
+    d <- as.matrix(stats::dist(pts_coords))
+    diag(d) <- Inf
+
+    group_ids <- sort(unique(groups))
+
+    purrr::map_dfr(group_ids, function(gid) {
+      in_group <- which(groups == gid)
+      out_group <- which(groups != gid)
+
+      nearest_other <- if (length(out_group) > 0) {
+        min(d[in_group, out_group, drop = FALSE], na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+
+      tibble::tibble(
+        group_id = gid,
+        nearest_other_dwelling_m = nearest_other
+      )
+    })
+  }
+
+  compute_ring_stats_one <- function(group_row, grid_sf, inner_m, outer_m) {
+    group_geom <- sf::st_geometry(group_row)
+    outer_buffer <- sf::st_buffer(group_geom, outer_m)
+    inner_buffer <- sf::st_buffer(group_geom, inner_m)
+    ring_geom <- suppressWarnings(sf::st_difference(outer_buffer, inner_buffer))
+    ring_geom <- sf::st_make_valid(ring_geom)
+
+    ring_sf <- sf::st_sf(
+      group_id = group_row$group_id,
+      geometry = ring_geom,
+      crs = sf::st_crs(grid_sf)
+    )
+
+    ring_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(ring_sf)))
+
+    grid_subset <- grid_sf |>
+      dplyr::select(
+        grid_id,
+        response,
+        cell_status,
+        cell_area_m2,
+        surveyed_area_m2
+      )
+
+    inter <- suppressWarnings(sf::st_intersection(grid_subset, ring_sf))
+
+    if (nrow(inter) == 0 || !is.finite(ring_area_m2) || ring_area_m2 <= 0) {
+      return(tibble::tibble(
+        group_id = group_row$group_id,
+        ring_area_m2 = ring_area_m2,
+        surveyed_area_in_ring_m2 = 0,
+        absence_area_in_ring_m2 = 0,
+        no_data_area_in_ring_m2 = 0,
+        surveyed_ring_coverage = 0,
+        absence_ring_ratio = 0,
+        no_data_open_ratio = 0
+      ))
+    }
+
+    inter <- inter |>
+      sf::st_make_valid()
+
+    inter$intersect_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(inter)))
+
+    inter_df <- inter |>
+      sf::st_drop_geometry() |>
+      dplyr::mutate(
+        cell_fraction = dplyr::if_else(
+          cell_area_m2 > 0,
+          intersect_area_m2 / cell_area_m2,
+          0
+        ),
+        surveyed_area_part_m2 = surveyed_area_m2 * cell_fraction,
+        absence_area_part_m2 = dplyr::if_else(
+          response == 0L,
+          surveyed_area_m2 * cell_fraction,
+          0
+        ),
+        no_data_area_part_m2 = dplyr::if_else(
+          is.na(response),
+          intersect_area_m2,
+          0
+        )
+      )
+
+    surveyed_area_in_ring <- sum(inter_df$surveyed_area_part_m2, na.rm = TRUE)
+    absence_area_in_ring <- sum(inter_df$absence_area_part_m2, na.rm = TRUE)
+    no_data_area_in_ring <- sum(inter_df$no_data_area_part_m2, na.rm = TRUE)
+
+    tibble::tibble(
+      group_id = group_row$group_id,
+      ring_area_m2 = ring_area_m2,
+      surveyed_area_in_ring_m2 = surveyed_area_in_ring,
+      absence_area_in_ring_m2 = absence_area_in_ring,
+      no_data_area_in_ring_m2 = no_data_area_in_ring,
+      surveyed_ring_coverage = clamp01_numeric(surveyed_area_in_ring / ring_area_m2),
+      absence_ring_ratio = clamp01_numeric(absence_area_in_ring / max(surveyed_area_in_ring, 1)),
+      no_data_open_ratio = clamp01_numeric(no_data_area_in_ring / ring_area_m2)
+    )
+  }
+
+  group_nearest <- group_nearest_other_distance(
+    dwelling_points_grouped,
+    group_col = "group_id"
+  )
+
+  ring_stats <- purrr::map_dfr(
+    seq_len(nrow(group_geometries_interim)),
+    function(i) {
+      compute_ring_stats_one(
+        group_geometries_interim[i, ],
+        grid10,
+        inner_m = isolation_ring_inner_m,
+        outer_m = isolation_ring_outer_m
+      )
+    }
+  )
+
+  group_support_table <- group_geometries_interim |>
+    sf::st_drop_geometry() |>
+    dplyr::left_join(group_nearest, by = "group_id") |>
+    dplyr::left_join(ring_stats, by = "group_id") |>
+    dplyr::mutate(
+      small_size_factor = clamp01_numeric(
+        (dense_cluster_min_n - n_dwellings) /
+          (dense_cluster_min_n - small_cluster_max_n)
+      ),
+      size_support_factor = clamp01_numeric(
+        (n_dwellings - small_cluster_max_n) /
+          (dense_cluster_min_n - small_cluster_max_n)
+      ),
+      spacing_factor = clamp01_numeric(
+        (nearest_other_dwelling_m - selected_d_adj_m) /
+          (2 * selected_d_adj_m)
+      ),
+      surveyed_coverage_factor = clamp01_numeric(
+        surveyed_ring_coverage / min_surveyed_ring_coverage
+      ),
+      absence_enclosure_factor = clamp01_numeric(absence_ring_ratio),
+      isolation_score =
+        small_size_factor *
+        spacing_factor *
+        surveyed_coverage_factor *
+        absence_enclosure_factor,
+      cluster_support = size_support_factor * (1 - isolation_score),
+      isolated_dwelling_weight = isolation_score,
+      final_group_interpretation = dplyr::case_when(
+        n_dwellings >= dense_cluster_min_n & cluster_support >= 0.75 ~ "dense_supported_cluster",
+        n_dwellings <= small_cluster_max_n & isolation_score >= 0.50 ~ "isolated_dwelling_or_pair",
+        n_dwellings <= small_cluster_max_n & surveyed_coverage_factor < 0.50 ~ "small_group_unconfirmed_due_to_no_data",
+        size_support_factor > 0 & cluster_support > 0 ~ "intermediate_supported_group",
+        TRUE ~ "low_support_group"
+      )
+    ) |>
+    dplyr::arrange(
+      dplyr::desc(cluster_support),
+      dplyr::desc(isolation_score)
+    )
+
+  group_geometries_final <- group_geometries_interim |>
+    dplyr::left_join(
+      group_support_table,
+      by = c(
+        "group_id",
+        "n_dwellings",
+        "dbscan_cluster_id",
+        "has_noise_point",
+        "n_core_points",
+        "mean_neighbor_count",
+        "interim_group_type",
+        "selected_eps_m",
+        "selected_min_pts"
+      )
+    )
+
+  dwelling_points_final <- dwelling_points_grouped |>
+    dplyr::left_join(
+      group_support_table |>
+        dplyr::select(
+          group_id,
+          isolation_score,
+          cluster_support,
+          isolated_dwelling_weight,
+          final_group_interpretation
+        ),
+      by = "group_id"
+    )
+
+  print(group_support_table)
+
+  readr::write_csv(
+    group_support_table,
+    file.path(final_csv_dir, "final_group_isolation_support_table.csv")
+  )
+}
+```
+
+## build-supported-rasters
+
+**目的**：孤立住居の過大評価を避けるため、`cluster_support` で補正した近接・密度・open no_data ラスタを作成する。  
+**達成指標**：単独・孤立住居周辺の主スコア寄与が抑制され、密集クラスター近傍が主に評価される。
+
+```{r build-supported-rasters}
+if (!proceed_to_final_model) {
+  message("proceed_to_final_model = FALSE のため、supported rasters の作成をスキップします。")
+} else {
+  no_data_flag_r <- rasterize_grid_field(
+    grid10_status,
+    "no_data_flag",
+    template_r,
+    background = 0
+  )
+  names(no_data_flag_r) <- "no_data_flag"
+
+  support_distance_decay_m <- max(isolation_ring_outer_m, 50)
+  isolated_distance_decay_m <- max(selected_d_adj_m, 30)
+
+  support_groups <- group_geometries_final |>
+    dplyr::filter(cluster_support > 0)
+
+  supported_cluster_proximity_score_r <- template_r
+  supported_cluster_proximity_score_r[] <- 0
+  names(supported_cluster_proximity_score_r) <- "supported_cluster_proximity_score"
+
+  if (nrow(support_groups) > 0) {
+    for (i in seq_len(nrow(support_groups))) {
+      g <- support_groups[i, ]
+
+      group_seed_r <- terra::rasterize(
+        terra::vect(g),
+        template_r,
+        field = 1,
+        background = NA,
+        touches = TRUE
+      )
+
+      group_dist_r <- terra::distance(group_seed_r)
+      group_score_r <- g$cluster_support * exp(-group_dist_r / support_distance_decay_m)
+      group_score_r[is.na(group_score_r)] <- 0
+
+      supported_cluster_proximity_score_r <- terra::max(
+        supported_cluster_proximity_score_r,
+        group_score_r,
+        na.rm = TRUE
+      )
+    }
+  }
+
+  supported_cluster_proximity_score_r <- clamp01_raster(supported_cluster_proximity_score_r)
+  names(supported_cluster_proximity_score_r) <- "supported_cluster_proximity_score"
+
+  dwelling_points_weighted <- dwelling_points_final |>
+    dplyr::mutate(
+      weighted_dwelling_count = cluster_support
+    )
+
+  weighted_dwelling_count_r <- terra::rasterize(
+    terra::vect(dwelling_points_weighted),
+    template_r,
+    field = "weighted_dwelling_count",
+    background = 0,
+    fun = "sum"
+  )
+  names(weighted_dwelling_count_r) <- "weighted_dwelling_count"
+
+  weighted_dwelling_count_50m_r <- focal_sum_circle(weighted_dwelling_count_r, 50)
+  names(weighted_dwelling_count_50m_r) <- "weighted_dwelling_count_50m"
+
+  local_surveyed_50m_r <- local_surveyed_area_rasters[["50"]]
+  weighted_density_raw_50m_r <- (weighted_dwelling_count_50m_r / terra::ifel(local_surveyed_50m_r < 1, 1, local_surveyed_50m_r)) * 10000
+  names(weighted_density_raw_50m_r) <- "supported_density_raw_50m_ha"
+
+  max_density_value <- terra::global(weighted_density_raw_50m_r, "max", na.rm = TRUE)[1, 1]
+
+  if (!is.finite(max_density_value) || max_density_value <= 0) {
+    supported_density_score_50m_r <- weighted_density_raw_50m_r
+    supported_density_score_50m_r[] <- 0
+  } else {
+    supported_density_score_50m_r <- weighted_density_raw_50m_r / max_density_value
+  }
+
+  supported_density_score_50m_r <- clamp01_raster(supported_density_score_50m_r)
+  names(supported_density_score_50m_r) <- "supported_density_score_50m"
+
+  effective_open_no_data_score_100m_r <-
+    open_no_data_score_100m_r *
+    supported_cluster_proximity_score_r *
+    no_data_flag_r
+
+  effective_open_no_data_score_100m_r <- clamp01_raster(effective_open_no_data_score_100m_r)
+  names(effective_open_no_data_score_100m_r) <- "effective_open_no_data_score_100m"
+
+  isolated_dwelling_signal_r <- template_r
+  isolated_dwelling_signal_r[] <- 0
+  names(isolated_dwelling_signal_r) <- "isolated_dwelling_signal"
+
+  isolated_groups <- group_geometries_final |>
+    dplyr::filter(isolated_dwelling_weight > 0)
+
+  if (nrow(isolated_groups) > 0) {
+    for (i in seq_len(nrow(isolated_groups))) {
+      g <- isolated_groups[i, ]
+
+      isolated_seed_r <- terra::rasterize(
+        terra::vect(g),
+        template_r,
+        field = 1,
+        background = NA,
+        touches = TRUE
+      )
+
+      isolated_dist_r <- terra::distance(isolated_seed_r)
+      isolated_score_r <- g$isolated_dwelling_weight * exp(-isolated_dist_r / isolated_distance_decay_m)
+      isolated_score_r[is.na(isolated_score_r)] <- 0
+
+      isolated_dwelling_signal_r <- terra::max(
+        isolated_dwelling_signal_r,
+        isolated_score_r,
+        na.rm = TRUE
+      )
+    }
+  }
+
+  isolated_dwelling_signal_r <- clamp01_raster(isolated_dwelling_signal_r)
+  names(isolated_dwelling_signal_r) <- "isolated_dwelling_signal"
+
+  safe_global(supported_cluster_proximity_score_r, c("min", "max", "mean"), "supported_cluster_proximity_score")
+  safe_global(supported_density_score_50m_r, c("min", "max", "mean"), "supported_density_score_50m")
+  safe_global(effective_open_no_data_score_100m_r, c("min", "max", "mean"), "effective_open_no_data_score_100m")
+  safe_global(isolated_dwelling_signal_r, c("min", "max", "mean"), "isolated_dwelling_signal")
+}
+```
+
+## build-final-continuity-score
+
+**目的**：密集集落の継続可能性を連続値スコアとして統合する。  
+**達成指標**：`cluster_continuity_score_no_data_only_r` が作成され、単独点ではなく支持された密集クラスターの近傍が主に高評価となる。
+
+```{r build-final-continuity-score}
+if (!proceed_to_final_model) {
+  message("proceed_to_final_model = FALSE のため、final score の作成をスキップします。")
+} else {
+  w_cluster_proximity <- 0.35
+  w_supported_density <- 0.30
+  w_effective_open_no_data <- 0.20
+  w_absence_penalty <- 0.35
+
+  final_score_weights <- tibble::tibble(
+    component = c(
+      "supported_cluster_proximity_score",
+      "supported_density_score_50m",
+      "effective_open_no_data_score_100m",
+      "absence_penalty_50m"
+    ),
+    weight = c(
+      w_cluster_proximity,
+      w_supported_density,
+      w_effective_open_no_data,
+      -w_absence_penalty
+    ),
+    interpretation = c(
+      "孤立度の低い密集クラスターへの近接性",
+      "cluster_supportで補正した50m住居密度",
+      "密集クラスター近傍で未調査域へ開く度合い",
+      "周辺50m内の調査済み非検出による減点"
+    )
+  )
+
+  cluster_continuity_score_all_cells_r <-
+    w_cluster_proximity * supported_cluster_proximity_score_r +
+    w_supported_density * supported_density_score_50m_r +
+    w_effective_open_no_data * effective_open_no_data_score_100m_r -
+    w_absence_penalty * absence_penalty_50m_r
+
+  cluster_continuity_score_all_cells_r <- clamp01_raster(cluster_continuity_score_all_cells_r)
+  names(cluster_continuity_score_all_cells_r) <- "cluster_continuity_score_all_cells"
+
+  cluster_continuity_score_no_data_only_r <- terra::ifel(
+    no_data_flag_r == 1,
+    cluster_continuity_score_all_cells_r,
+    NA_real_
+  )
+  names(cluster_continuity_score_no_data_only_r) <- "cluster_continuity_score_no_data_only"
+
+  final_components_stack <- c(
+    supported_cluster_proximity_score_r,
+    supported_density_score_50m_r,
+    effective_open_no_data_score_100m_r,
+    absence_penalty_50m_r,
+    cluster_continuity_score_all_cells_r,
+    cluster_continuity_score_no_data_only_r,
+    isolated_dwelling_signal_r
+  )
+
+  names(final_components_stack) <- c(
+    "supported_cluster_proximity_score",
+    "supported_density_score_50m",
+    "effective_open_no_data_score_100m",
+    "absence_penalty_50m",
+    "cluster_continuity_score_all_cells",
+    "cluster_continuity_score_no_data_only",
+    "isolated_dwelling_signal"
+  )
+
+  safe_global(cluster_continuity_score_all_cells_r, c("min", "max", "mean"), "cluster_continuity_score_all_cells")
+  safe_global(cluster_continuity_score_no_data_only_r, c("min", "max", "mean"), "cluster_continuity_score_no_data_only")
+
+  readr::write_csv(
+    final_score_weights,
+    file.path(final_csv_dir, "final_score_weights.csv")
+  )
+}
+```
+
+## final-score-diagnostics-by-status
+
+**目的**：presence / absence / no_data別に最終スコアの分布を診断する。  
+**達成指標**：absenceで高スコアが過度に残っていないか、no_dataの高値域が妥当かを確認できる。
+
+```{r final-score-diagnostics-by-status}
+if (!proceed_to_final_model) {
+  message("proceed_to_final_model = FALSE のため、final diagnostics をスキップします。")
+} else {
+  grid10_points <- sf::st_point_on_surface(grid10)
+
+  final_score_values <- terra::extract(
+    c(cluster_continuity_score_all_cells_r, isolated_dwelling_signal_r),
+    terra::vect(grid10_points),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  names(final_score_values) <- c(
+    "cluster_continuity_score_all_cells",
+    "isolated_dwelling_signal"
+  )
+
+  grid10_final_scores <- dplyr::bind_cols(
+    grid10,
+    final_score_values
+  )
+
+  final_score_diagnostics_by_status <- grid10_final_scores |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(cell_status) |>
+    dplyr::summarise(
+      n = dplyr::n(),
+      continuity_min = min(cluster_continuity_score_all_cells, na.rm = TRUE),
+      continuity_q25 = stats::quantile(cluster_continuity_score_all_cells, 0.25, na.rm = TRUE),
+      continuity_med = median(cluster_continuity_score_all_cells, na.rm = TRUE),
+      continuity_q75 = stats::quantile(cluster_continuity_score_all_cells, 0.75, na.rm = TRUE),
+      continuity_q95 = stats::quantile(cluster_continuity_score_all_cells, 0.95, na.rm = TRUE),
+      continuity_q99 = stats::quantile(cluster_continuity_score_all_cells, 0.99, na.rm = TRUE),
+      continuity_max = max(cluster_continuity_score_all_cells, na.rm = TRUE),
+      isolated_signal_med = median(isolated_dwelling_signal, na.rm = TRUE),
+      isolated_signal_max = max(isolated_dwelling_signal, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  print(final_score_diagnostics_by_status)
+
+  readr::write_csv(
+    final_score_diagnostics_by_status,
+    file.path(final_csv_dir, "final_score_diagnostics_by_cell_status.csv")
+  )
+}
+```
+
+## export-final-rasters
+
+**目的**：QGIS表示用の最終ラスタと構成要素ラスタをGeoTIFFで出力する。  
+**達成指標**：連続値の `cluster_continuity_score_no_data_only.tif` と診断用成分ラスタが作成される。
+
+```{r export-final-rasters}
+if (!proceed_to_final_model) {
+  message("proceed_to_final_model = FALSE のため、final raster 出力をスキップします。")
+} else {
+  raster_outputs <- list(
+    supported_cluster_proximity_score = supported_cluster_proximity_score_r,
+    supported_density_score_50m = supported_density_score_50m_r,
+    effective_open_no_data_score_100m = effective_open_no_data_score_100m_r,
+    absence_penalty_50m = absence_penalty_50m_r,
+    cluster_continuity_score_all_cells = cluster_continuity_score_all_cells_r,
+    cluster_continuity_score_no_data_only = cluster_continuity_score_no_data_only_r,
+    isolated_dwelling_signal = isolated_dwelling_signal_r
+  )
+
+  for (nm in names(raster_outputs)) {
+    r <- raster_outputs[[nm]]
+    names(r) <- nm
+
+    terra::writeRaster(
+      r,
+      file.path(final_raster_dir, paste0(nm, ".tif")),
+      overwrite = TRUE,
+      gdal = c("COMPRESS=LZW")
+    )
+  }
+
+  terra::writeRaster(
+    final_components_stack,
+    file.path(final_raster_dir, "final_supported_model_components.tif"),
+    overwrite = TRUE,
+    gdal = c("COMPRESS=LZW")
+  )
+
+  cat("final raster outputs:\n")
+  print(list.files(final_raster_dir, pattern = "\\.tif$", full.names = TRUE))
+}
+```
+
+## export-final-gpkg
+
+**目的**：最終成果と中間検証レイヤをGeoPackageにまとめる。  
+**達成指標**：`final/gpkg/supported_autocorrelation_outputs.gpkg` に `interim_` と `final_` レイヤが格納される。
+
+```{r export-final-gpkg}
+if (!proceed_to_final_model) {
+  message("proceed_to_final_model = FALSE のため、final gpkg 出力をスキップします。中間検証レイヤは build-interim-cluster-layers で既に出力済みです。")
+} else {
+  if (file.exists(final_gpkg)) {
+    unlink(final_gpkg)
+  }
+
+  write_gpkg_layer_safe(
+    dwelling_points_grouped,
+    final_gpkg,
+    "interim_dwelling_points_grouped"
+  )
+
+  write_gpkg_layer_safe(
+    group_geometries_interim,
+    final_gpkg,
+    "interim_group_geometries"
+  )
+
+  write_gpkg_layer_safe(
+    dwelling_points_final,
+    final_gpkg,
+    "final_dwelling_points_with_support"
+  )
+
+  write_gpkg_layer_safe(
+    group_geometries_final,
+    final_gpkg,
+    "final_group_isolation_support"
+  )
+
+  final_grid_extract_points <- sf::st_point_on_surface(grid10)
+
+  final_grid_values <- terra::extract(
+    c(
+      cluster_continuity_score_no_data_only_r,
+      cluster_continuity_score_all_cells_r,
+      isolated_dwelling_signal_r
+    ),
+    terra::vect(final_grid_extract_points),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  names(final_grid_values) <- c(
+    "cluster_continuity_score_no_data_only",
+    "cluster_continuity_score_all_cells",
+    "isolated_dwelling_signal"
+  )
+
+  final_score_grid <- dplyr::bind_cols(
+    grid10,
+    final_grid_values
+  )
+
+  final_score_grid_no_data <- final_score_grid |>
+    dplyr::filter(
+      cell_status == "no_data",
+      !is.na(cluster_continuity_score_no_data_only)
+    )
+
+  write_gpkg_layer_safe(
+    final_score_grid_no_data,
+    final_gpkg,
+    "final_cluster_continuity_grid_no_data"
+  )
+
+  high_score_threshold <- stats::quantile(
+    final_score_grid_no_data$cluster_continuity_score_no_data_only,
+    0.95,
+    na.rm = TRUE
+  )
+
+  final_score_grid_no_data_high <- final_score_grid_no_data |>
+    dplyr::filter(
+      cluster_continuity_score_no_data_only >= high_score_threshold
+    )
+
+  write_gpkg_layer_safe(
+    final_score_grid_no_data_high,
+    final_gpkg,
+    "final_cluster_continuity_grid_no_data_top5pct"
+  )
+
+  cat("final gpkg:", final_gpkg, "\n")
+}
+```
+
+## final-summaries
+
+**目的**：最終出力のCSV要約を作成する。  
+**達成指標**：パラメータ、群別孤立度・support、スコア分布のCSVが `final/csv` に出力される。
+
+```{r final-summaries}
+if (!proceed_to_final_model) {
+  message("proceed_to_final_model = FALSE のため、final summaries をスキップします。")
+} else {
+  final_parameters <- tibble::tibble(
+    selected_eps_m = selected_eps_m,
+    selected_min_pts = selected_min_pts,
+    dense_cluster_min_n = dense_cluster_min_n,
+    small_cluster_max_n = small_cluster_max_n,
+    selected_d_adj_m = selected_d_adj_m,
+    isolation_ring_inner_m = isolation_ring_inner_m,
+    isolation_ring_outer_m = isolation_ring_outer_m,
+    min_surveyed_ring_coverage = min_surveyed_ring_coverage,
+    support_distance_decay_m = support_distance_decay_m,
+    isolated_distance_decay_m = isolated_distance_decay_m
+  )
+
+  readr::write_csv(
+    final_parameters,
+    file.path(final_csv_dir, "final_parameters_used.csv")
+  )
+
+  final_output_manifest <- tibble::tibble(
+    output_type = c(
+      "raster",
+      "raster",
+      "raster",
+      "raster",
+      "gpkg",
+      "csv"
+    ),
+    path = c(
+      file.path(final_raster_dir, "cluster_continuity_score_no_data_only.tif"),
+      file.path(final_raster_dir, "cluster_continuity_score_all_cells.tif"),
+      file.path(final_raster_dir, "isolated_dwelling_signal.tif"),
+      file.path(final_raster_dir, "final_supported_model_components.tif"),
+      final_gpkg,
+      final_csv_dir
+    ),
+    interpretation = c(
+      "主成果。未調査域に限定した密集集落継続可能性の連続値スコア。",
+      "診断用。presence/absence/no_dataすべてに連続スコアを保持。",
+      "補助成果。単独・孤立的住居シグナル。",
+      "構成成分を含むマルチバンドGeoTIFF。",
+      "中間検証レイヤと最終ベクタ成果を格納。",
+      "パラメータ、評価表、スコア要約を格納。"
+    )
+  )
+
+  readr::write_csv(
+    final_output_manifest,
+    file.path(final_csv_dir, "final_output_manifest.csv")
+  )
+
+  print(final_parameters)
+  print(final_output_manifest)
+}
+```
