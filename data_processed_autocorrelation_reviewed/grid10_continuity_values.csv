@@ -1,2 +1,0 @@
-grid_id,cell_area_m2,surveyed_ratio,dwelling_count,presence_binary,dwelling_presence,response,cell_status,surveyed_area_m2,absence_area_m2,no_data_area_m2,city_area_m2,continuity_score_all_cells,continuity_score_no_data_only,continuity_class_no_data_only,continuity_score_absence_included,continuity_class_absence_included,continuity_class_label_no_data_only,continuity_class_label_absence_included
-1,11611169.041632364,0,0,0,FALSE,NA,no_data,0,NA,11611169.041632364,11611169.041632364,0.15000924226172135,0.15000924226172135,1,0.15000924226172135,1,Low,Low

@@ -1,0 +1,5 @@
+eps_m,minPts,n_clusters,n_noise,max_cluster_n,median_cluster_n
+30,3,11,37,189,10
+50,3,12,25,191,8.5
+75,3,10,17,191,18.5
+100,3,9,14,202,26

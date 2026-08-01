@@ -1,0 +1,7 @@
+cell_status,continuity_class_label_absence_included,n,ratio
+absence,High,180,0.04916689429117727
+absence,Medium,302,0.08249112264408631
+absence,Low,3179,0.8683419830647364
+no_data,High,725,0.007591146106003812
+no_data,Medium,1790,0.018742277972064583
+no_data,Low,92991,0.9736665759219316

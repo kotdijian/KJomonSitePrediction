@@ -1,0 +1,1910 @@
+---
+title: "国分寺市縄文住居跡分布の空間自己相関・集落継続可能性評価（修正版）"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# 分析の目的
+
+このR Markdownは、地形適合度モデルとは独立に、**既知の縄文住居跡分布そのものの空間自己相関**を評価します。
+
+ここでの目的は、地形条件から住居立地を予測することではなく、既知住居跡の密度・近接・クラスター構造・調査済み範囲の負の証拠にもとづいて、既知集落が未調査域へ連続する可能性を評価することです。
+
+最終出力は2系統に分けます。
+
+| 出力 | 内容 |
+|---|---|
+| `no_data_only` | 既調査のpresence/absenceを除外し、未調査セルだけに継続可能性スコアを表示する |
+| `absence_included` | presenceセルのみを除外し、absenceセルにもスコアを内挿表示する。既調査非検出域がどの程度「既知分布から見ると連続しそうに見えるか」を検証するための診断用出力 |
+
+`absence_included` は予測結果として採用するためではなく、**既調査で住居が確認されていない範囲に対して、自己相関モデルがどの程度高く評価してしまうかを確認する診断図**として扱います。
+
+---
+
+# 0. 初期設定
+
+## setup-autocorrelation
+
+```{r setup-autocorrelation}
+required_packages <- c(
+  "sf", "terra", "dplyr", "tidyr", "ggplot2",
+  "dbscan", "readr", "tibble"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "不足しているパッケージがあります。先にインストールしてください: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(sf)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(dbscan)
+library(readr)
+library(tibble)
+
+options(stringsAsFactors = FALSE)
+sf::sf_use_s2(FALSE)
+```
+
+## helper-functions
+
+```{r helper-functions}
+make_circle_window <- function(r, radius_m) {
+  res_xy <- terra::res(r)
+
+  if (abs(res_xy[1] - res_xy[2]) > 1e-6) {
+    warning("ラスタのX方向・Y方向の解像度が異なります。平均解像度で円形近傍を作成します。")
+  }
+
+  res_m <- mean(res_xy)
+  n <- ceiling(radius_m / res_m)
+
+  coords <- expand.grid(x = -n:n, y = -n:n)
+  dist_m <- sqrt(coords$x^2 + coords$y^2) * res_m
+
+  matrix(
+    ifelse(dist_m <= radius_m, 1, 0),
+    nrow = 2 * n + 1,
+    ncol = 2 * n + 1,
+    byrow = FALSE
+  )
+}
+
+focal_sum_circle <- function(r, radius_m) {
+  w <- make_circle_window(r, radius_m)
+
+  terra::focal(
+    r,
+    w = w,
+    fun = "sum",
+    na.policy = "all",
+    fillvalue = 0,
+    na.rm = TRUE
+  )
+}
+
+scale01_raster <- function(r) {
+  if (is.null(r)) {
+    stop("scale01_raster() に NULL が渡されました。前段のラスタ作成chunkを確認してください。")
+  }
+
+  r_min <- terra::global(r, "min", na.rm = TRUE)[1, 1]
+  r_max <- terra::global(r, "max", na.rm = TRUE)[1, 1]
+
+  if (!is.finite(r_min) || !is.finite(r_max) || abs(r_max - r_min) < 1e-12) {
+    out <- r * 0
+    names(out) <- paste0(names(r)[1], "_scaled01")
+    return(out)
+  }
+
+  out <- (r - r_min) / (r_max - r_min)
+  out <- terra::clamp(out, lower = 0, upper = 1, values = TRUE)
+  names(out) <- paste0(names(r)[1], "_scaled01")
+  out
+}
+
+na_to_zero_raster <- function(r) {
+  if (is.null(r)) {
+    stop("na_to_zero_raster() に NULL が渡されました。")
+  }
+  terra::ifel(is.na(r), 0, r)
+}
+
+get_radius_raster <- function(raster_list, radius_m, object_name) {
+  radius_key <- as.character(radius_m)
+
+  if (!radius_key %in% names(raster_list) || is.null(raster_list[[radius_key]])) {
+    stop(
+      object_name, "[['", radius_key, "']] が存在しません。\n",
+      "現在のキー: ", paste(names(raster_list), collapse = ", "), "\n",
+      "前段のchunkを再実行してください。"
+    )
+  }
+
+  raster_list[[radius_key]]
+}
+
+rasterize_grid_field <- function(grid_sf, field, template_r, background = NA, touches = FALSE) {
+  if (!field %in% names(grid_sf)) {
+    stop("grid_sfにフィールドがありません: ", field)
+  }
+
+  terra::rasterize(
+    terra::vect(grid_sf[, field]),
+    template_r,
+    field = field,
+    background = background,
+    touches = touches
+  )
+}
+
+write_gpkg_layer_safe <- function(x, dsn, layer) {
+  dir.create(dirname(dsn), showWarnings = FALSE, recursive = TRUE)
+
+  if (is.null(x) || nrow(x) == 0) {
+    message("スキップ: ", layer, " は0件です。")
+    return(invisible(NULL))
+  }
+
+  x <- sf::st_make_valid(x)
+
+  sf::st_write(
+    x,
+    dsn = dsn,
+    layer = layer,
+    driver = "GPKG",
+    delete_layer = TRUE,
+    quiet = TRUE
+  )
+
+  message("出力: ", layer, " / ", dsn)
+  invisible(NULL)
+}
+
+classify_score_3class <- function(score_r) {
+  out <- terra::ifel(
+    is.na(score_r),
+    NA,
+    terra::ifel(
+      score_r >= 0.66,
+      3,
+      terra::ifel(score_r >= 0.33, 2, 1)
+    )
+  )
+  out
+}
+
+class_label_from_integer <- function(x) {
+  dplyr::case_when(
+    x == 3L ~ "High",
+    x == 2L ~ "Medium",
+    x == 1L ~ "Low",
+    TRUE ~ NA_character_
+  )
+}
+```
+
+## paths-and-parameters
+
+```{r paths-and-parameters}
+raw_dir <- "data_raw"
+processed_dir <- "data_processed_autocorrelation_reviewed"
+
+dir.create(raw_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(processed_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 入力データ
+raw_gpkg_url <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/Kokubunji_Jomon.gpkg"
+raw_dem_url  <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/10mDEM.tif"
+
+gpkg_path <- file.path(raw_dir, "Kokubunji_Jomon.gpkg")
+dem_path  <- file.path(raw_dir, "10mDEM.tif")
+
+# レイヤ名
+layer_dwelling_point <- "jdwelling_point"
+layer_dwelling_polygon <- "jdwelling_polygon"
+layer_trench <- "trench_polygon"
+layer_city_boundary <- "kokubunji_city_boundary"
+
+# absence判定: セル内の調査済み面積比率がこの値以上で、住居がなければabsenceとする
+surveyed_ratio_min_for_absence <- 0.25
+
+# 自己相関・密度評価のスケール
+local_radii_m <- c(30, 50, 100)
+nearest_dwelling_decay_m <- 50
+cluster_decay_m <- 75
+
+# DBSCANパラメータ
+# epsは住居群のまとまりを抽出する距離閾値。必要に応じて 30, 50, 75m で比較する。
+dbscan_eps_m <- 50
+dbscan_minPts <- 3
+cluster_hull_buffer_m <- 10
+boundary_touch_m <- 10
+
+# 合成スコアの重み
+w_nearest <- 0.25
+w_density <- 0.30
+w_cluster <- 0.30
+w_open_nodata <- 0.15
+w_absence_penalty <- 0.25
+```
+
+---
+
+# 1. データ読み込み
+
+## download-data
+
+```{r download-data}
+if (!file.exists(gpkg_path)) {
+  download.file(raw_gpkg_url, gpkg_path, mode = "wb")
+}
+
+if (!file.exists(dem_path)) {
+  download.file(raw_dem_url, dem_path, mode = "wb")
+}
+
+file.info(gpkg_path)
+file.info(dem_path)
+```
+
+## inspect-gpkg-layers
+
+```{r inspect-gpkg-layers}
+sf::st_layers(gpkg_path)
+```
+
+## read-input-layers
+
+```{r read-input-layers}
+dem_r <- terra::rast(dem_path)
+analysis_crs <- sf::st_crs(terra::crs(dem_r))
+
+city_boundary <- sf::st_read(gpkg_path, layer = layer_city_boundary, quiet = TRUE) |>
+  sf::st_transform(analysis_crs) |>
+  sf::st_make_valid()
+
+trench_polygon <- sf::st_read(gpkg_path, layer = layer_trench, quiet = TRUE) |>
+  sf::st_transform(analysis_crs) |>
+  sf::st_make_valid()
+
+dwelling_point <- sf::st_read(gpkg_path, layer = layer_dwelling_point, quiet = TRUE) |>
+  sf::st_transform(analysis_crs) |>
+  sf::st_make_valid()
+
+# 点レイヤが空の場合の保険として、ポリゴン重心から代表点を作成する。
+if (nrow(dwelling_point) == 0) {
+  dwelling_polygon <- sf::st_read(gpkg_path, layer = layer_dwelling_polygon, quiet = TRUE) |>
+    sf::st_transform(analysis_crs) |>
+    sf::st_make_valid()
+
+  dwelling_point <- sf::st_point_on_surface(dwelling_polygon)
+}
+
+city_boundary <- city_boundary |>
+  dplyr::mutate(city_id = 1L) |>
+  dplyr::summarise(city_id = 1L, .groups = "drop")
+
+trench_polygon <- trench_polygon |>
+  dplyr::mutate(trench_id_tmp = dplyr::row_number())
+
+dwelling_point <- dwelling_point |>
+  dplyr::mutate(dwelling_id = dplyr::row_number())
+
+cat("住居点数:", nrow(dwelling_point), "\n")
+cat("調査区ポリゴン数:", nrow(trench_polygon), "\n")
+```
+
+## prepare-template-raster
+
+```{r prepare-template-raster}
+# DEMを市域でマスクし、以後の解析テンプレートにする。
+template_r <- dem_r
+
+template_r <- terra::crop(
+  template_r,
+  terra::vect(city_boundary)
+)
+
+template_r <- terra::mask(
+  template_r,
+  terra::vect(city_boundary)
+)
+
+names(template_r) <- "template"
+
+template_r
+terra::res(template_r)
+terra::crs(template_r)
+```
+
+---
+
+# 2. 10mグリッドとpresence / absence / no_data
+
+## create-analysis-grid
+
+```{r create-analysis-grid}
+# city_mask_r の各セルに一意のIDを与えてからポリゴン化する。
+# これにより、市域を1ポリゴンにまとめず、10mセル単位のgridを作成する。
+
+cell_id_r <- terra::init(city_mask_r, "cell")
+cell_id_r <- terra::mask(cell_id_r, city_mask_r)
+names(cell_id_r) <- "raster_cell_id"
+
+grid10 <- terra::as.polygons(
+  cell_id_r,
+  values = TRUE,
+  na.rm = TRUE,
+  dissolve = FALSE
+) |>
+  sf::st_as_sf() |>
+  sf::st_make_valid() |>
+  dplyr::rename(
+    raster_cell_id = 1
+  ) |>
+  dplyr::mutate(
+    grid_id = dplyr::row_number()
+  )
+
+grid10$cell_area_m2 <- as.numeric(
+  sf::st_area(sf::st_geometry(grid10))
+)
+
+grid10 <- grid10 |>
+  dplyr::select(
+    grid_id,
+    raster_cell_id,
+    cell_area_m2
+  )
+
+cat("grid10 cell count:", nrow(grid10), "\n")
+summary(grid10$cell_area_m2)
+```
+
+## rasterize-survey-and-dwellings
+
+```{r rasterize-survey-and-dwellings}
+# 調査済み範囲の被覆率。cover=TRUEでセル内被覆率を近似する。
+surveyed_ratio_r <- terra::rasterize(
+  terra::vect(trench_polygon),
+  city_mask_r,
+  field = 1,
+  background = 0,
+  cover = TRUE
+)
+
+surveyed_ratio_r <- terra::clamp(surveyed_ratio_r, lower = 0, upper = 1, values = TRUE)
+names(surveyed_ratio_r) <- "surveyed_ratio"
+
+cell_area_mean_m2 <- mean(grid10$cell_area_m2, na.rm = TRUE)
+
+surveyed_area_r <- surveyed_ratio_r * cell_area_mean_m2
+names(surveyed_area_r) <- "surveyed_area_m2"
+
+# 住居点数ラスタ。複数点が同一セルに入る場合は合計する。
+dwelling_point_for_raster <- dwelling_point |>
+  dplyr::mutate(dwelling_unit = 1L)
+
+dwelling_count_r <- terra::rasterize(
+  terra::vect(dwelling_point_for_raster[, "dwelling_unit"]),
+  city_mask_r,
+  field = "dwelling_unit",
+  fun = "sum",
+  background = 0
+)
+
+names(dwelling_count_r) <- "dwelling_count"
+
+presence_binary_r <- terra::ifel(dwelling_count_r > 0, 1, 0)
+names(presence_binary_r) <- "presence_binary"
+
+surveyed_ratio_r
+dwelling_count_r
+presence_binary_r
+```
+
+## assign-response-to-grid
+
+```{r assign-grid-response}
+# responseを10mグリッドへ付与する。
+# 1  = 縄文住居あり
+# 0  = 十分調査済みだが縄文住居なし
+# NA = 未調査、または調査面積が小さいため不明
+
+if (!exists("grid10")) {
+  stop("grid10 が存在しません。create-analysis-grid chunkを先に実行してください。")
+}
+
+if (!exists("trench_polygon")) {
+  stop("trench_polygon が存在しません。read-vector-layers chunkを確認してください。")
+}
+
+# Rmd内の住居点オブジェクト名が dwelling_points でない場合への保険
+if (!exists("dwelling_points")) {
+  if (exists("jdwelling_point")) {
+    dwelling_points <- jdwelling_point
+  } else {
+    stop("dwelling_points が存在しません。住居跡ポイントレイヤの読み込みを確認してください。")
+  }
+}
+
+# grid10が10mセル単位で作成されているか確認
+if (nrow(grid10) < 1000) {
+  warning(
+    "grid10 のセル数が非常に少ないです。市域全体が1ポリゴンに統合されている可能性があります。create-analysis-grid chunkを確認してください。"
+  )
+}
+
+# CRSをgrid10に合わせる
+trench_polygon <- sf::st_transform(trench_polygon, sf::st_crs(grid10))
+dwelling_points <- sf::st_transform(dwelling_points, sf::st_crs(grid10))
+
+# 調査区ポリゴンを統合
+trench_valid <- trench_polygon |>
+  sf::st_make_valid()
+
+surveyed_union_geom <- sf::st_union(sf::st_geometry(trench_valid))
+
+surveyed_union <- sf::st_sf(
+  surveyed_dummy = 1L,
+  geometry = surveyed_union_geom,
+  crs = sf::st_crs(grid10)
+)
+
+# 住居跡ポイントをgridに重ねてpresence判定
+dwelling_points_for_join <- dwelling_points |>
+  sf::st_make_valid() |>
+  dplyr::mutate(dwelling_dummy = 1L) |>
+  dplyr::select(dwelling_dummy)
+
+dwelling_join <- sf::st_join(
+  grid10,
+  dwelling_points_for_join,
+  join = sf::st_intersects,
+  left = TRUE
+)
+
+dwelling_presence_by_grid <- dwelling_join |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(grid_id) |>
+  dplyr::summarise(
+    dwelling_presence = as.integer(any(!is.na(dwelling_dummy))),
+    dwelling_count = sum(!is.na(dwelling_dummy)),
+    .groups = "drop"
+  )
+
+# 調査済み面積をgridごとに計算
+grid10_for_intersection <- grid10 |>
+  dplyr::select(grid_id, cell_area_m2)
+
+grid10_intersection <- suppressWarnings(
+  sf::st_intersection(
+    grid10_for_intersection,
+    surveyed_union
+  )
+)
+
+if (nrow(grid10_intersection) > 0) {
+  grid10_intersection <- grid10_intersection |>
+    sf::st_make_valid()
+
+  grid10_intersection$surveyed_area_m2 <- as.numeric(
+    sf::st_area(sf::st_geometry(grid10_intersection))
+  )
+
+  surveyed_area_by_grid <- grid10_intersection |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(grid_id) |>
+    dplyr::summarise(
+      surveyed_area_m2 = sum(surveyed_area_m2, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+} else {
+  surveyed_area_by_grid <- tibble::tibble(
+    grid_id = integer(0),
+    surveyed_area_m2 = numeric(0)
+  )
+}
+
+# absence判定に用いる調査面積比率
+# 0.25 = セル面積の25%以上が調査済みなら、住居なしセルをabsenceとみなす
+surveyed_ratio_min_for_absence <- 0.25
+
+# responseを付与
+grid10 <- grid10 |>
+  dplyr::left_join(
+    dwelling_presence_by_grid,
+    by = "grid_id"
+  ) |>
+  dplyr::left_join(
+    surveyed_area_by_grid,
+    by = "grid_id"
+  ) |>
+  dplyr::mutate(
+    dwelling_presence = tidyr::replace_na(dwelling_presence, 0L),
+    dwelling_count = tidyr::replace_na(dwelling_count, 0L),
+    surveyed_area_m2 = tidyr::replace_na(surveyed_area_m2, 0),
+    surveyed_ratio = pmin(surveyed_area_m2 / cell_area_m2, 1),
+    response = dplyr::case_when(
+      dwelling_presence == 1L ~ 1L,
+      surveyed_ratio >= surveyed_ratio_min_for_absence ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+cat("response内訳:\n")
+print(table(grid10$response, useNA = "ifany"))
+
+grid10_response_summary <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    presence_cells = sum(response == 1L, na.rm = TRUE),
+    absence_cells = sum(response == 0L, na.rm = TRUE),
+    no_data_cells = sum(is.na(response)),
+    dwelling_points_in_grid = sum(dwelling_count, na.rm = TRUE),
+    surveyed_area_total_m2 = sum(surveyed_area_m2, na.rm = TRUE),
+    surveyed_ratio_min = min(surveyed_ratio, na.rm = TRUE),
+    surveyed_ratio_med = median(surveyed_ratio, na.rm = TRUE),
+    surveyed_ratio_max = max(surveyed_ratio, na.rm = TRUE)
+  )
+
+grid10_response_summary
+```
+
+## create-area-rasters
+
+```{r rasterize-status-layers}
+# response属性から、presence / absence / no_data の面積ラスタを作成する。
+# このchunkは assign-grid-response chunk の後に実行する。
+
+if (!exists("grid10")) {
+  stop("grid10 が存在しません。create-analysis-grid / assign-grid-response chunkを先に実行してください。")
+}
+
+if (!exists("city_mask_r")) {
+  stop("city_mask_r が存在しません。template raster作成chunkを確認してください。")
+}
+
+required_grid_fields <- c("response", "cell_area_m2", "surveyed_area_m2")
+
+missing_grid_fields <- setdiff(
+  required_grid_fields,
+  names(grid10)
+)
+
+if (length(missing_grid_fields) > 0) {
+  stop(
+    "grid10に必要なフィールドがありません: ",
+    paste(missing_grid_fields, collapse = ", "),
+    "\nassign-grid-response chunkを先に実行してください。"
+  )
+}
+
+# 面積・フラグ列を明示的に作成
+grid10_status <- grid10 |>
+  dplyr::mutate(
+    presence_flag = dplyr::if_else(
+      !is.na(response) & response == 1L,
+      1L,
+      0L
+    ),
+    absence_flag = dplyr::if_else(
+      !is.na(response) & response == 0L,
+      1L,
+      0L
+    ),
+    no_data_flag = dplyr::if_else(
+      is.na(response),
+      1L,
+      0L
+    ),
+    city_area_m2 = cell_area_m2,
+    presence_area_m2 = dplyr::if_else(
+      presence_flag == 1L,
+      cell_area_m2,
+      0
+    ),
+    absence_area_m2 = dplyr::if_else(
+      absence_flag == 1L,
+      cell_area_m2,
+      0
+    ),
+    no_data_area_m2 = dplyr::if_else(
+      no_data_flag == 1L,
+      cell_area_m2,
+      0
+    ),
+    surveyed_area_m2 = tidyr::replace_na(
+      surveyed_area_m2,
+      0
+    )
+  )
+
+cat("grid10_status response内訳:\n")
+print(table(grid10_status$response, useNA = "ifany"))
+
+grid10_status |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    presence_cells = sum(presence_flag, na.rm = TRUE),
+    absence_cells = sum(absence_flag, na.rm = TRUE),
+    no_data_cells = sum(no_data_flag, na.rm = TRUE),
+    presence_area_sum = sum(presence_area_m2, na.rm = TRUE),
+    absence_area_sum = sum(absence_area_m2, na.rm = TRUE),
+    no_data_area_sum = sum(no_data_area_m2, na.rm = TRUE),
+    surveyed_area_sum = sum(surveyed_area_m2, na.rm = TRUE)
+  )
+
+# presenceセルを1/0で表すラスタ
+presence_binary_r <- rasterize_grid_field(
+  grid10_status,
+  "presence_flag",
+  city_mask_r,
+  background = 0
+)
+names(presence_binary_r) <- "presence_binary"
+
+# 各カテゴリの面積ラスタ
+presence_area_r <- rasterize_grid_field(
+  grid10_status,
+  "presence_area_m2",
+  city_mask_r,
+  background = 0
+)
+names(presence_area_r) <- "presence_area_m2"
+
+absence_area_r <- rasterize_grid_field(
+  grid10_status,
+  "absence_area_m2",
+  city_mask_r,
+  background = 0
+)
+names(absence_area_r) <- "absence_area_m2"
+
+no_data_area_r <- rasterize_grid_field(
+  grid10_status,
+  "no_data_area_m2",
+  city_mask_r,
+  background = 0
+)
+names(no_data_area_r) <- "no_data_area_m2"
+
+surveyed_area_r <- rasterize_grid_field(
+  grid10_status,
+  "surveyed_area_m2",
+  city_mask_r,
+  background = 0
+)
+names(surveyed_area_r) <- "surveyed_area_m2"
+
+city_area_r <- rasterize_grid_field(
+  grid10_status,
+  "city_area_m2",
+  city_mask_r,
+  background = 0
+)
+names(city_area_r) <- "city_area_m2"
+
+# 作成確認
+cat("\nラスタ合計値確認:\n")
+
+print(
+  terra::global(
+    presence_area_r,
+    "sum",
+    na.rm = TRUE
+  )
+)
+
+print(
+  terra::global(
+    absence_area_r,
+    "sum",
+    na.rm = TRUE
+  )
+)
+
+print(
+  terra::global(
+    no_data_area_r,
+    "sum",
+    na.rm = TRUE
+  )
+)
+
+print(
+  terra::global(
+    surveyed_area_r,
+    "sum",
+    na.rm = TRUE
+  )
+)
+
+print(
+  terra::global(
+    city_area_r,
+    "sum",
+    na.rm = TRUE
+  )
+)
+```
+
+---
+
+# 3. 住居分布のクラスター診断
+
+## nearest-neighbor-distance
+
+```{r nearest-neighbor-distance}
+dwelling_coords <- sf::st_coordinates(dwelling_point)
+
+if (nrow(dwelling_coords) < 2) {
+  stop("住居点が2点未満のため、最近隣距離を計算できません。")
+}
+
+nn_dist <- dbscan::kNNdist(dwelling_coords[, 1:2, drop = FALSE], k = 1)
+
+nn_summary <- tibble::tibble(
+  min = min(nn_dist, na.rm = TRUE),
+  q25 = quantile(nn_dist, 0.25, na.rm = TRUE),
+  median = median(nn_dist, na.rm = TRUE),
+  q75 = quantile(nn_dist, 0.75, na.rm = TRUE),
+  q90 = quantile(nn_dist, 0.90, na.rm = TRUE),
+  q95 = quantile(nn_dist, 0.95, na.rm = TRUE),
+  max = max(nn_dist, na.rm = TRUE)
+)
+
+nn_summary
+
+plot(sort(nn_dist), type = "l", xlab = "住居点（最近隣距離の昇順）", ylab = "最近隣距離 m")
+abline(h = dbscan_eps_m, lty = 2)
+```
+
+## dbscan-dwelling-clusters
+
+```{r dbscan-dwelling-clusters}
+db <- dbscan::dbscan(
+  dwelling_coords[, 1:2, drop = FALSE],
+  eps = dbscan_eps_m,
+  minPts = dbscan_minPts
+)
+
+dwelling_cluster_points <- dwelling_point |>
+  dplyr::mutate(
+    cluster_id = as.integer(db$cluster),
+    cluster_type = dplyr::if_else(cluster_id == 0L, "isolated_or_noise", "cluster")
+  )
+
+dwelling_cluster_points |>
+  sf::st_drop_geometry() |>
+  dplyr::count(cluster_type, cluster_id)
+```
+
+## export-dwelling-clusters
+
+```{r export-dwelling-clusters}
+cluster_gpkg <- file.path(processed_dir, "dwelling_clusters.gpkg")
+if (file.exists(cluster_gpkg)) unlink(cluster_gpkg)
+
+write_gpkg_layer_safe(
+  dwelling_cluster_points,
+  cluster_gpkg,
+  "dwelling_points_with_cluster"
+)
+
+cluster_points_only <- dwelling_cluster_points |>
+  dplyr::filter(cluster_id > 0)
+
+if (nrow(cluster_points_only) > 0) {
+  cluster_polygons <- cluster_points_only |>
+    dplyr::group_by(cluster_id) |>
+    dplyr::summarise(
+      cluster_n = dplyr::n(),
+      .groups = "drop"
+    ) |>
+    sf::st_convex_hull() |>
+    sf::st_buffer(cluster_hull_buffer_m) |>
+    sf::st_make_valid()
+
+  cluster_polygons$cluster_area_m2 <- as.numeric(
+    sf::st_area(sf::st_geometry(cluster_polygons))
+  )
+
+  cluster_polygons <- cluster_polygons |>
+    dplyr::mutate(
+      cluster_density_per_ha = cluster_n / (cluster_area_m2 / 10000)
+    )
+
+} else {
+  cluster_polygons <- sf::st_sf(
+    cluster_id = integer(0),
+    cluster_n = integer(0),
+    cluster_area_m2 = numeric(0),
+    cluster_density_per_ha = numeric(0),
+    geometry = sf::st_sfc(crs = analysis_crs)
+  )
+}
+
+write_gpkg_layer_safe(
+  cluster_polygons,
+  cluster_gpkg,
+  "dwelling_cluster_hulls"
+)
+
+cluster_polygons
+```
+
+## cluster-boundary-diagnostics
+
+```{r cluster-boundary-diagnostics}
+if (nrow(cluster_polygons) > 0) {
+  surveyed_union <- trench_polygon |>
+    dplyr::summarise(tmp = 1L, .groups = "drop") |>
+    sf::st_make_valid()
+
+  surveyed_boundary <- sf::st_boundary(sf::st_union(surveyed_union))
+
+  cluster_polygons <- cluster_polygons |>
+    dplyr::mutate(
+      cluster_boundary_touch = lengths(
+        sf::st_intersects(
+          sf::st_buffer(sf::st_geometry(cluster_polygons), boundary_touch_m),
+          surveyed_boundary
+        )
+      ) > 0
+    )
+
+  write_gpkg_layer_safe(
+    cluster_polygons,
+    cluster_gpkg,
+    "dwelling_cluster_hulls_boundary_checked"
+  )
+
+  cluster_polygons |>
+    sf::st_drop_geometry() |>
+    dplyr::count(cluster_boundary_touch)
+
+} else {
+  cat("DBSCANクラスターがないため、境界診断をスキップします。\n")
+}
+```
+
+---
+
+# 4. 局所密度・調査面積補正・absence負の証拠
+
+## nearest-dwelling-distance-raster
+
+```{r nearest-dwelling-distance-raster}
+presence_for_distance <- presence_binary_r
+presence_for_distance[presence_for_distance == 0] <- NA
+
+dist_nearest_dwelling_r <- terra::distance(presence_for_distance)
+names(dist_nearest_dwelling_r) <- "dist_nearest_dwelling_m"
+
+nearest_dwelling_score_r <- exp(-dist_nearest_dwelling_r / nearest_dwelling_decay_m)
+names(nearest_dwelling_score_r) <- "nearest_dwelling_score"
+
+dist_nearest_dwelling_r
+nearest_dwelling_score_r
+```
+
+## local-dwelling-density
+
+```{r local-dwelling-density}
+local_dwelling_count_rasters <- list()
+
+for (radius_m in local_radii_m) {
+  radius_key <- as.character(radius_m)
+
+  local_count <- focal_sum_circle(dwelling_count_r, radius_m)
+  names(local_count) <- paste0("local_dwelling_count_", radius_m, "m")
+
+  local_dwelling_count_rasters[[radius_key]] <- local_count
+}
+
+cat("local_dwelling_count_rasters のキー:\n")
+print(names(local_dwelling_count_rasters))
+
+local_dwelling_count_stack <- do.call(c, local_dwelling_count_rasters)
+local_dwelling_count_stack
+```
+
+## survey-effort-corrected-density
+
+```{r survey-effort-corrected-density}
+local_surveyed_area_rasters <- list()
+local_density_corrected_rasters <- list()
+
+for (radius_m in local_radii_m) {
+  radius_key <- as.character(radius_m)
+
+  local_surveyed <- focal_sum_circle(surveyed_area_r, radius_m)
+  names(local_surveyed) <- paste0("local_surveyed_area_", radius_m, "m")
+
+  local_count <- local_dwelling_count_rasters[[radius_key]]
+
+  if (is.null(local_count)) {
+    stop("local_dwelling_count_rasters[['", radius_key, "']] が存在しません。local-dwelling-density chunkを確認してください。")
+  }
+
+  if (!terra::compareGeom(local_count, local_surveyed, stopOnError = FALSE)) {
+    local_surveyed <- terra::resample(local_surveyed, local_count, method = "near")
+  }
+
+  local_surveyed_safe <- terra::ifel(
+    is.na(local_surveyed) | local_surveyed < 1,
+    1,
+    local_surveyed
+  )
+
+  density_corrected <- (local_count / local_surveyed_safe) * 10000
+  names(density_corrected) <- paste0("dwelling_density_corrected_", radius_m, "m_ha")
+
+  local_surveyed_area_rasters[[radius_key]] <- local_surveyed
+  local_density_corrected_rasters[[radius_key]] <- density_corrected
+}
+
+cat("local_surveyed_area_rasters のキー:\n")
+print(names(local_surveyed_area_rasters))
+
+cat("local_density_corrected_rasters のキー:\n")
+print(names(local_density_corrected_rasters))
+
+local_density_corrected_stack <- do.call(c, local_density_corrected_rasters)
+local_density_corrected_stack
+```
+
+## local-absence-evidence
+
+```{r local-absence-evidence}
+local_absence_area_rasters <- list()
+local_absence_ratio_rasters <- list()
+local_no_data_ratio_rasters <- list()
+
+for (radius_m in local_radii_m) {
+  radius_key <- as.character(radius_m)
+
+  local_absence <- focal_sum_circle(absence_area_r, radius_m)
+  names(local_absence) <- paste0("local_absence_area_", radius_m, "m")
+
+  local_surveyed <- local_surveyed_area_rasters[[radius_key]]
+
+  if (is.null(local_surveyed)) {
+    stop("local_surveyed_area_rasters[['", radius_key, "']] が存在しません。survey-effort-corrected-density chunkを先に再実行してください。")
+  }
+
+  if (!terra::compareGeom(local_absence, local_surveyed, stopOnError = FALSE)) {
+    local_surveyed <- terra::resample(local_surveyed, local_absence, method = "near")
+  }
+
+  local_surveyed_safe <- terra::ifel(
+    is.na(local_surveyed) | local_surveyed < 1,
+    1,
+    local_surveyed
+  )
+
+  absence_ratio <- local_absence / local_surveyed_safe
+  names(absence_ratio) <- paste0("absence_ratio_", radius_m, "m")
+
+  local_no_data <- focal_sum_circle(no_data_area_r, radius_m)
+  local_city <- focal_sum_circle(city_area_r, radius_m)
+
+  if (!terra::compareGeom(local_no_data, local_city, stopOnError = FALSE)) {
+    local_city <- terra::resample(local_city, local_no_data, method = "near")
+  }
+
+  local_city_safe <- terra::ifel(
+    is.na(local_city) | local_city < 1,
+    1,
+    local_city
+  )
+
+  no_data_ratio <- local_no_data / local_city_safe
+  names(no_data_ratio) <- paste0("no_data_ratio_", radius_m, "m")
+
+  local_absence_area_rasters[[radius_key]] <- local_absence
+  local_absence_ratio_rasters[[radius_key]] <- absence_ratio
+  local_no_data_ratio_rasters[[radius_key]] <- no_data_ratio
+}
+
+cat("local_absence_ratio_rasters のキー:\n")
+print(names(local_absence_ratio_rasters))
+
+cat("local_no_data_ratio_rasters のキー:\n")
+print(names(local_no_data_ratio_rasters))
+
+local_absence_ratio_stack <- do.call(c, local_absence_ratio_rasters)
+local_no_data_ratio_stack <- do.call(c, local_no_data_ratio_rasters)
+
+local_absence_ratio_stack
+local_no_data_ratio_stack
+```
+
+---
+
+# 5. クラスター近接スコア
+
+## cluster-proximity-score
+
+```{r cluster-proximity-score}
+if (nrow(cluster_polygons) > 0) {
+  cluster_seed_r <- terra::rasterize(
+    terra::vect(cluster_polygons |> dplyr::mutate(cluster_seed = 1L) |> dplyr::select(cluster_seed)),
+    city_mask_r,
+    field = "cluster_seed",
+    background = NA,
+    touches = TRUE
+  )
+
+  dist_cluster_r <- terra::distance(cluster_seed_r)
+  names(dist_cluster_r) <- "dist_cluster_m"
+
+  cluster_proximity_score_r <- exp(-dist_cluster_r / cluster_decay_m)
+  names(cluster_proximity_score_r) <- "cluster_proximity_score"
+
+} else {
+  dist_cluster_r <- city_mask_r * NA
+  names(dist_cluster_r) <- "dist_cluster_m"
+
+  cluster_proximity_score_r <- city_mask_r * 0
+  names(cluster_proximity_score_r) <- "cluster_proximity_score"
+}
+
+dist_cluster_r
+cluster_proximity_score_r
+```
+
+---
+
+# 6. 継続可能性スコアの構築
+
+## build-continuity-score
+
+```{r build-continuity-score}
+# 前段が部分実行された場合に備えて、距離スコアがなければ再作成する。
+if (!exists("dist_nearest_dwelling_r")) {
+  if (!exists("presence_binary_r")) {
+    stop("presence_binary_r が存在しません。rasterize-survey-and-dwellings chunkを再実行してください。")
+  }
+  presence_for_distance <- presence_binary_r
+  presence_for_distance[presence_for_distance == 0] <- NA
+  dist_nearest_dwelling_r <- terra::distance(presence_for_distance)
+  names(dist_nearest_dwelling_r) <- "dist_nearest_dwelling_m"
+}
+
+nearest_dwelling_score_r <- exp(-dist_nearest_dwelling_r / nearest_dwelling_decay_m)
+names(nearest_dwelling_score_r) <- "nearest_dwelling_score"
+
+# 代表スケールとして50m密度・50mabsence・100m未調査開放度を使用する。
+density_50m_r <- get_radius_raster(
+  local_density_corrected_rasters,
+  50,
+  "local_density_corrected_rasters"
+)
+
+absence_ratio_50m_r <- get_radius_raster(
+  local_absence_ratio_rasters,
+  50,
+  "local_absence_ratio_rasters"
+)
+
+no_data_ratio_100m_r <- get_radius_raster(
+  local_no_data_ratio_rasters,
+  100,
+  "local_no_data_ratio_rasters"
+)
+
+density_score_50m_r <- scale01_raster(log1p(density_50m_r))
+names(density_score_50m_r) <- "density_score_50m"
+
+absence_penalty_50m_r <- scale01_raster(absence_ratio_50m_r)
+names(absence_penalty_50m_r) <- "absence_penalty_50m"
+
+open_no_data_score_100m_r <- scale01_raster(no_data_ratio_100m_r)
+names(open_no_data_score_100m_r) <- "open_no_data_score_100m"
+
+cluster_score_r <- cluster_proximity_score_r
+names(cluster_score_r) <- "cluster_proximity_score"
+
+# NAは0として合成する。SpatRasterへの[]代入は避け、terra::ifelで処理する。
+nearest_dwelling_score_r <- na_to_zero_raster(nearest_dwelling_score_r)
+density_score_50m_r <- na_to_zero_raster(density_score_50m_r)
+absence_penalty_50m_r <- na_to_zero_raster(absence_penalty_50m_r)
+open_no_data_score_100m_r <- na_to_zero_raster(open_no_data_score_100m_r)
+cluster_score_r <- na_to_zero_raster(cluster_score_r)
+
+continuity_score_r <-
+  w_nearest * nearest_dwelling_score_r +
+  w_density * density_score_50m_r +
+  w_cluster * cluster_score_r +
+  w_open_nodata * open_no_data_score_100m_r -
+  w_absence_penalty * absence_penalty_50m_r
+
+continuity_score_r <- terra::clamp(
+  continuity_score_r,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+
+names(continuity_score_r) <- "continuity_score_all_cells"
+
+continuity_component_stack <- c(
+  nearest_dwelling_score_r,
+  density_score_50m_r,
+  cluster_score_r,
+  open_no_data_score_100m_r,
+  absence_penalty_50m_r,
+  continuity_score_r
+)
+
+continuity_component_stack
+```
+---
+
+
+## score-diagnostics-by-cell-status
+
+```{r score-diagnostics-by-cell-status}
+# continuity_score を presence / absence / no_data 別に集計する。
+# grid10 に cell_status や continuity_score_all_cells が未付与でも、このchunk内で作成する。
+
+if (!exists("grid10")) {
+  stop("grid10 が存在しません。assign-grid-response まで再実行してください。")
+}
+
+if (!exists("continuity_score_r")) {
+  stop("continuity_score_r が存在しません。build-continuity-score chunkを先に実行してください。")
+}
+
+if (!exists("template_r")) {
+  if (exists("city_mask_r")) {
+    template_r <- city_mask_r
+  } else {
+    stop("template_r または city_mask_r が存在しません。ラスタ作成chunkを確認してください。")
+  }
+}
+
+# grid10 に cell_status を付与
+grid10_score_diag <- grid10 |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1L ~ "presence",
+      !is.na(response) & response == 0L ~ "absence",
+      is.na(response) ~ "no_data",
+      TRUE ~ "unknown"
+    )
+  )
+
+# continuity_score_all_cells が grid10 にない場合は、ラスタから抽出して付与
+if (!"continuity_score_all_cells" %in% names(grid10_score_diag)) {
+
+  continuity_score_for_extract <- continuity_score_r
+  names(continuity_score_for_extract) <- "continuity_score_all_cells"
+
+  grid10_extract_points <- sf::st_point_on_surface(grid10_score_diag)
+
+  continuity_values <- terra::extract(
+    continuity_score_for_extract,
+    terra::vect(grid10_extract_points),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  grid10_score_diag <- dplyr::bind_cols(
+    grid10_score_diag,
+    continuity_values
+  )
+}
+
+# 診断集計
+score_diagnostics_by_cell_status <- grid10_score_diag |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(cell_status) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    score_min = min(continuity_score_all_cells, na.rm = TRUE),
+    score_q25 = quantile(continuity_score_all_cells, 0.25, na.rm = TRUE),
+    score_med = median(continuity_score_all_cells, na.rm = TRUE),
+    score_q75 = quantile(continuity_score_all_cells, 0.75, na.rm = TRUE),
+    score_q95 = quantile(continuity_score_all_cells, 0.95, na.rm = TRUE),
+    score_q99 = quantile(continuity_score_all_cells, 0.99, na.rm = TRUE),
+    score_max = max(continuity_score_all_cells, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+score_diagnostics_by_cell_status
+```
+
+---
+
+# 7. no_dataのみ出力とabsence含む出力
+
+## classify-continuity-targets
+
+```{r classify-continuity-targets}
+# no_dataのみ: presence/absenceを除外し、未調査セルだけに残す。
+no_data_flag_grid <- grid10 |>
+  dplyr::mutate(no_data_flag = dplyr::if_else(is.na(response), 1L, 0L))
+
+no_data_flag_r <- rasterize_grid_field(
+  no_data_flag_grid,
+  "no_data_flag",
+  city_mask_r,
+  background = 0
+)
+names(no_data_flag_r) <- "no_data_flag"
+
+continuity_score_nodata_r <- terra::ifel(
+  no_data_flag_r == 1,
+  continuity_score_r,
+  NA
+)
+names(continuity_score_nodata_r) <- "continuity_score_no_data_only"
+
+continuity_class_nodata_r <- classify_score_3class(continuity_score_nodata_r)
+names(continuity_class_nodata_r) <- "continuity_class_no_data_only"
+
+# absence included: presenceだけを除外し、absence/no_dataにスコアを表示する。
+absence_included_flag_grid <- grid10 |>
+  dplyr::mutate(absence_included_flag = dplyr::if_else(response == 1L, 0L, 1L, missing = 1L))
+
+absence_included_flag_r <- rasterize_grid_field(
+  absence_included_flag_grid,
+  "absence_included_flag",
+  city_mask_r,
+  background = 0
+)
+names(absence_included_flag_r) <- "absence_included_flag"
+
+continuity_score_absence_included_r <- terra::ifel(
+  absence_included_flag_r == 1,
+  continuity_score_r,
+  NA
+)
+names(continuity_score_absence_included_r) <- "continuity_score_absence_included"
+
+continuity_class_absence_included_r <- classify_score_3class(continuity_score_absence_included_r)
+names(continuity_class_absence_included_r) <- "continuity_class_absence_included"
+
+c(
+  continuity_score_nodata_r,
+  continuity_class_nodata_r,
+  continuity_score_absence_included_r,
+  continuity_class_absence_included_r
+)
+```
+
+## create-output-grids
+
+```{r create-output-grids}
+# continuity score / class を grid10 に付与し、
+# no_data限定出力用と absence含む出力用のsfグリッドを作成する。
+# ラスタのextent不一致を避けるため、このchunk内で出力用ラスタをcity_mask_rに揃える。
+
+if (!exists("grid10")) {
+  stop("grid10 が存在しません。assign-grid-response chunkまで再実行してください。")
+}
+
+if (!exists("continuity_score_r")) {
+  stop("continuity_score_r が存在しません。build-continuity-score chunkを先に実行してください。")
+}
+
+if (!exists("city_mask_r")) {
+  stop("city_mask_r が存在しません。raster template作成chunkを確認してください。")
+}
+
+if (!exists("rasterize_grid_field")) {
+  stop("rasterize_grid_field 関数が存在しません。setup/helper関数chunkを先に実行してください。")
+}
+
+# SpatRasterを基準ラスタに揃える関数
+# scoreも10mセル単位の値なので、ここでは method = "near" でセル値を保持する。
+align_to_template <- function(r, template, method = "near") {
+  if (is.null(r)) {
+    stop("align_to_template に NULL が渡されました。")
+  }
+
+  if (!terra::compareGeom(r, template, stopOnError = FALSE)) {
+    r <- terra::resample(
+      r,
+      template,
+      method = method
+    )
+  }
+
+  r
+}
+
+base_template_r <- city_mask_r
+
+# continuity_score_r を基準ラスタに揃える
+continuity_score_all_cells_r <- align_to_template(
+  continuity_score_r,
+  base_template_r,
+  method = "near"
+)
+names(continuity_score_all_cells_r) <- "continuity_score_all_cells"
+
+# no_data flag rasterを作成
+grid10_nodata_flag <- grid10 |>
+  dplyr::mutate(
+    no_data_flag = dplyr::if_else(
+      is.na(response),
+      1L,
+      0L
+    )
+  )
+
+no_data_flag_r <- rasterize_grid_field(
+  grid10_nodata_flag,
+  "no_data_flag",
+  base_template_r,
+  background = 0,
+  touches = TRUE
+)
+names(no_data_flag_r) <- "no_data_flag"
+
+no_data_flag_r <- align_to_template(
+  no_data_flag_r,
+  base_template_r,
+  method = "near"
+)
+
+# no_data のみに continuity_score を残す
+continuity_score_nodata_r <- terra::ifel(
+  no_data_flag_r == 1,
+  continuity_score_all_cells_r,
+  NA_real_
+)
+names(continuity_score_nodata_r) <- "continuity_score_nodata"
+
+# no_data 限定クラス
+continuity_class_r <- terra::ifel(
+  is.na(continuity_score_nodata_r),
+  NA_real_,
+  terra::ifel(
+    continuity_score_nodata_r >= 0.66,
+    3,
+    terra::ifel(
+      continuity_score_nodata_r >= 0.33,
+      2,
+      1
+    )
+  )
+)
+names(continuity_class_r) <- "continuity_class"
+
+# absence included flag rasterを作成
+# presence は除外、absence + no_data は評価対象に含める。
+grid10_absence_included_flag <- grid10 |>
+  dplyr::mutate(
+    absence_included_flag = dplyr::case_when(
+      !is.na(response) & response == 1L ~ 0L,
+      TRUE ~ 1L
+    )
+  )
+
+absence_included_flag_r <- rasterize_grid_field(
+  grid10_absence_included_flag,
+  "absence_included_flag",
+  base_template_r,
+  background = 0,
+  touches = TRUE
+)
+names(absence_included_flag_r) <- "absence_included_flag"
+
+absence_included_flag_r <- align_to_template(
+  absence_included_flag_r,
+  base_template_r,
+  method = "near"
+)
+
+continuity_score_absence_included_r <- terra::ifel(
+  absence_included_flag_r == 1,
+  continuity_score_all_cells_r,
+  NA_real_
+)
+names(continuity_score_absence_included_r) <- "continuity_score_absence_included"
+
+continuity_class_absence_included_r <- terra::ifel(
+  is.na(continuity_score_absence_included_r),
+  NA_real_,
+  terra::ifel(
+    continuity_score_absence_included_r >= 0.66,
+    3,
+    terra::ifel(
+      continuity_score_absence_included_r >= 0.33,
+      2,
+      1
+    )
+  )
+)
+names(continuity_class_absence_included_r) <- "continuity_class_absence_included"
+
+# 念のため、全ラスターを基準に再整列
+continuity_score_nodata_r <- align_to_template(
+  continuity_score_nodata_r,
+  base_template_r,
+  method = "near"
+)
+
+continuity_class_r <- align_to_template(
+  continuity_class_r,
+  base_template_r,
+  method = "near"
+)
+
+continuity_score_absence_included_r <- align_to_template(
+  continuity_score_absence_included_r,
+  base_template_r,
+  method = "near"
+)
+
+continuity_class_absence_included_r <- align_to_template(
+  continuity_class_absence_included_r,
+  base_template_r,
+  method = "near"
+)
+
+# 代表点で各ラスター値を抽出
+grid10_extract_points <- sf::st_point_on_surface(grid10)
+
+extract_raster_values <- function(r, value_name) {
+  names(r) <- value_name
+
+  extracted_values <- terra::extract(
+    r,
+    terra::vect(grid10_extract_points),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  if (!value_name %in% names(extracted_values)) {
+    names(extracted_values)[1] <- value_name
+  }
+
+  extracted_values
+}
+
+continuity_values <- dplyr::bind_cols(
+  extract_raster_values(
+    continuity_score_all_cells_r,
+    "continuity_score_all_cells"
+  ),
+  extract_raster_values(
+    continuity_score_nodata_r,
+    "continuity_score_nodata"
+  ),
+  extract_raster_values(
+    continuity_class_r,
+    "continuity_class"
+  ),
+  extract_raster_values(
+    continuity_score_absence_included_r,
+    "continuity_score_absence_included"
+  ),
+  extract_raster_values(
+    continuity_class_absence_included_r,
+    "continuity_class_absence_included"
+  )
+)
+
+# cell_status を必ず作成したうえで、continuity値を付与
+grid10_continuity <- dplyr::bind_cols(
+  grid10,
+  continuity_values
+) |>
+  dplyr::mutate(
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1L ~ "presence",
+      !is.na(response) & response == 0L ~ "absence",
+      is.na(response) ~ "no_data",
+      TRUE ~ "unknown"
+    ),
+    continuity_class = as.integer(round(continuity_class)),
+    continuity_class_absence_included = as.integer(
+      round(continuity_class_absence_included)
+    ),
+    continuity_class_label = dplyr::case_when(
+      continuity_class == 3L ~ "High",
+      continuity_class == 2L ~ "Medium",
+      continuity_class == 1L ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    continuity_class_label_absence_included = dplyr::case_when(
+      continuity_class_absence_included == 3L ~ "High",
+      continuity_class_absence_included == 2L ~ "Medium",
+      continuity_class_absence_included == 1L ~ "Low",
+      TRUE ~ NA_character_
+    )
+  )
+
+# 1. no_data のみの出力用グリッド
+no_data_continuity_grid <- grid10_continuity |>
+  dplyr::filter(
+    cell_status == "no_data",
+    !is.na(continuity_class_label)
+  )
+
+# 2. absence + no_data を含む診断用グリッド
+# presence は既知住居セルなので、内挿評価対象から除外する。
+absence_included_continuity_grid <- grid10_continuity |>
+  dplyr::filter(
+    cell_status %in% c("absence", "no_data"),
+    !is.na(continuity_class_label_absence_included)
+  )
+
+cat("no_data_continuity_grid:\n")
+print(
+  no_data_continuity_grid |>
+    sf::st_drop_geometry() |>
+    dplyr::count(cell_status, continuity_class_label)
+)
+
+cat("\nabsence_included_continuity_grid:\n")
+print(
+  absence_included_continuity_grid |>
+    sf::st_drop_geometry() |>
+    dplyr::count(cell_status, continuity_class_label_absence_included)
+)
+
+cat("\ngrid10_continuity 全体:\n")
+print(
+  grid10_continuity |>
+    sf::st_drop_geometry() |>
+    dplyr::count(cell_status)
+)
+```
+
+## summaries
+
+```{r summaries}
+# no_data限定出力、absence含む出力の分類別集計を作成する。
+
+if (!exists("no_data_continuity_grid")) {
+  stop("no_data_continuity_grid が存在しません。create-output-grids chunkを先に実行してください。")
+}
+
+if (!exists("absence_included_continuity_grid")) {
+  stop("absence_included_continuity_grid が存在しません。create-output-grids chunkを先に実行してください。")
+}
+
+# no_data only 集計
+if (!"continuity_class_label" %in% names(no_data_continuity_grid)) {
+  stop("no_data_continuity_grid に continuity_class_label 列がありません。create-output-grids chunkを確認してください。")
+}
+
+no_data_summary_df <- no_data_continuity_grid |>
+  sf::st_drop_geometry()
+
+no_data_summary_df$continuity_class_label_no_data_only <- factor(
+  no_data_summary_df$continuity_class_label,
+  levels = c("High", "Medium", "Low")
+)
+
+continuity_class_summary_no_data <- no_data_summary_df |>
+  dplyr::count(
+    continuity_class_label_no_data_only,
+    .drop = FALSE
+  ) |>
+  dplyr::mutate(
+    ratio = n / sum(n)
+  )
+
+# absence included 集計
+if (!"continuity_class_label_absence_included" %in% names(absence_included_continuity_grid)) {
+  stop("absence_included_continuity_grid に continuity_class_label_absence_included 列がありません。create-output-grids chunkを確認してください。")
+}
+
+absence_included_summary_df <- absence_included_continuity_grid |>
+  sf::st_drop_geometry()
+
+absence_included_summary_df$continuity_class_label_absence_included <- factor(
+  absence_included_summary_df$continuity_class_label_absence_included,
+  levels = c("High", "Medium", "Low")
+)
+
+continuity_class_summary_absence_included <- absence_included_summary_df |>
+  dplyr::count(
+    cell_status,
+    continuity_class_label_absence_included,
+    .drop = FALSE
+  ) |>
+  dplyr::group_by(cell_status) |>
+  dplyr::mutate(
+    ratio = n / sum(n)
+  ) |>
+  dplyr::ungroup()
+
+# 全体集計も作成
+continuity_class_summary_absence_included_total <- absence_included_summary_df |>
+  dplyr::count(
+    continuity_class_label_absence_included,
+    .drop = FALSE
+  ) |>
+  dplyr::mutate(
+    ratio = n / sum(n)
+  )
+
+cat("no_data only summary:\n")
+print(continuity_class_summary_no_data)
+
+cat("\nabsence included summary by cell_status:\n")
+print(continuity_class_summary_absence_included)
+
+cat("\nabsence included total summary:\n")
+print(continuity_class_summary_absence_included_total)
+
+# CSV出力
+summary_dir <- file.path(processed_dir, "summary")
+dir.create(
+  summary_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+readr::write_csv(
+  continuity_class_summary_no_data,
+  file.path(summary_dir, "continuity_class_summary_no_data_only.csv")
+)
+
+readr::write_csv(
+  continuity_class_summary_absence_included,
+  file.path(summary_dir, "continuity_class_summary_absence_included_by_status.csv")
+)
+
+readr::write_csv(
+  continuity_class_summary_absence_included_total,
+  file.path(summary_dir, "continuity_class_summary_absence_included_total.csv")
+)
+```
+
+---
+
+# 8. 出力
+
+## export-continuity-geotiffs
+
+```{r export-continuity-geotiffs}
+geotiff_dir <- file.path(processed_dir, "geotiff")
+dir.create(geotiff_dir, showWarnings = FALSE, recursive = TRUE)
+
+terra::writeRaster(
+  continuity_score_r,
+  file.path(geotiff_dir, "continuity_score_all_cells.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  continuity_component_stack,
+  file.path(geotiff_dir, "continuity_score_components.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  continuity_score_nodata_r,
+  file.path(geotiff_dir, "continuity_score_no_data_only.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  continuity_class_nodata_r,
+  file.path(geotiff_dir, "continuity_class_no_data_only.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  continuity_score_absence_included_r,
+  file.path(geotiff_dir, "continuity_score_absence_included.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+terra::writeRaster(
+  continuity_class_absence_included_r,
+  file.path(geotiff_dir, "continuity_class_absence_included.tif"),
+  overwrite = TRUE,
+  gdal = c("COMPRESS=LZW")
+)
+
+cat("GeoTIFF出力先:", geotiff_dir, "\n")
+list.files(geotiff_dir, full.names = TRUE)
+```
+
+## export-continuity-gpkg
+
+```{r export-continuity-gpkg}
+# continuity結果をGeoPackageへ出力する。
+# no_data only と absence included の2系統を出力する。
+
+if (!exists("no_data_continuity_grid")) {
+  stop("no_data_continuity_grid が存在しません。create-output-grids chunkを先に実行してください。")
+}
+
+if (!exists("absence_included_continuity_grid")) {
+  stop("absence_included_continuity_grid が存在しません。create-output-grids chunkを先に実行してください。")
+}
+
+if (!exists("processed_dir")) {
+  processed_dir <- "data_processed_autocorrelation"
+}
+
+gpkg_dir <- file.path(processed_dir, "gpkg")
+
+dir.create(
+  gpkg_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+continuity_gpkg <- file.path(
+  gpkg_dir,
+  "settlement_continuity_outputs.gpkg"
+)
+
+# GeoPackage書き出し関数
+if (!exists("write_gpkg_layer_safe")) {
+  write_gpkg_layer_safe <- function(x, dsn, layer) {
+    if (is.null(x) || nrow(x) == 0) {
+      message("スキップ: ", layer, " は0件です。")
+      return(invisible(NULL))
+    }
+
+    x <- sf::st_make_valid(x)
+
+    sf::st_write(
+      x,
+      dsn = dsn,
+      layer = layer,
+      delete_layer = TRUE,
+      quiet = TRUE
+    )
+
+    message("出力: ", layer, " / ", dsn)
+    invisible(NULL)
+  }
+}
+
+# no_data_continuity_grid 側の列名を統一
+if (!"continuity_class_label_no_data_only" %in% names(no_data_continuity_grid)) {
+  if ("continuity_class_label" %in% names(no_data_continuity_grid)) {
+    no_data_continuity_grid <- no_data_continuity_grid |>
+      dplyr::mutate(
+        continuity_class_label_no_data_only = continuity_class_label
+      )
+  } else {
+    stop(
+      "no_data_continuity_grid に continuity_class_label または ",
+      "continuity_class_label_no_data_only がありません。create-output-grids chunkを確認してください。"
+    )
+  }
+}
+
+# absence_included_continuity_grid 側の列名を確認
+if (!"continuity_class_label_absence_included" %in% names(absence_included_continuity_grid)) {
+  stop(
+    "absence_included_continuity_grid に continuity_class_label_absence_included がありません。create-output-grids chunkを確認してください。"
+  )
+}
+
+# 既存GeoPackageがある場合は削除してから作成
+# QGISで開いていると削除・上書きに失敗するため、その場合はQGIS側で閉じてから再実行する。
+if (file.exists(continuity_gpkg)) {
+  unlink(continuity_gpkg)
+}
+
+# 全体レイヤ
+write_gpkg_layer_safe(
+  no_data_continuity_grid,
+  continuity_gpkg,
+  "no_data_continuity_all"
+)
+
+write_gpkg_layer_safe(
+  absence_included_continuity_grid,
+  continuity_gpkg,
+  "absence_included_continuity_all"
+)
+
+# no_data only：High / Medium / Low 別
+for (class_label in c("High", "Medium", "Low")) {
+  x <- no_data_continuity_grid |>
+    dplyr::filter(
+      continuity_class_label_no_data_only == class_label
+    )
+
+  write_gpkg_layer_safe(
+    x,
+    continuity_gpkg,
+    paste0("no_data_continuity_", tolower(class_label))
+  )
+}
+
+# absence included：High / Medium / Low 別
+for (class_label in c("High", "Medium", "Low")) {
+  x <- absence_included_continuity_grid |>
+    dplyr::filter(
+      continuity_class_label_absence_included == class_label
+    )
+
+  write_gpkg_layer_safe(
+    x,
+    continuity_gpkg,
+    paste0("absence_included_continuity_", tolower(class_label))
+  )
+}
+
+# absence included：cell_status別にも出力
+for (status_label in c("absence", "no_data")) {
+  x <- absence_included_continuity_grid |>
+    dplyr::filter(
+      cell_status == status_label
+    )
+
+  write_gpkg_layer_safe(
+    x,
+    continuity_gpkg,
+    paste0("absence_included_", status_label)
+  )
+}
+
+cat("GeoPackage出力完了:\n")
+cat(continuity_gpkg, "\n")
+```
+
+## export-csv-summaries
+
+```{r export-csv-summaries}
+readr::write_csv(
+  continuity_class_summary_no_data,
+  file.path(processed_dir, "continuity_class_summary_no_data_only.csv")
+)
+
+readr::write_csv(
+  continuity_class_summary_absence_included,
+  file.path(processed_dir, "continuity_class_summary_absence_included.csv")
+)
+
+readr::write_csv(
+  grid10_with_outputs |>
+    sf::st_drop_geometry(),
+  file.path(processed_dir, "grid10_continuity_values.csv")
+)
+
+list.files(processed_dir, full.names = TRUE)
+```
+
+---
+
+# 9. 解釈上の注意
+
+`continuity_score` は、地形的な立地適合度ではなく、既知住居跡分布からみた**集落継続可能性スコア**です。
+
+- `no_data_only` は、未調査範囲の優先確認地点を抽出するための主出力です。
+- `absence_included` は、既調査非検出域にもスコアを内挿した診断出力です。ここでabsenceセルに高スコアが多い場合、自己相関モデルは過大推定している可能性があります。
+- absenceは「調査済みだが住居が確認されていない」範囲であり、未調査地と同じ意味ではありません。
+- スコアは絶対確率ではなく、近接・密度・調査面積補正・absence負の証拠を合成した相対指標です。
