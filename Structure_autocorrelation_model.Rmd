@@ -1,5 +1,5 @@
 ---
-title: "Kokubunji Jomon Settlement Autocorrelation: Cluster-Supported Continuity Model"
+title: "Kokubunji Jomon Settlement Autocorrelation: Micro/Macro Cluster-Supported Continuity Model"
 output:
   html_document:
     toc: true
@@ -32,6 +32,19 @@ auto-cor-results/
 ```
 
 GeoPackageは `final/gpkg` にまとめ、途中検証用レイヤはレイヤ名に `interim_` を付けます。
+
+本修正版では、考古学的解釈に近づけるため、住居点を直接「集落」とみなさず、以下の階層で評価します。
+
+```text
+住居点
+  ↓
+micro cluster：局所的な密集単位
+  ↓
+macro cluster：複数のmicro clusterから構成される集落複合体・環状/馬蹄形配置の候補
+```
+
+これにより、単独・少数住居を密集集落に誤って吸収しにくくしつつ、C1・C2・C8・C30のような局所クラスタ群を、上位の集落構造として扱えるようにします。
+
 
 # Stage 0: Setup
 
@@ -1044,7 +1057,10 @@ build_group_geometries <- function(point_sf, group_col = "group_id") {
 
   sf::st_sf(
     attr_df,
-    geometry = sf::st_sfc(geom_list, crs = sf::st_crs(point_sf))
+    geometry = do.call(
+      sf::st_sfc,
+      c(geom_list, list(crs = sf::st_crs(point_sf)))
+    )
   ) |>
     sf::st_make_valid()
 }
@@ -1135,6 +1151,580 @@ write_gpkg_layer_safe(
 cat("中間検証用GPKG:", final_gpkg, "\n")
 ```
 
+
+## build-interim-macro-cluster-groups
+
+**目的**：micro cluster間の距離・接続関係・間隙部の調査状況を評価し、上位の `macro_cluster_id` を作成する。  
+**達成指標**：`interim_cluster_pair_metrics.csv`、`interim_macro_cluster_geometries`、`interim_macro_cluster_link_edges`、`interim_internal_void_candidates` が出力され、局所クラスタ群としての集落構造をQGISで検証できる。
+
+```{r build-interim-macro-cluster-groups}
+# micro clusterを保持したまま、上位のmacro clusterを作成する。
+# ここでのmacro clusterは、複数の局所クラスタが空白域・広場候補を挟んで
+# 環状・馬蹄形・弧状の集落構造を作る可能性を評価するための中間単位である。
+
+macro_link_max_boundary_distance_m <- max(4 * selected_d_adj_m, 100)
+macro_nearest_dwelling_link_m <- max(3 * selected_d_adj_m, 80)
+macro_corridor_width_m <- max(selected_d_adj_m, 20)
+macro_min_group_n_for_link <- 3
+macro_min_internal_void_area_m2 <- 500
+
+make_centroid_line <- function(g1, g2, crs_value) {
+  c1 <- sf::st_coordinates(sf::st_centroid(sf::st_geometry(g1)))[1, 1:2]
+  c2 <- sf::st_coordinates(sf::st_centroid(sf::st_geometry(g2)))[1, 1:2]
+
+  sf::st_sfc(
+    sf::st_linestring(rbind(c1, c2)),
+    crs = crs_value
+  )
+}
+
+compute_polygon_context <- function(poly_sfc, grid_sf) {
+  poly_sf <- sf::st_sf(
+    context_dummy = 1L,
+    geometry = poly_sfc,
+    crs = sf::st_crs(grid_sf)
+  ) |>
+    sf::st_make_valid()
+
+  poly_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(poly_sf)))
+
+  if (!is.finite(poly_area_m2) || poly_area_m2 <= 0) {
+    return(tibble::tibble(
+      context_area_m2 = poly_area_m2,
+      surveyed_area_m2 = 0,
+      absence_area_m2 = 0,
+      no_data_area_m2 = 0,
+      surveyed_ratio = 0,
+      absence_ratio_in_surveyed = 0,
+      no_data_ratio = 0
+    ))
+  }
+
+  grid_subset <- grid_sf |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      cell_area_m2,
+      surveyed_area_m2
+    )
+
+  inter <- suppressWarnings(sf::st_intersection(grid_subset, poly_sf))
+
+  if (nrow(inter) == 0) {
+    return(tibble::tibble(
+      context_area_m2 = poly_area_m2,
+      surveyed_area_m2 = 0,
+      absence_area_m2 = 0,
+      no_data_area_m2 = 0,
+      surveyed_ratio = 0,
+      absence_ratio_in_surveyed = 0,
+      no_data_ratio = 0
+    ))
+  }
+
+  inter <- inter |>
+    sf::st_make_valid()
+
+  inter$intersect_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(inter)))
+
+  inter_df <- inter |>
+    sf::st_drop_geometry() |>
+    dplyr::mutate(
+      cell_fraction = dplyr::if_else(
+        cell_area_m2 > 0,
+        intersect_area_m2 / cell_area_m2,
+        0
+      ),
+      surveyed_area_part_m2 = surveyed_area_m2 * cell_fraction,
+      absence_area_part_m2 = dplyr::if_else(
+        response == 0L,
+        surveyed_area_m2 * cell_fraction,
+        0
+      ),
+      no_data_area_part_m2 = dplyr::if_else(
+        is.na(response),
+        intersect_area_m2,
+        0
+      )
+    )
+
+  surveyed_area <- sum(inter_df$surveyed_area_part_m2, na.rm = TRUE)
+  absence_area <- sum(inter_df$absence_area_part_m2, na.rm = TRUE)
+  no_data_area <- sum(inter_df$no_data_area_part_m2, na.rm = TRUE)
+
+  tibble::tibble(
+    context_area_m2 = poly_area_m2,
+    surveyed_area_m2 = surveyed_area,
+    absence_area_m2 = absence_area,
+    no_data_area_m2 = no_data_area,
+    surveyed_ratio = clamp01_numeric(surveyed_area / poly_area_m2),
+    absence_ratio_in_surveyed = clamp01_numeric(absence_area / max(surveyed_area, 1)),
+    no_data_ratio = clamp01_numeric(no_data_area / poly_area_m2)
+  )
+}
+
+nearest_dwelling_between_groups <- function(point_sf, group_a, group_b) {
+  pts_a <- point_sf[point_sf$group_id == group_a, ]
+  pts_b <- point_sf[point_sf$group_id == group_b, ]
+
+  if (nrow(pts_a) == 0 || nrow(pts_b) == 0) {
+    return(NA_real_)
+  }
+
+  coords_a <- sf::st_coordinates(pts_a)
+  coords_b <- sf::st_coordinates(pts_b)
+
+  d <- as.matrix(stats::dist(rbind(coords_a, coords_b)))
+  n_a <- nrow(coords_a)
+  d_ab <- d[seq_len(n_a), n_a + seq_len(nrow(coords_b)), drop = FALSE]
+
+  min(d_ab, na.rm = TRUE)
+}
+
+build_connected_components <- function(node_ids, edge_from, edge_to, prefix = "M") {
+  adjacency <- stats::setNames(vector("list", length(node_ids)), node_ids)
+
+  if (length(edge_from) > 0) {
+    for (i in seq_along(edge_from)) {
+      a <- edge_from[i]
+      b <- edge_to[i]
+      adjacency[[a]] <- unique(c(adjacency[[a]], b))
+      adjacency[[b]] <- unique(c(adjacency[[b]], a))
+    }
+  }
+
+  visited <- stats::setNames(rep(FALSE, length(node_ids)), node_ids)
+  component_id <- stats::setNames(rep(NA_character_, length(node_ids)), node_ids)
+  component_counter <- 0L
+
+  for (node in node_ids) {
+    if (visited[[node]]) {
+      next
+    }
+
+    component_counter <- component_counter + 1L
+    cid <- paste0(prefix, component_counter)
+    queue <- node
+    visited[[node]] <- TRUE
+
+    while (length(queue) > 0) {
+      current <- queue[1]
+      queue <- queue[-1]
+      component_id[[current]] <- cid
+
+      neighbors <- adjacency[[current]]
+      if (length(neighbors) > 0) {
+        for (nb in neighbors) {
+          if (!visited[[nb]]) {
+            visited[[nb]] <- TRUE
+            queue <- c(queue, nb)
+          }
+        }
+      }
+    }
+  }
+
+  tibble::tibble(
+    group_id = names(component_id),
+    macro_cluster_id = unname(component_id)
+  )
+}
+
+micro_group_ids <- group_geometries_interim$group_id
+
+if (length(micro_group_ids) < 2) {
+  cluster_pair_metrics <- tibble::tibble()
+  macro_cluster_link_edges <- sf::st_sf(
+    tibble::tibble(),
+    geometry = sf::st_sfc(crs = sf::st_crs(group_geometries_interim))
+  )
+  macro_assignment <- tibble::tibble(
+    group_id = micro_group_ids,
+    macro_cluster_id = paste0("M", seq_along(micro_group_ids))
+  )
+} else {
+  pair_index <- utils::combn(seq_along(micro_group_ids), 2)
+  pair_rows <- vector("list", ncol(pair_index))
+  edge_geometries <- vector("list", ncol(pair_index))
+
+  for (i in seq_len(ncol(pair_index))) {
+    idx_a <- pair_index[1, i]
+    idx_b <- pair_index[2, i]
+
+    g1 <- group_geometries_interim[idx_a, ]
+    g2 <- group_geometries_interim[idx_b, ]
+
+    group_id_1 <- g1$group_id
+    group_id_2 <- g2$group_id
+    n1 <- g1$n_dwellings
+    n2 <- g2$n_dwellings
+
+    boundary_distance_m <- as.numeric(sf::st_distance(sf::st_geometry(g1), sf::st_geometry(g2)))
+    centroid_distance_m <- as.numeric(sf::st_distance(
+      sf::st_centroid(sf::st_geometry(g1)),
+      sf::st_centroid(sf::st_geometry(g2))
+    ))
+
+    nearest_between_m <- nearest_dwelling_between_groups(
+      dwelling_points_grouped,
+      group_id_1,
+      group_id_2
+    )
+
+    line_sfc <- make_centroid_line(
+      g1,
+      g2,
+      sf::st_crs(group_geometries_interim)
+    )
+
+    corridor_sfc <- sf::st_buffer(line_sfc, macro_corridor_width_m)
+    context <- compute_polygon_context(corridor_sfc, grid10)
+
+    both_linkable_size <- n1 >= macro_min_group_n_for_link && n2 >= macro_min_group_n_for_link
+    at_least_one_dense <- n1 >= dense_cluster_min_n || n2 >= dense_cluster_min_n
+    distance_condition <-
+      boundary_distance_m <= macro_link_max_boundary_distance_m ||
+      nearest_between_m <= macro_nearest_dwelling_link_m
+
+    macro_link_candidate <-
+      both_linkable_size &&
+      at_least_one_dense &&
+      distance_condition
+
+    proximity_score <- clamp01_numeric(
+      1 - boundary_distance_m / macro_link_max_boundary_distance_m
+    )
+    pair_size_score <- clamp01_numeric(
+      (n1 + n2) / (2 * dense_cluster_min_n)
+    )
+
+    macro_link_score <- proximity_score * pair_size_score
+
+    pair_rows[[i]] <- dplyr::bind_cols(
+      tibble::tibble(
+        group_id_1 = group_id_1,
+        group_id_2 = group_id_2,
+        n_dwellings_1 = n1,
+        n_dwellings_2 = n2,
+        interim_group_type_1 = g1$interim_group_type,
+        interim_group_type_2 = g2$interim_group_type,
+        boundary_distance_m = boundary_distance_m,
+        centroid_distance_m = centroid_distance_m,
+        nearest_dwelling_between_groups_m = nearest_between_m,
+        macro_corridor_width_m = macro_corridor_width_m,
+        macro_link_max_boundary_distance_m = macro_link_max_boundary_distance_m,
+        macro_nearest_dwelling_link_m = macro_nearest_dwelling_link_m,
+        macro_link_score = macro_link_score,
+        macro_link_candidate = macro_link_candidate
+      ),
+      context
+    ) |>
+      dplyr::mutate(
+        pair_interpretation = dplyr::case_when(
+          macro_link_candidate & surveyed_ratio >= 0.30 & absence_ratio_in_surveyed >= 0.50 ~
+            "macro_link_with_possible_internal_void_or_plaza",
+          macro_link_candidate & no_data_ratio >= 0.50 ~
+            "macro_link_open_to_no_data",
+          macro_link_candidate ~
+            "macro_link_candidate",
+          !both_linkable_size ~
+            "not_linked_because_small_group_included",
+          !at_least_one_dense ~
+            "not_linked_because_no_dense_group",
+          !distance_condition ~
+            "not_linked_because_too_far",
+          TRUE ~
+            "not_linked"
+        )
+      )
+
+    edge_geometries[[i]] <- line_sfc[[1]]
+  }
+
+  cluster_pair_metrics <- dplyr::bind_rows(pair_rows)
+
+  link_edges_df <- cluster_pair_metrics |>
+    dplyr::filter(macro_link_candidate)
+
+  if (nrow(link_edges_df) > 0) {
+    link_edge_indices <- which(cluster_pair_metrics$macro_link_candidate)
+    macro_cluster_link_edges <- sf::st_sf(
+      link_edges_df,
+      geometry = do.call(
+        sf::st_sfc,
+        c(edge_geometries[link_edge_indices], list(crs = sf::st_crs(group_geometries_interim)))
+      )
+    ) |>
+      sf::st_make_valid()
+  } else {
+    macro_cluster_link_edges <- sf::st_sf(
+      link_edges_df,
+      geometry = sf::st_sfc(crs = sf::st_crs(group_geometries_interim))
+    )
+  }
+
+  macro_assignment <- build_connected_components(
+    node_ids = micro_group_ids,
+    edge_from = link_edges_df$group_id_1,
+    edge_to = link_edges_df$group_id_2,
+    prefix = "M"
+  )
+}
+
+micro_group_macro_table <- group_geometries_interim |>
+  sf::st_drop_geometry() |>
+  dplyr::left_join(macro_assignment, by = "group_id") |>
+  dplyr::arrange(macro_cluster_id, group_id)
+
+macro_ids <- unique(micro_group_macro_table$macro_cluster_id)
+macro_geom_list <- vector("list", length(macro_ids))
+macro_attr_rows <- vector("list", length(macro_ids))
+
+for (i in seq_along(macro_ids)) {
+  mid <- macro_ids[i]
+  micro_ids <- micro_group_macro_table |>
+    dplyr::filter(macro_cluster_id == mid) |>
+    dplyr::pull(group_id)
+
+  micro_geoms <- group_geometries_interim[group_geometries_interim$group_id %in% micro_ids, ]
+  union_geom <- sf::st_union(sf::st_geometry(micro_geoms))
+  hull_geom <- sf::st_convex_hull(union_geom)
+  hull_geom <- sf::st_buffer(hull_geom, 1)
+  hull_geom <- sf::st_make_valid(hull_geom)
+
+  macro_geom_list[[i]] <- hull_geom[[1]]
+
+  n_dwellings_total <- sum(micro_geoms$n_dwellings, na.rm = TRUE)
+  n_micro_groups <- nrow(micro_geoms)
+
+  n_dense_micro_groups <- sum(micro_geoms$n_dwellings >= dense_cluster_min_n, na.rm = TRUE)
+  n_intermediate_micro_groups <- sum(
+    micro_geoms$n_dwellings > small_cluster_max_n &
+      micro_geoms$n_dwellings < dense_cluster_min_n,
+    na.rm = TRUE
+  )
+  n_small_micro_groups <- sum(micro_geoms$n_dwellings <= small_cluster_max_n, na.rm = TRUE)
+
+  macro_group_type_value <- dplyr::case_when(
+    n_micro_groups >= 2 & n_dwellings_total >= dense_cluster_min_n ~ "macro_settlement_complex_candidate",
+    n_dwellings_total >= dense_cluster_min_n ~ "single_dense_micro_cluster",
+    n_dwellings_total <= small_cluster_max_n ~ "small_or_isolated_candidate",
+    TRUE ~ "intermediate_candidate"
+  )
+
+  macro_attr_rows[[i]] <- tibble::tibble(
+    macro_cluster_id = mid,
+    micro_group_ids = paste(micro_ids, collapse = ";"),
+    n_micro_groups = n_micro_groups,
+    n_dwellings = n_dwellings_total,
+    n_dense_micro_groups = n_dense_micro_groups,
+    n_intermediate_micro_groups = n_intermediate_micro_groups,
+    n_small_micro_groups = n_small_micro_groups,
+    macro_group_type = macro_group_type_value,
+    selected_eps_m = selected_eps_m,
+    selected_min_pts = selected_min_pts,
+    selected_d_adj_m = selected_d_adj_m,
+    macro_link_max_boundary_distance_m = macro_link_max_boundary_distance_m,
+    macro_nearest_dwelling_link_m = macro_nearest_dwelling_link_m
+  )
+}
+
+macro_group_geometries_interim <- sf::st_sf(
+  dplyr::bind_rows(macro_attr_rows),
+  geometry = do.call(
+    sf::st_sfc,
+    c(macro_geom_list, list(crs = sf::st_crs(group_geometries_interim)))
+  )
+) |>
+  sf::st_make_valid()
+
+# macro cluster内部の空白域候補を抽出する。
+# これは単純なabsence減点ではなく、環状・馬蹄形集落の内部空間候補として確認するためのレイヤである。
+void_rows <- list()
+void_geoms <- list()
+void_counter <- 0L
+
+for (i in seq_len(nrow(macro_group_geometries_interim))) {
+  macro_row <- macro_group_geometries_interim[i, ]
+
+  if (macro_row$n_micro_groups < 2 || macro_row$n_dwellings < dense_cluster_min_n) {
+    next
+  }
+
+  micro_ids <- strsplit(macro_row$micro_group_ids, ";", fixed = TRUE)[[1]]
+  micro_geoms <- group_geometries_interim[group_geometries_interim$group_id %in% micro_ids, ]
+
+  macro_hull <- sf::st_geometry(macro_row)
+  micro_union_buffer <- sf::st_union(sf::st_buffer(sf::st_geometry(micro_geoms), selected_d_adj_m / 2))
+  void_geom <- suppressWarnings(sf::st_difference(macro_hull, micro_union_buffer))
+  void_geom <- sf::st_make_valid(void_geom)
+  void_geom <- suppressWarnings(sf::st_collection_extract(void_geom, "POLYGON"))
+
+  if (length(void_geom) == 0 || all(sf::st_is_empty(void_geom))) {
+    next
+  }
+
+  void_sf <- sf::st_sf(
+    macro_cluster_id = rep(macro_row$macro_cluster_id, length(void_geom)),
+    geometry = void_geom,
+    crs = sf::st_crs(macro_group_geometries_interim)
+  ) |>
+    sf::st_make_valid()
+
+  void_sf$void_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(void_sf)))
+  void_sf <- void_sf |>
+    dplyr::filter(void_area_m2 >= macro_min_internal_void_area_m2)
+
+  if (nrow(void_sf) == 0) {
+    next
+  }
+
+  for (j in seq_len(nrow(void_sf))) {
+    void_counter <- void_counter + 1L
+    context <- compute_polygon_context(sf::st_geometry(void_sf[j, ]), grid10)
+
+    void_rows[[void_counter]] <- dplyr::bind_cols(
+      tibble::tibble(
+        void_id = paste0("V", void_counter),
+        macro_cluster_id = macro_row$macro_cluster_id,
+        void_area_m2 = void_sf$void_area_m2[j]
+      ),
+      context
+    ) |>
+      dplyr::mutate(
+        void_interpretation = dplyr::case_when(
+          surveyed_ratio >= 0.30 & absence_ratio_in_surveyed >= 0.50 ~
+            "surveyed_absence_internal_void_candidate",
+          no_data_ratio >= 0.50 ~
+            "no_data_internal_void_unconfirmed",
+          TRUE ~
+            "internal_void_candidate"
+        )
+      )
+
+    void_geoms[[void_counter]] <- sf::st_geometry(void_sf[j, ])[[1]]
+  }
+}
+
+if (length(void_rows) > 0) {
+  internal_void_candidates <- sf::st_sf(
+    dplyr::bind_rows(void_rows),
+    geometry = do.call(
+      sf::st_sfc,
+      c(void_geoms, list(crs = sf::st_crs(macro_group_geometries_interim)))
+    )
+  ) |>
+    sf::st_make_valid()
+} else {
+  internal_void_candidates <- sf::st_sf(
+    tibble::tibble(
+      void_id = character(0),
+      macro_cluster_id = character(0),
+      void_area_m2 = numeric(0),
+      context_area_m2 = numeric(0),
+      surveyed_area_m2 = numeric(0),
+      absence_area_m2 = numeric(0),
+      no_data_area_m2 = numeric(0),
+      surveyed_ratio = numeric(0),
+      absence_ratio_in_surveyed = numeric(0),
+      no_data_ratio = numeric(0),
+      void_interpretation = character(0)
+    ),
+    geometry = sf::st_sfc(crs = sf::st_crs(macro_group_geometries_interim))
+  )
+}
+
+# dwelling point側にもmacro_cluster_idを付与する。
+dwelling_points_grouped <- dwelling_points_grouped |>
+  dplyr::select(-dplyr::any_of(c("macro_cluster_id", "macro_group_type", "macro_n_micro_groups", "macro_n_dwellings"))) |>
+  dplyr::left_join(macro_assignment, by = "group_id") |>
+  dplyr::left_join(
+    macro_group_geometries_interim |>
+      sf::st_drop_geometry() |>
+      dplyr::select(
+        macro_cluster_id,
+        macro_group_type,
+        macro_n_micro_groups = n_micro_groups,
+        macro_n_dwellings = n_dwellings
+      ),
+    by = "macro_cluster_id"
+  )
+
+print(macro_group_geometries_interim |> sf::st_drop_geometry())
+print(cluster_pair_metrics)
+
+readr::write_csv(
+  cluster_pair_metrics,
+  file.path(interim_csv_dir, "interim_cluster_pair_metrics.csv")
+)
+
+readr::write_csv(
+  micro_group_macro_table,
+  file.path(interim_csv_dir, "interim_micro_to_macro_cluster_assignment.csv")
+)
+
+readr::write_csv(
+  macro_group_geometries_interim |> sf::st_drop_geometry(),
+  file.path(interim_csv_dir, "interim_macro_cluster_summary.csv")
+)
+
+readr::write_csv(
+  internal_void_candidates |> sf::st_drop_geometry(),
+  file.path(interim_csv_dir, "interim_internal_void_candidates.csv")
+)
+
+# 中間検証用GPKGへ追加出力する。
+# final_gpkgはinterim/finalで分割しない方針のため、ここでもfinal/gpkgへ追記する。
+write_gpkg_layer_safe(
+  dwelling_points_grouped,
+  final_gpkg,
+  "interim_dwelling_points_grouped"
+)
+
+write_gpkg_layer_safe(
+  macro_cluster_link_edges,
+  final_gpkg,
+  "interim_macro_cluster_link_edges"
+)
+
+write_gpkg_layer_safe(
+  macro_group_geometries_interim,
+  final_gpkg,
+  "interim_macro_cluster_geometries"
+)
+
+write_gpkg_layer_safe(
+  internal_void_candidates,
+  final_gpkg,
+  "interim_internal_void_candidates"
+)
+
+macro_validation_guide <- tibble::tibble(
+  item = c(
+    "interim_macro_cluster_link_edges",
+    "interim_macro_cluster_geometries",
+    "interim_internal_void_candidates",
+    "interim_cluster_pair_metrics.csv"
+  ),
+  interpretation = c(
+    "micro cluster間をmacro clusterとして結ぶ根拠線。C1-C2-C8-C30などが期待通り連結されるか確認する。",
+    "統合後のcluster群。環状・馬蹄形・弧状の集落構造として過大/過小でないか確認する。",
+    "macro cluster内部の空白域候補。広場・中央空間として解釈できるか、単なる未調査/非検出か確認する。",
+    "micro cluster間の距離、間隙部のabsence/no_data、リンク判定理由を確認する表。"
+  )
+)
+
+readr::write_csv(
+  macro_validation_guide,
+  file.path(interim_csv_dir, "interim_macro_cluster_validation_guide.csv")
+)
+
+cat("macro cluster中間検証レイヤを出力しました:", final_gpkg, "
+")
+```
+
+
 ## interim-local-absence-and-open-ratios
 
 **目的**：最終スコアの基礎となるabsence比率、no_data開放度、調査面積補正密度を事前計算する。  
@@ -1209,32 +1799,139 @@ terra::writeRaster(
 )
 ```
 
-## manual-validation-gate
+## 中間検証結果の確認方法
 
-**目的**：中間検証を明示的に行い、検証が通った場合のみ最終モデルへ進む。  
-**達成指標**：QGISで `interim_dwelling_points_grouped` と `interim_group_geometries` を確認し、`proceed_to_final_model` を手動で `TRUE` にする。
+このRmdでは、GeoPackageは `final` 側に集約して出力する。  
+ただし、中間検証用レイヤはレイヤ名に `interim_` を付け、最終成果レイヤと区別する。
+
+### GPKGで確認するレイヤ
+
+GPKGの出力先：
+
+```text
+auto-cor-results/final/gpkg/supported_autocorrelation_outputs.gpkg
+```
+
+検証ゲートで主に確認するレイヤは以下である。
+
+| レイヤ名 | 意味 | 検証すべき事項 |
+|---|---|---|
+| `interim_dwelling_points_grouped` | 住居点ごとのグループ分類・密集/小規模/中間の判定結果 | 1〜2軒程度の小規模住居が過剰に密集群へ含まれていないか。明らかな密集範囲の住居点が適切に同一群として扱われているか。 |
+| `interim_group_geometries` | 住居群ごとの集約ジオメトリと評価指標 | 密集群の範囲が過大・過小でないか。小規模群・孤立候補が、周辺の密集群と不自然に結合されていないか。 |
+
+この確認では、単に点数やクラスター数を見るだけでなく、QGIS上で発掘調査区・住居点分布と重ねて、考古学的に妥当なまとまりになっているかを確認する。
+
+### `interim_dwelling_points_grouped` の属性確認
+
+`interim_dwelling_points_grouped` は、住居点ごとにクラスタリング結果とグループ判定を付与した中間検証用レイヤである。  
+QGISでは、主に以下の属性を確認する。
+
+| 属性名 | 意味 | 検証すべき事項 |
+|---|---|---|
+| `dwelling_id` | Rmd内で付与した住居点ID | 個々の住居点を識別するためのID。主に確認・追跡用。 |
+| `dbscan_cluster_id` | DBSCANによるクラスターID | 同じ値の点が同一クラスターとして扱われる。`0` はクラスターに属さないノイズ点・孤立候補を示す。 |
+| `is_core` | DBSCANのコア点かどうか | `TRUE` の点が密集範囲の核として認識されているかを確認する。密集範囲内に `TRUE` が十分含まれるかを見る。 |
+| `neighbor_count` | 設定距離内にある近傍住居点数 | 値が大きい点は密集度が高い。孤立候補でこの値が高すぎないか、密集範囲で低すぎないかを確認する。 |
+| `group_id` | 後続処理でまとめた住居群ID | 同じ `group_id` の点が同一住居群として扱われる。明らかに離れた点が同一グループに入っていないか確認する。 |
+| `group_size` | そのグループに含まれる住居点数 | `1〜2` は小規模・孤立候補、`5以上` は密集候補として扱う。中間値は要確認。 |
+| `interim_group_type` | 中間判定上のグループ種別 | 最重要項目。`dense_candidate`、`small_or_isolated_candidate`、`intermediate_candidate` の分類が考古学的に妥当か確認する。 |
+
+元データ由来の属性である `ID`、`管理番号`、`調査次数`、`遺構種別`、`備考`、`Shape_Leng`、`Shape_Area` は、必要に応じて元資料との照合に用いる。  
+密集・孤立判定そのものでは、主に `dbscan_cluster_id` 以降の属性を確認する。
+
+#### QGISでの確認手順
+
+1. `interim_group_type` でカテゴリ表示する。  
+   まず、密集候補 (dense_candidate)・小規模/孤立候補 (small_or_isolated_)・中間候補 (intermediate_)の空間分布を確認する。
+
+2. `group_id` をラベル表示する。  
+   どの住居点同士が同一グループとして扱われているかを確認する。
+
+3. `group_size` を確認する。  
+   `group_size <= 2` の点が小規模・孤立候補として妥当か、`group_size >= 5` の点が密集候補として妥当かを確認する。
+
+4. `neighbor_count` と `is_core` を確認する。  
+   密集範囲では `neighbor_count` が高く、`is_core = TRUE` の点がまとまって出ることが期待される。  
+   孤立候補では `neighbor_count` が低く、`is_core = FALSE` または `dbscan_cluster_id = 0` になることが期待される。
+
+5. `interim_absence_penalty_50m.tif` と `interim_open_no_data_score_100m.tif` を重ねる。  
+   小規模候補の周囲に `absence_penalty` が高ければ、調査済み非検出域に囲まれた孤立的住居として評価できる。  
+   小規模候補の周囲に `open_no_data_score` が高ければ、孤立とは断定せず、未調査域への連続可能性を残す。
+
+#### 判定の目安
+
+| 属性の組み合わせ | 解釈 |
+|---|---|
+| `group_size <= 2` かつ `interim_group_type = small_or_isolated_candidate` | 小規模・孤立候補 |
+| `group_size <= 2` かつ `absence_penalty` が高い | 孤立的住居として扱う妥当性が高い |
+| `group_size <= 2` かつ `open_no_data_score` が高い | 未調査域に続く可能性があり、孤立とは断定しない |
+| `group_size >= 5` かつ `interim_group_type = dense_candidate` | 密集住居群候補 |
+| `dense_candidate` が no_data 側に開いている | 密集集落の連続可能性が高い |
+| 明らかな孤立点が `dense_candidate` に入る | クラスタリングパラメータが緩すぎる可能性 |
+| 明らかな密集範囲が複数の `group_id` に分断される | クラスタリングパラメータが厳しすぎる可能性 |
+
+### ラスタで確認する中間指標
+
+中間検証用ラスタの出力先：
+
+```text
+auto-cor-results/interim/raster/
+```
+
+確認する主なラスタは以下である。
+
+| ラスタ名 | 意味 | 検証すべき事項 |
+|---|---|---|
+| `interim_absence_penalty_50m.tif` | 周辺50mに調査済み非検出域がどれだけ存在するかを示す指標 | 小規模住居群・孤立候補の周囲に高い値が出ているか。高い場合、その住居は未調査域に開いているのではなく、調査済み非検出域に囲まれた孤立的住居として評価できる。 |
+| `interim_open_no_data_score_100m.tif` | 周辺100mに未調査域がどれだけ開いているかを示す指標 | 密集住居群の端部が未調査域へ自然に続いているか。高い場合、密集範囲がno_data領域へ連続する可能性がある。 |
+
+### 検証ゲートでの判断基準
+
+検証ゲートでは、以下の対応関係を確認する。
+
+| 観察される状態 | 解釈 |
+|---|---|
+| 小規模住居群 + 周囲の `absence_penalty` が高い | 単独・孤立的住居として扱うのが妥当 |
+| 小規模住居群 + 周囲の `open_no_data_score` が高い | 孤立とは断定せず、未確認領域へ続く可能性を残す |
+| 密集住居群 + no_data側に開く | 密集集落の連続候補として扱うのが妥当 |
+| 密集住居群 + 周囲の `absence_penalty` が高い | 連続可能性は抑制されるべき |
+| 明らかな密集群が分断される | クラスタリングパラメータが厳しすぎる可能性 |
+| 明らかな孤立住居が密集群へ吸収される | クラスタリングパラメータが緩すぎる可能性 |
+
+この検証で、密集範囲と孤立的ポイントが十分に識別できていると判断できる場合のみ、`proceed_to_final_model <- TRUE` に変更して最終モデル構築へ進む。
 
 ```{r manual-validation-gate}
 # 初回実行時は必ず FALSE のままにしてください。
 # 以下を確認した後に TRUE へ変更します。
-# 1. dense_candidate が実際の密集住居群を十分拾えているか。
-# 2. small_or_isolated_candidate が単独・少数住居を過不足なく拾えているか。
-# 3. eps/minPts によって別集落が過結合していないか。
-# 4. selected_d_adj_m が密集範囲内の通常住居間距離として妥当か。
+# 1. micro clusterのgroup_typeが、局所的な密集単位・小規模/孤立候補を妥当に分けているか。
+# 2. macro clusterが、C1-C2-C8-C30やC4-C5-C10のようなクラスタ群を妥当に統合しているか。
+# 3. macro link edgeが、明らかな孤立住居や小規模点を過剰に吸収していないか。
+# 4. internal void candidateが、環状・馬蹄形集落の内部空間候補として妥当か。
+# 5. selected_d_adj_m が密集範囲内の通常住居間距離として妥当か。
 
 proceed_to_final_model <- FALSE
 
 validation_checklist <- tibble::tibble(
   check_item = c(
-    "dense_candidate は密集住居群を拾えている",
-    "small_or_isolated_candidate は単独・少数住居を拾えている",
-    "別集落の過結合がない",
+    "micro clusterの dense/intermediate/small 判定は妥当",
+    "macro cluster は期待されるクラスタ群を統合している",
+    "macro link edge は小規模・孤立点を過剰吸収していない",
+    "internal void candidate は広場・中央空間候補として妥当",
     "selected_d_adj_m は密集範囲内の通常隣接距離として妥当",
     "検証後に proceed_to_final_model を TRUE に変更した"
+  ),
+  qgis_layer_or_table = c(
+    "interim_dwelling_points_grouped / interim_group_geometries",
+    "interim_macro_cluster_geometries / interim_macro_cluster_link_edges",
+    "interim_macro_cluster_link_edges / interim_cluster_pair_metrics.csv",
+    "interim_internal_void_candidates",
+    "interim_selected_parameters_initial.csv / interim_neighbor_distance_quantiles.csv",
+    "manual-validation-gate chunk"
   ),
   status = c(
     "QGISで確認",
     "QGISで確認",
+    "QGISとCSVで確認",
     "QGISで確認",
     "パラメータ表とQGISで確認",
     as.character(proceed_to_final_model)
@@ -1248,6 +1945,7 @@ readr::write_csv(
   validation_checklist,
   file.path(interim_csv_dir, "interim_manual_validation_checklist.csv")
 )
+
 ```
 
 # Stage 3: Final supported model
@@ -1263,17 +1961,21 @@ if (!proceed_to_final_model) {
 } else {
   min_surveyed_ring_coverage <- 0.30
 
-  group_nearest_other_distance <- function(point_sf, group_col = "group_id") {
+  if (!exists("macro_group_geometries_interim")) {
+    stop("macro_group_geometries_interim が存在しません。build-interim-macro-cluster-groups chunkを先に実行してください。")
+  }
+
+  macro_nearest_other_distance <- function(point_sf, macro_col = "macro_cluster_id") {
     pts_coords <- sf::st_coordinates(point_sf)
-    groups <- point_sf[[group_col]]
+    groups <- point_sf[[macro_col]]
     d <- as.matrix(stats::dist(pts_coords))
     diag(d) <- Inf
 
-    group_ids <- sort(unique(groups))
+    macro_ids <- sort(unique(groups))
 
-    purrr::map_dfr(group_ids, function(gid) {
-      in_group <- which(groups == gid)
-      out_group <- which(groups != gid)
+    purrr::map_dfr(macro_ids, function(mid) {
+      in_group <- which(groups == mid)
+      out_group <- which(groups != mid)
 
       nearest_other <- if (length(out_group) > 0) {
         min(d[in_group, out_group, drop = FALSE], na.rm = TRUE)
@@ -1282,13 +1984,13 @@ if (!proceed_to_final_model) {
       }
 
       tibble::tibble(
-        group_id = gid,
+        macro_cluster_id = mid,
         nearest_other_dwelling_m = nearest_other
       )
     })
   }
 
-  compute_ring_stats_one <- function(group_row, grid_sf, inner_m, outer_m) {
+  compute_ring_stats_one <- function(group_row, grid_sf, inner_m, outer_m, id_col = "macro_cluster_id") {
     group_geom <- sf::st_geometry(group_row)
     outer_buffer <- sf::st_buffer(group_geom, outer_m)
     inner_buffer <- sf::st_buffer(group_geom, inner_m)
@@ -1296,7 +1998,7 @@ if (!proceed_to_final_model) {
     ring_geom <- sf::st_make_valid(ring_geom)
 
     ring_sf <- sf::st_sf(
-      group_id = group_row$group_id,
+      id_value = as.character(group_row[[id_col]][1]),
       geometry = ring_geom,
       crs = sf::st_crs(grid_sf)
     )
@@ -1316,7 +2018,7 @@ if (!proceed_to_final_model) {
 
     if (nrow(inter) == 0 || !is.finite(ring_area_m2) || ring_area_m2 <= 0) {
       return(tibble::tibble(
-        group_id = group_row$group_id,
+        macro_cluster_id = as.character(group_row[[id_col]][1]),
         ring_area_m2 = ring_area_m2,
         surveyed_area_in_ring_m2 = 0,
         absence_area_in_ring_m2 = 0,
@@ -1358,7 +2060,7 @@ if (!proceed_to_final_model) {
     no_data_area_in_ring <- sum(inter_df$no_data_area_part_m2, na.rm = TRUE)
 
     tibble::tibble(
-      group_id = group_row$group_id,
+      macro_cluster_id = as.character(group_row[[id_col]][1]),
       ring_area_m2 = ring_area_m2,
       surveyed_area_in_ring_m2 = surveyed_area_in_ring,
       absence_area_in_ring_m2 = absence_area_in_ring,
@@ -1369,27 +2071,28 @@ if (!proceed_to_final_model) {
     )
   }
 
-  group_nearest <- group_nearest_other_distance(
+  macro_nearest <- macro_nearest_other_distance(
     dwelling_points_grouped,
-    group_col = "group_id"
+    macro_col = "macro_cluster_id"
   )
 
-  ring_stats <- purrr::map_dfr(
-    seq_len(nrow(group_geometries_interim)),
+  macro_ring_stats <- purrr::map_dfr(
+    seq_len(nrow(macro_group_geometries_interim)),
     function(i) {
       compute_ring_stats_one(
-        group_geometries_interim[i, ],
+        macro_group_geometries_interim[i, ],
         grid10,
         inner_m = isolation_ring_inner_m,
-        outer_m = isolation_ring_outer_m
+        outer_m = isolation_ring_outer_m,
+        id_col = "macro_cluster_id"
       )
     }
   )
 
-  group_support_table <- group_geometries_interim |>
+  macro_support_table <- macro_group_geometries_interim |>
     sf::st_drop_geometry() |>
-    dplyr::left_join(group_nearest, by = "group_id") |>
-    dplyr::left_join(ring_stats, by = "group_id") |>
+    dplyr::left_join(macro_nearest, by = "macro_cluster_id") |>
+    dplyr::left_join(macro_ring_stats, by = "macro_cluster_id") |>
     dplyr::mutate(
       small_size_factor = clamp01_numeric(
         (dense_cluster_min_n - n_dwellings) /
@@ -1398,6 +2101,11 @@ if (!proceed_to_final_model) {
       size_support_factor = clamp01_numeric(
         (n_dwellings - small_cluster_max_n) /
           (dense_cluster_min_n - small_cluster_max_n)
+      ),
+      macro_complex_bonus = dplyr::if_else(
+        n_micro_groups >= 2 & n_dwellings >= dense_cluster_min_n,
+        1,
+        0
       ),
       spacing_factor = clamp01_numeric(
         (nearest_other_dwelling_m - selected_d_adj_m) /
@@ -1412,13 +2120,21 @@ if (!proceed_to_final_model) {
         spacing_factor *
         surveyed_coverage_factor *
         absence_enclosure_factor,
-      cluster_support = size_support_factor * (1 - isolation_score),
+      cluster_support = clamp01_numeric(
+        pmax(size_support_factor, macro_complex_bonus) * (1 - isolation_score)
+      ),
       isolated_dwelling_weight = isolation_score,
       final_group_interpretation = dplyr::case_when(
-        n_dwellings >= dense_cluster_min_n & cluster_support >= 0.75 ~ "dense_supported_cluster",
-        n_dwellings <= small_cluster_max_n & isolation_score >= 0.50 ~ "isolated_dwelling_or_pair",
-        n_dwellings <= small_cluster_max_n & surveyed_coverage_factor < 0.50 ~ "small_group_unconfirmed_due_to_no_data",
-        size_support_factor > 0 & cluster_support > 0 ~ "intermediate_supported_group",
+        macro_group_type == "macro_settlement_complex_candidate" & cluster_support >= 0.75 ~
+          "macro_supported_settlement_complex",
+        n_dwellings >= dense_cluster_min_n & cluster_support >= 0.75 ~
+          "dense_supported_cluster",
+        n_dwellings <= small_cluster_max_n & isolation_score >= 0.50 ~
+          "isolated_dwelling_or_pair",
+        n_dwellings <= small_cluster_max_n & surveyed_coverage_factor < 0.50 ~
+          "small_group_unconfirmed_due_to_no_data",
+        size_support_factor > 0 & cluster_support > 0 ~
+          "intermediate_supported_group",
         TRUE ~ "low_support_group"
       )
     ) |>
@@ -1427,42 +2143,80 @@ if (!proceed_to_final_model) {
       dplyr::desc(isolation_score)
     )
 
-  group_geometries_final <- group_geometries_interim |>
+  macro_group_geometries_final <- macro_group_geometries_interim |>
     dplyr::left_join(
-      group_support_table,
-      by = c(
-        "group_id",
-        "n_dwellings",
-        "dbscan_cluster_id",
-        "has_noise_point",
-        "n_core_points",
-        "mean_neighbor_count",
-        "interim_group_type",
-        "selected_eps_m",
-        "selected_min_pts"
-      )
-    )
-
-  dwelling_points_final <- dwelling_points_grouped |>
-    dplyr::left_join(
-      group_support_table |>
+      macro_support_table |>
         dplyr::select(
-          group_id,
+          macro_cluster_id,
+          nearest_other_dwelling_m,
+          ring_area_m2,
+          surveyed_area_in_ring_m2,
+          absence_area_in_ring_m2,
+          no_data_area_in_ring_m2,
+          surveyed_ring_coverage,
+          absence_ring_ratio,
+          no_data_open_ratio,
+          small_size_factor,
+          size_support_factor,
+          macro_complex_bonus,
+          spacing_factor,
+          surveyed_coverage_factor,
+          absence_enclosure_factor,
           isolation_score,
           cluster_support,
           isolated_dwelling_weight,
           final_group_interpretation
         ),
-      by = "group_id"
+      by = "macro_cluster_id"
     )
 
-  print(group_support_table)
+  group_geometries_final <- group_geometries_interim |>
+    dplyr::left_join(
+      micro_group_macro_table |>
+        dplyr::select(group_id, macro_cluster_id),
+      by = "group_id"
+    ) |>
+    dplyr::left_join(
+      macro_support_table |>
+        dplyr::select(
+          macro_cluster_id,
+          macro_group_type,
+          macro_n_dwellings = n_dwellings,
+          macro_n_micro_groups = n_micro_groups,
+          isolation_score,
+          cluster_support,
+          isolated_dwelling_weight,
+          final_group_interpretation
+        ),
+      by = "macro_cluster_id"
+    )
+
+  dwelling_points_final <- dwelling_points_grouped |>
+    dplyr::left_join(
+      macro_support_table |>
+        dplyr::select(
+          macro_cluster_id,
+          isolation_score,
+          cluster_support,
+          isolated_dwelling_weight,
+          final_group_interpretation
+        ),
+      by = "macro_cluster_id"
+    )
+
+  print(macro_support_table)
 
   readr::write_csv(
-    group_support_table,
-    file.path(final_csv_dir, "final_group_isolation_support_table.csv")
+    macro_support_table,
+    file.path(final_csv_dir, "final_macro_cluster_isolation_support_table.csv")
+  )
+
+  readr::write_csv(
+    group_geometries_final |> sf::st_drop_geometry(),
+    file.path(final_csv_dir, "final_micro_group_with_macro_support_table.csv")
   )
 }
+
 ```
 
 ## build-supported-rasters
@@ -1485,21 +2239,24 @@ if (!proceed_to_final_model) {
   support_distance_decay_m <- max(isolation_ring_outer_m, 50)
   isolated_distance_decay_m <- max(selected_d_adj_m, 30)
 
-  support_groups <- group_geometries_final |>
+  support_macro_groups <- macro_group_geometries_final |>
     dplyr::filter(cluster_support > 0)
 
   supported_cluster_proximity_score_r <- template_r
   supported_cluster_proximity_score_r[] <- 0
   names(supported_cluster_proximity_score_r) <- "supported_cluster_proximity_score"
 
-  if (nrow(support_groups) > 0) {
-    for (i in seq_len(nrow(support_groups))) {
-      g <- support_groups[i, ]
+  if (nrow(support_macro_groups) > 0) {
+    for (i in seq_len(nrow(support_macro_groups))) {
+      g <- support_macro_groups[i, ]
+
+      g_seed <- g |>
+        dplyr::mutate(seed_value = 1L)
 
       group_seed_r <- terra::rasterize(
-        terra::vect(g),
+        terra::vect(g_seed),
         template_r,
-        field = 1,
+        field = "seed_value",
         background = NA,
         touches = TRUE
       )
@@ -1537,7 +2294,10 @@ if (!proceed_to_final_model) {
   names(weighted_dwelling_count_50m_r) <- "weighted_dwelling_count_50m"
 
   local_surveyed_50m_r <- local_surveyed_area_rasters[["50"]]
-  weighted_density_raw_50m_r <- (weighted_dwelling_count_50m_r / terra::ifel(local_surveyed_50m_r < 1, 1, local_surveyed_50m_r)) * 10000
+  weighted_density_raw_50m_r <- (
+    weighted_dwelling_count_50m_r /
+      terra::ifel(local_surveyed_50m_r < 1, 1, local_surveyed_50m_r)
+  ) * 10000
   names(weighted_density_raw_50m_r) <- "supported_density_raw_50m_ha"
 
   max_density_value <- terra::global(weighted_density_raw_50m_r, "max", na.rm = TRUE)[1, 1]
@@ -1564,17 +2324,20 @@ if (!proceed_to_final_model) {
   isolated_dwelling_signal_r[] <- 0
   names(isolated_dwelling_signal_r) <- "isolated_dwelling_signal"
 
-  isolated_groups <- group_geometries_final |>
+  isolated_macro_groups <- macro_group_geometries_final |>
     dplyr::filter(isolated_dwelling_weight > 0)
 
-  if (nrow(isolated_groups) > 0) {
-    for (i in seq_len(nrow(isolated_groups))) {
-      g <- isolated_groups[i, ]
+  if (nrow(isolated_macro_groups) > 0) {
+    for (i in seq_len(nrow(isolated_macro_groups))) {
+      g <- isolated_macro_groups[i, ]
+
+      g_seed <- g |>
+        dplyr::mutate(seed_value = 1L)
 
       isolated_seed_r <- terra::rasterize(
-        terra::vect(g),
+        terra::vect(g_seed),
         template_r,
-        field = 1,
+        field = "seed_value",
         background = NA,
         touches = TRUE
       )
@@ -1599,6 +2362,7 @@ if (!proceed_to_final_model) {
   safe_global(effective_open_no_data_score_100m_r, c("min", "max", "mean"), "effective_open_no_data_score_100m")
   safe_global(isolated_dwelling_signal_r, c("min", "max", "mean"), "isolated_dwelling_signal")
 }
+
 ```
 
 ## build-final-continuity-score
@@ -1629,9 +2393,9 @@ if (!proceed_to_final_model) {
       -w_absence_penalty
     ),
     interpretation = c(
-      "孤立度の低い密集クラスターへの近接性",
-      "cluster_supportで補正した50m住居密度",
-      "密集クラスター近傍で未調査域へ開く度合い",
+      "孤立度の低いmacro clusterへの近接性",
+      "macro cluster supportで補正した50m住居密度",
+      "macro cluster近傍で未調査域へ開く度合い",
       "周辺50m内の調査済み非検出による減点"
     )
   )
@@ -1786,7 +2550,7 @@ if (!proceed_to_final_model) {
 
 ```{r export-final-gpkg}
 if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、final gpkg 出力をスキップします。中間検証レイヤは build-interim-cluster-layers で既に出力済みです。")
+  message("proceed_to_final_model = FALSE のため、final gpkg 出力をスキップします。中間検証レイヤは build-interim-cluster-layers / build-interim-macro-cluster-groups で既に出力済みです。")
 } else {
   if (file.exists(final_gpkg)) {
     unlink(final_gpkg)
@@ -1805,6 +2569,24 @@ if (!proceed_to_final_model) {
   )
 
   write_gpkg_layer_safe(
+    macro_cluster_link_edges,
+    final_gpkg,
+    "interim_macro_cluster_link_edges"
+  )
+
+  write_gpkg_layer_safe(
+    macro_group_geometries_interim,
+    final_gpkg,
+    "interim_macro_cluster_geometries"
+  )
+
+  write_gpkg_layer_safe(
+    internal_void_candidates,
+    final_gpkg,
+    "interim_internal_void_candidates"
+  )
+
+  write_gpkg_layer_safe(
     dwelling_points_final,
     final_gpkg,
     "final_dwelling_points_with_support"
@@ -1813,7 +2595,13 @@ if (!proceed_to_final_model) {
   write_gpkg_layer_safe(
     group_geometries_final,
     final_gpkg,
-    "final_group_isolation_support"
+    "final_micro_groups_with_macro_support"
+  )
+
+  write_gpkg_layer_safe(
+    macro_group_geometries_final,
+    final_gpkg,
+    "final_macro_cluster_isolation_support"
   )
 
   final_grid_extract_points <- sf::st_point_on_surface(grid10)
@@ -1869,8 +2657,10 @@ if (!proceed_to_final_model) {
     "final_cluster_continuity_grid_no_data_top5pct"
   )
 
-  cat("final gpkg:", final_gpkg, "\n")
+  cat("final gpkg:", final_gpkg, "
+")
 }
+
 ```
 
 ## final-summaries
@@ -1890,6 +2680,11 @@ if (!proceed_to_final_model) {
     selected_d_adj_m = selected_d_adj_m,
     isolation_ring_inner_m = isolation_ring_inner_m,
     isolation_ring_outer_m = isolation_ring_outer_m,
+    macro_link_max_boundary_distance_m = macro_link_max_boundary_distance_m,
+    macro_nearest_dwelling_link_m = macro_nearest_dwelling_link_m,
+    macro_corridor_width_m = macro_corridor_width_m,
+    macro_min_group_n_for_link = macro_min_group_n_for_link,
+    macro_min_internal_void_area_m2 = macro_min_internal_void_area_m2,
     min_surveyed_ring_coverage = min_surveyed_ring_coverage,
     support_distance_decay_m = support_distance_decay_m,
     isolated_distance_decay_m = isolated_distance_decay_m
@@ -1907,6 +2702,7 @@ if (!proceed_to_final_model) {
       "raster",
       "raster",
       "gpkg",
+      "csv",
       "csv"
     ),
     path = c(
@@ -1915,14 +2711,16 @@ if (!proceed_to_final_model) {
       file.path(final_raster_dir, "isolated_dwelling_signal.tif"),
       file.path(final_raster_dir, "final_supported_model_components.tif"),
       final_gpkg,
+      file.path(interim_csv_dir, "interim_cluster_pair_metrics.csv"),
       final_csv_dir
     ),
     interpretation = c(
-      "主成果。未調査域に限定した密集集落継続可能性の連続値スコア。",
+      "主成果。未調査域に限定したmacro cluster継続可能性の連続値スコア。",
       "診断用。presence/absence/no_dataすべてに連続スコアを保持。",
       "補助成果。単独・孤立的住居シグナル。",
       "構成成分を含むマルチバンドGeoTIFF。",
-      "中間検証レイヤと最終ベクタ成果を格納。",
+      "中間検証レイヤと最終ベクタ成果を格納。interim_レイヤにはmacro cluster検証結果を含む。",
+      "micro cluster間のリンク判定・間隙部評価を格納。",
       "パラメータ、評価表、スコア要約を格納。"
     )
   )
@@ -1935,4 +2733,33 @@ if (!proceed_to_final_model) {
   print(final_parameters)
   print(final_output_manifest)
 }
+
 ```
+
+# ノート: chunk一覧
+
+| chunk名 | 概要 |
+|---|---|
+| `setup` | 必要パッケージと補助関数を読み込み、以後の空間処理・ラスタ処理を実行可能にする。 |
+| `paths` | 入力GPKGと auto-cor-results 以下の出力フォルダ構成を定義する。 |
+| `download-data` | Kokubunji_Jomon.gpkg がローカルにない場合に取得する。 |
+| `inspect-gpkg-layers` | GPKG内の利用可能レイヤ名を確認する。 |
+| `read-data` | 発掘調査区・住居点・市域境界を読み込み、共通CRSへ変換する。 |
+| `create-analysis-grid` | 市域ポリゴンから10mグリッドとラスタテンプレートを作成する。 |
+| `assign-grid-response` | 各10mセルに presence / absence / no_data の観測状態を付与する。 |
+| `rasterize-status-layers` | 観測状態と面積情報をラスタ化し、後続の近傍集計に使う。 |
+| `dwelling-neighbor-distances` | 住居点間の最近傍距離分布を計算し、密集内通常距離の候補を出力する。 |
+| `define-clustering-functions` | DBSCAN相当のクラスタリングと評価関数を定義する。 |
+| `parameter-sweep-clustering` | 複数の eps/minPts 候補を評価し、密集・孤立識別のパラメータ表を作成する。 |
+| `select-candidate-parameters` | 評価表にもとづき初期推奨パラメータと孤立判定リングを設定する。 |
+| `build-interim-cluster-layers` | 住居点をmicro clusterに分類し、中間検証用GPKGレイヤを作成する。 |
+| `build-interim-macro-cluster-groups` | micro cluster間の関係を評価し、macro cluster、リンク、内部空白候補を作成する。 |
+| `interim-local-absence-and-open-ratios` | absence penalty と open no_data の中間検証ラスタを作成する。 |
+| `manual-validation-gate` | QGISとCSVで中間結果を確認し、最終モデルへ進むかを手動制御する。 |
+| `compute-isolation-and-support` | macro cluster単位で孤立度と cluster support を計算する。 |
+| `build-supported-rasters` | macro cluster supportで補正した近接・密度・孤立シグナルのラスタを作成する。 |
+| `build-final-continuity-score` | 構成成分を統合し、連続値の自己相関スコアを作成する。 |
+| `final-score-diagnostics-by-status` | 観測状態別に最終スコア分布を集計して診断する。 |
+| `export-final-rasters` | 最終スコアと構成成分をQGIS表示用GeoTIFFとして出力する。 |
+| `export-final-gpkg` | 中間検証レイヤと最終ベクタ成果を単一GPKGへ出力する。 |
+| `final-summaries` | 使用パラメータ、出力一覧、最終要約CSVを作成する。 |
