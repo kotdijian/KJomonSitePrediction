@@ -1,0 +1,16 @@
+category,parameter,contents,inputs,related_parameters,memo
+基本設定,grid_cell_size_m,解析グリッドのセルサイズ,"city_boundary, grid10, template_r",距離・半径系parameter全般,継続。現状 10
+基本設定,surveyed_ratio_min_for_absence,absenceセル判定に必要な最小調査済み面積比,"trench_polygon, grid10","absence_flag, absence_area_r",継続。現状 0.25
+cluster判定,small_cluster_max_n,小規模・孤立候補とする最大住居数,dwelling_points,"dense_cluster_min_n, isolated_dwelling_weight",継続。現状 2
+cluster判定,dense_cluster_min_n,密集cluster候補とする最小住居数,dwelling_points,"selected_min_pts, source_strength",継続。現状 5
+source強度,source_density_radius_m,presence自己相関・局所密度の評価半径,"presence_flag_r, dwelling_points",source_strength,追加。例 50
+source強度,source_strength_power,強いpresence群を非線形に強調する指数,"macro_support, density_score",effective_range_m,追加。例 1.0–2.0
+開口方向,opening_neighbor_radius_m,presenceがno_dataへ接している方向を判定する幅,"presence_flag_r, no_data_flag_r",opening_gate,追加。10mグリッドなら 10–20
+距離減衰,base_range_m,positive値の基本到達距離,"selected_d_adj_m, source_strength",effective_range_m,"追加。例 max(3 * selected_d_adj_m, 80)"
+距離減衰,decay_power,距離減衰曲線の形,distance_from_source,effective_range_m,追加。例 2
+absence遮断,absence_evidence_radius_m,absence evidence の局所評価半径,"absence_area_r, surveyed_area_r",barrier_strength,追加。例 50
+absence遮断,absence_continuity_radius_m,absence領域の広さ・連続性評価半径,"absence_flag_r, absence_area_r",barrier_strength,追加。例 50–100
+absence遮断,barrier_strength_power,absence遮断の強調指数,"absence_evidence, absence_continuity",effective_range_m,追加。再上昇抑制に重要
+source–barrier比較,barrier_vs_source_scale,source strength と barrier strength の比較尺度,"source_strength, barrier_strength",range_modifier,追加。遮断がsourceを上回るかを制御
+source–barrier比較,min_range_modifier,強い遮断時の最小到達距離比,"barrier_strength, source_strength",effective_range_m,追加。例 0.15–0.30
+再上昇防止,monotonic_decay_enforce,一度低下したpositive値が外側で再上昇しないよう制御,"distance, barrier_strength, score",effective_range_m,追加。TRUE 推奨
