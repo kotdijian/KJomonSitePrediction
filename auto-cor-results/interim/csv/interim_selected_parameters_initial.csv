@@ -1,2 +1,0 @@
-selected_eps_m,selected_min_pts,dense_cluster_min_n,small_cluster_max_n,selected_d_adj_m,isolation_ring_inner_m,isolation_ring_outer_m,note
-10,3,5,2,7.337496561150367,7.337496561150367,50,自動推奨値。QGISで密集・孤立識別を確認後、必要なら手動修正する。

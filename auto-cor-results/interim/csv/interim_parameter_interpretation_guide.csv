@@ -1,6 +1,0 @@
-item,judgement
-dense_cluster_count,1以上であること。0の場合は密集範囲を識別できていない。
-dense_clustered_point_ratio,0.25〜0.90程度を目安とする。低すぎると拾い漏れ、高すぎると過結合。
-noise_point_ratio,0.60以下を目安とする。高すぎる場合はepsが小さすぎる可能性。
-largest_cluster_point_ratio,0.60以下を目安とする。高すぎる場合は別集落を結合している可能性。
-dense_nn_q90,密集範囲内の通常隣接距離 d_adj の候補。孤立判定リングの基準に使う。
