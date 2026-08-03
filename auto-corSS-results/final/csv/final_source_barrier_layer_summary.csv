@@ -1,0 +1,13 @@
+layer,min,mean,max,positive_cells
+source_seed_strength,0,0.007041928594907029,1,1687
+open_source_strength,0,0.0034112003016659224,1,855
+supported_density_score,0,0.004228801605587262,1,2244
+no_data_contact,0,0.5329785099242917,1,116863
+macro_internal_context,0,0.00972343841214836,1,2132
+internal_macro_absence,0,0.004962054874493585,1,1088
+external_absence_barrier,0,0.014229422066525615,1,3120
+external_absence_evidence,0,0.056271575734903406,1,18323
+external_absence_continuity_score,0,0.014196362690772717,1,25273
+absence_barrier_shadow,0,0.007282609818714266,0.911504424778761,15752
+absence_barrier_strength,0,0.03914876110998449,1,25661
+directional_allowed,0,0.514270468476054,1,112761

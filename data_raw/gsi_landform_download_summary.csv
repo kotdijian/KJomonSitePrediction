@@ -1,0 +1,3 @@
+source_key,output_layer,zoom,tile_count_requested,feature_count,clipped_to_target_area,written,gpkg_path,target_area_mode,target_area_layer,output_gpkg_path
+natural,gsi_landform_natural,16,270,946,TRUE,TRUE,data_raw/Kokubunji_Jomon.gpkg,gpkg_layer,kokubunji_city_buffer,data_raw/Kokubunji_Jomon.gpkg
+artificial,gsi_landform_artificial,16,270,192,TRUE,TRUE,data_raw/Kokubunji_Jomon.gpkg,gpkg_layer,kokubunji_city_buffer,data_raw/Kokubunji_Jomon.gpkg

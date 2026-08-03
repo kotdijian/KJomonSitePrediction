@@ -1,0 +1,12 @@
+landform_class,landform_group_for_model,feature_count,source_layer
+台地・段丘,upland_terrace,313,gsi_landform_natural
+凹地・浅い谷,shallow_valley_depression,222,gsi_landform_natural
+水部,water,208,gsi_landform_natural
+山地斜面等,slope_mountain,87,gsi_landform_natural
+氾濫平野・海岸平野,floodplain_coastal_plain,52,gsi_landform_natural
+崖･段丘崖,scarp_terrace_edge,44,gsi_landform_natural
+旧河道,abandoned_channel,11,gsi_landform_natural
+扇状地,fan,7,gsi_landform_natural
+自然堤防,natural_levee,2,gsi_landform_natural
+盛土地・埋立地,fill_reclaimed_land,132,gsi_landform_artificial
+切土地,cut_land,60,gsi_landform_artificial

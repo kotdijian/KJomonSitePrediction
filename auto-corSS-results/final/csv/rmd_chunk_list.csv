@@ -1,0 +1,28 @@
+no,chunk,section,purpose
+1,c01_setup,setup,解析に必要なパッケージと共通関数を準備する。
+2,c02_paths,paths,入力データと出力先フォルダを定義する。
+3,c03_analysis_parameters,analysis-parameters,directional model用の解析パラメータを定義する。
+4,c04_download_data,download-data,必要な入力GPKGがローカルにない場合に取得する。
+5,c05_read_data,read-data,GPKGから集石点、調査区、市域ポリゴンを読み込む。
+6,c06_create_analysis_grid,create-analysis-grid,市域内に10mグリッドとラスタテンプレートを作成する。
+7,c07_assign_grid_response,assign-grid-response,各10mセルにpresence、absence、no_dataを付与する。
+8,c08_rasterize_status_layers,rasterize-status-layers,presence、absence、no_data、surveyed areaをラスタ化する。
+8,c08b_rasterize_artificial_modified_land,rasterize_artificial_modified_land,GSI人工地形分類 code=11001 を、score対象外・通過可能高cost領域としてラスタ化する。
+9,c09_local_context_rasters,local-context-rasters,interim確認用のabsence penalty と open no_data scoreを作成する。
+10,c10_shuseki_neighbor_distances,shuseki-neighbor-distances,集石間距離を計算し、micro cluster候補パラメータを作る。
+11,c11_parameter_sweep_clustering,parameter-sweep-clustering,DBSCAN候補パラメータを評価する。
+12,c12_select_candidate_parameters,select-candidate-parameters,候補パラメータからselected_eps_m、selected_min_pts、selected_d_adj_mを定義する。
+13,c13_build_interim_micro_cluster_layers,build-interim-micro-cluster-layers,選択パラメータで集石点をmicro clusterに分類する。
+14,c14_build_interim_macro_cluster_groups,build-interim-macro-cluster-groups,micro cluster間関係からmacro clusterを作成する。
+15,c15_export_interim_rasters,export-interim-rasters,中間確認用ラスタをGeoTIFFとして出力する。
+16,c16_export_interim_gpkg_layers,export-interim-gpkg-layers,中間確認用ベクタレイヤをGPKGに出力する。
+17,c17_check_interim_outputs,check-interim-outputs,interim出力の過不足を確認する。
+18,c18_compute_macro_isolation_support,compute-macro-isolation-support,macro clusterごとに孤立度と集石集中域連続性への寄与度を計算する。
+19,c19_build_directional_source_barrier_rasters,build-directional-source-barrier-rasters,開口source、source strength、absence barrier strengthを作成する。
+20,c20_build_directional_propagation_score,build-directional-propagation-score,累積コスト型のdirectional propagationにより最終スコアを作成する。
+20,c20b_build_micro_continuity_diagnostic,build-micro-continuity-diagnostic,累積コスト型のdirectional propagationにより最終スコアを作成する。
+21,c21_directional_score_diagnostics,directional-score-diagnostics,directional modelの構成ラスタと最終スコアを数値診断する。
+22,c22_export_final_rasters,export-final-rasters,final成果ラスタをGeoTIFFとして出力する。
+23,c23_export_final_gpkg,export-final-gpkg,interimとfinal成果をGeoPackageにまとめる。
+24,c24_final_summaries,final-summaries,final成果の要約CSVを出力する。
+25,c25_chunk_list,chunk-list,Rmd内のchunk一覧を出力する。

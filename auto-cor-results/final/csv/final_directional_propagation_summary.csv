@@ -1,2 +1,2 @@
-source_cells,processed_cells,base_range_m,max_normalized_cost,decay_power,barrier_cost_multiplier,absence_cell_extra_cost
-424,3115,80,1,2,3,5
+source_cells,processed_cells,base_range_m,max_normalized_cost,decay_power,barrier_cost_multiplier,barrier_strength_power,barrier_vs_source_scale,artificial_modified_cost_multiplier,modified_unavailable_no_data_cells,prediction_target_cells
+424,2342,80,1,2,18,1.5,1,3,1344,110140

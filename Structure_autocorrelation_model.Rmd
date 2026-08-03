@@ -211,71 +211,142 @@ cat("final_gpkg:", final_gpkg, "\n")
 
 # 03. analysis-parameters
 
-**目的**：directional model用の解析パラメータを定義する。
+**目的**：解析パラメータを設定し、記録用テーブルとして出力する。
+**方針*：**
+  - absenceは一律の絶対壁ではなく、internal / external に分けて扱う。
+  - external absence は強い方向遮断として扱う。
+  - internal macro absence は集落内部空白として弱コストまたは通過可とする。
 
 ```{r c03_analysis_parameters, eval=TRUE}
+
 grid_cell_size_m <- 10
 surveyed_ratio_min_for_absence <- 0.25
 
 small_cluster_max_n <- 2
 dense_cluster_min_n <- 5
 
-# source強度：presence自己相関・密集度・macro supportをpositive sourceの強さに反映する。
+# source strength
 source_density_radius_m <- 50
-source_strength_power <- 1.25
-source_range_bonus <- 0.75
+source_strength_power <- 1.5
+source_range_bonus <- 0.5
 source_min_strength <- 0.05
 
-# 開口方向：macro/presence sourceがno_dataへ接する境界だけを伝播開始点にする。
+# opening
 opening_neighbor_radius_m <- 15
 
-# 距離減衰：selected_d_adj_mから実行時にbase_range_mを計算する。
+# distance decay
 base_range_min_m <- 80
 base_range_adj_multiplier <- 3
 decay_power <- 2
 
-# absence遮断：absenceの広さ・連続性を累積コストに変換する。
+# absence barrier
 absence_evidence_radius_m <- 50
 absence_continuity_radius_m <- 80
-absence_evidence_weight <- 0.70
-absence_continuity_weight <- 0.30
-barrier_strength_power <- 1.50
-barrier_cost_multiplier <- 8
-absence_cell_extra_cost <- 4
 
-# sourceとbarrierの比較：sourceが強い場合は遮断を相対的に弱める。
-barrier_vs_source_scale <- 0.35
-min_range_modifier <- 0.15
+# external absence の周辺no_dataに与えるshadow幅
+absence_shadow_radius_m <- 60
+
+# macro cluster内部のabsenceをinternal void側に寄せるための許容幅
+internal_absence_buffer_m <- 10
+
+# barrier strength 合成重み
+absence_evidence_weight <- 0.45
+absence_continuity_weight <- 0.30
+absence_shadow_weight <- 0.25
+
+# internal macro absence は弱いbarrierに留める
+internal_absence_barrier_strength <- 0.15
+
+# external absence は通過不可にする
+external_absence_hard_barrier <- TRUE
+
+# propagation cost
+barrier_strength_power <- 1.50
+barrier_cost_multiplier <- 18
+
+# source strengthによるbarrier緩和は弱くする
+barrier_vs_source_scale <- 1.0
+
+# source strengthが低い場合の最小到達距離比
+min_range_modifier <- 0.10
+
 max_normalized_cost <- 1.0
 directional_neighbor_mode <- "queen_8"
 monotonic_decay_enforce <- TRUE
 
+# 人工改変地：
+# GSI人工地形分類から、道路・鉄道・造成等により
+# 今後の確認が困難な no_data を抽出する。
+# negative evidence ではなく、通過可能な高cost領域として扱う。
+artificial_landform_layer <- "gsi_landform_artificial"
+artificial_landform_code <- 11001
+
+# 10mセル内に人工改変地がこの割合以上含まれる場合、
+# modified unavailable no_data として扱う。
+artificial_modified_min_cell_ratio <- 0.05
+
+# 人工改変地を通過する際の追加cost倍率。
+# 1なら通常no_dataと同じ、2〜5で通過しにくくなる。
+artificial_modified_cost_multiplier <- 3
+
+format_param_value <- function(x) {
+  if (is.null(x) || length(x) == 0) {
+    return(NA_character_)
+  }
+
+  if (is.logical(x)) {
+    return(as.character(x))
+  }
+
+  if (is.numeric(x)) {
+    return(format(x, trim = TRUE, scientific = FALSE))
+  }
+
+  as.character(x)
+}
+
 analysis_parameter_table <- tibble::tribble(
   ~group, ~parameter, ~value, ~meaning,
-  "basic", "grid_cell_size_m", grid_cell_size_m, "解析グリッド解像度",
-  "basic", "surveyed_ratio_min_for_absence", surveyed_ratio_min_for_absence, "absenceセル判定に必要な最小調査済み面積比",
-  "cluster", "small_cluster_max_n", small_cluster_max_n, "小規模・孤立候補とする最大住居数",
-  "cluster", "dense_cluster_min_n", dense_cluster_min_n, "密集cluster候補とする最小住居数",
-  "source_strength", "source_density_radius_m", source_density_radius_m, "presence自己相関・局所密度の評価半径",
-  "source_strength", "source_strength_power", source_strength_power, "source strengthの非線形強調",
-  "source_strength", "source_range_bonus", source_range_bonus, "source strengthによる到達距離の増分",
-  "source_strength", "source_min_strength", source_min_strength, "伝播source strengthの下限",
-  "opening", "opening_neighbor_radius_m", opening_neighbor_radius_m, "no_dataに接するsource境界の判定半径",
-  "distance_decay", "base_range_min_m", base_range_min_m, "positive値の最小基本到達距離",
-  "distance_decay", "base_range_adj_multiplier", base_range_adj_multiplier, "selected_d_adj_mに対する到達距離倍率",
-  "distance_decay", "decay_power", decay_power, "距離減衰曲線の指数",
-  "absence_barrier", "absence_evidence_radius_m", absence_evidence_radius_m, "absence evidenceの局所評価半径",
-  "absence_barrier", "absence_continuity_radius_m", absence_continuity_radius_m, "absence領域の広さ・連続性評価半径",
-  "absence_barrier", "absence_evidence_weight", absence_evidence_weight, "barrier strengthにおけるabsence evidence重み",
-  "absence_barrier", "absence_continuity_weight", absence_continuity_weight, "barrier strengthにおけるabsence連続性重み",
-  "absence_barrier", "barrier_strength_power", barrier_strength_power, "absence遮断の非線形強調",
-  "absence_barrier", "barrier_cost_multiplier", barrier_cost_multiplier, "barrier strengthを累積コストへ変換する倍率",
-  "absence_barrier", "absence_cell_extra_cost", absence_cell_extra_cost, "absenceセル通過時の追加コスト",
-  "source_barrier_comparison", "barrier_vs_source_scale", barrier_vs_source_scale, "source strengthとbarrier strengthの比較尺度",
-  "source_barrier_comparison", "min_range_modifier", min_range_modifier, "source strengthが低い場合の最小到達距離比",
-  "propagation", "max_normalized_cost", max_normalized_cost, "この値を超える伝播を停止する正規化コスト",
-  "propagation", "directional_neighbor_mode", directional_neighbor_mode, "伝播近傍設定",
-  "propagation", "monotonic_decay_enforce", monotonic_decay_enforce, "累積コストにより外周再上昇を防ぐ"
+  "basic", "grid_cell_size_m", format_param_value(grid_cell_size_m), "解析グリッド解像度",
+  "basic", "surveyed_ratio_min_for_absence", format_param_value(surveyed_ratio_min_for_absence), "absenceセル判定に必要な最小調査済み面積比",
+
+  "cluster", "small_cluster_max_n", format_param_value(small_cluster_max_n), "小規模・孤立候補とする最大住居数",
+  "cluster", "dense_cluster_min_n", format_param_value(dense_cluster_min_n), "密集cluster候補とする最小住居数",
+
+  "source_strength", "source_density_radius_m", format_param_value(source_density_radius_m), "presence自己相関・局所密度の評価半径",
+  "source_strength", "source_strength_power", format_param_value(source_strength_power), "source strengthの非線形強調",
+  "source_strength", "source_range_bonus", format_param_value(source_range_bonus), "source strengthによる到達距離の増分",
+  "source_strength", "source_min_strength", format_param_value(source_min_strength), "伝播source strengthの下限",
+
+  "opening", "opening_neighbor_radius_m", format_param_value(opening_neighbor_radius_m), "no_dataに接するsource境界の判定半径",
+
+  "distance_decay", "base_range_min_m", format_param_value(base_range_min_m), "positive値の最小基本到達距離",
+  "distance_decay", "base_range_adj_multiplier", format_param_value(base_range_adj_multiplier), "selected_d_adj_mに対する到達距離倍率",
+  "distance_decay", "decay_power", format_param_value(decay_power), "距離減衰曲線の指数",
+
+  "absence_barrier", "absence_evidence_radius_m", format_param_value(absence_evidence_radius_m), "absence evidenceの局所評価半径",
+  "absence_barrier", "absence_continuity_radius_m", format_param_value(absence_continuity_radius_m), "absence領域の広さ・連続性評価半径",
+  "absence_barrier", "absence_shadow_radius_m", format_param_value(absence_shadow_radius_m), "external absence周辺no_dataに与えるshadow幅",
+  "absence_barrier", "internal_absence_buffer_m", format_param_value(internal_absence_buffer_m), "macro cluster内部absence判定の許容幅",
+  "absence_barrier", "absence_evidence_weight", format_param_value(absence_evidence_weight), "barrier strengthにおけるabsence evidence重み",
+  "absence_barrier", "absence_continuity_weight", format_param_value(absence_continuity_weight), "barrier strengthにおけるabsence連続性重み",
+  "absence_barrier", "absence_shadow_weight", format_param_value(absence_shadow_weight), "barrier strengthにおけるabsence shadow重み",
+  "absence_barrier", "internal_absence_barrier_strength", format_param_value(internal_absence_barrier_strength), "internal macro absenceに与える弱barrier",
+  "absence_barrier", "external_absence_hard_barrier", format_param_value(external_absence_hard_barrier), "external absenceを通過不可とするか",
+  "absence_barrier", "barrier_strength_power", format_param_value(barrier_strength_power), "absence遮断の非線形強調",
+  "absence_barrier", "barrier_cost_multiplier", format_param_value(barrier_cost_multiplier), "barrier strengthを累積コストへ変換する倍率",
+
+  "source_barrier_comparison", "barrier_vs_source_scale", format_param_value(barrier_vs_source_scale), "source strengthによるbarrier緩和尺度",
+  "source_barrier_comparison", "min_range_modifier", format_param_value(min_range_modifier), "source strengthが低い場合の最小到達距離比",
+
+  "modern_disturbance", "artificial_landform_layer", format_param_value(artificial_landform_layer), "人工改変地を取得するGPKGレイヤ",
+  "modern_disturbance", "artificial_landform_code", format_param_value(artificial_landform_code), "人工改変地として扱うGSI人工地形分類code",
+  "modern_disturbance", "artificial_modified_min_cell_ratio", format_param_value(artificial_modified_min_cell_ratio), "人工改変地セル判定の最小面積比",
+  "modern_disturbance", "artificial_modified_cost_multiplier", format_param_value(artificial_modified_cost_multiplier), "人工改変地通過時の追加cost倍率",
+  
+  "propagation", "max_normalized_cost", format_param_value(max_normalized_cost), "この値を超える伝播を停止する正規化コスト",
+  "propagation", "directional_neighbor_mode", format_param_value(directional_neighbor_mode), "伝播近傍設定",
+  "propagation", "monotonic_decay_enforce", format_param_value(monotonic_decay_enforce), "累積コストにより外周再上昇を防ぐ"
 )
 
 print(analysis_parameter_table)
@@ -309,6 +380,7 @@ file.info(gpkg_path)
 
 ```{r c05_read_data, eval=TRUE}
 gpkg_layers <- sf::st_layers(gpkg_path)$name
+
 print(gpkg_layers)
 
 required_layers <- c(
@@ -318,17 +390,30 @@ required_layers <- c(
 )
 
 missing_layers <- setdiff(required_layers, gpkg_layers)
+
 if (length(missing_layers) > 0) {
   stop("GPKGに必要レイヤがありません: ", paste(missing_layers, collapse = ", "))
 }
 
-dwelling_points <- sf::st_read(gpkg_path, layer = "jdwelling_point", quiet = TRUE) |>
+dwelling_points <- sf::st_read(
+  gpkg_path,
+  layer = "jdwelling_point",
+  quiet = TRUE
+) |>
   sf::st_make_valid()
 
-trench_polygon <- sf::st_read(gpkg_path, layer = "trench_polygon", quiet = TRUE) |>
+trench_polygon <- sf::st_read(
+  gpkg_path,
+  layer = "trench_polygon",
+  quiet = TRUE
+) |>
   sf::st_make_valid()
 
-city_boundary <- sf::st_read(gpkg_path, layer = "kokubunji_city_boundary", quiet = TRUE) |>
+city_boundary <- sf::st_read(
+  gpkg_path,
+  layer = "kokubunji_city_boundary",
+  quiet = TRUE
+) |>
   sf::st_make_valid()
 
 analysis_crs <- sf::st_crs(city_boundary)
@@ -351,9 +436,79 @@ city_boundary <- sf::st_sf(
 dwelling_points <- dwelling_points |>
   dplyr::mutate(dwelling_id = dplyr::row_number())
 
+# ------------------------------------------------------------
+# GSI人工地形分類から人工改変地を読み込む。
+# code == artificial_landform_code を、
+# score出力対象外・通過可能高cost領域として使う。
+# ------------------------------------------------------------
+
+empty_artificial_modified_land <- function(crs_obj) {
+  sf::st_sf(
+    code = integer(0),
+    code_chr = character(0),
+    artificial_modified = integer(0),
+    geometry = sf::st_sfc(crs = crs_obj)
+  )
+}
+
+if (!exists("artificial_landform_layer")) {
+  artificial_landform_layer <- "gsi_landform_artificial"
+}
+
+if (!exists("artificial_landform_code")) {
+  artificial_landform_code <- 11001
+}
+
+if (artificial_landform_layer %in% gpkg_layers) {
+  gsi_landform_artificial <- sf::st_read(
+    gpkg_path,
+    layer = artificial_landform_layer,
+    quiet = TRUE
+  ) |>
+    sf::st_make_valid() |>
+    sf::st_transform(analysis_crs)
+
+  if (!"code" %in% names(gsi_landform_artificial)) {
+    stop(
+      artificial_landform_layer,
+      " に code フィールドがありません。"
+    )
+  }
+
+  artificial_modified_land <- gsi_landform_artificial |>
+    dplyr::mutate(
+      code_chr = as.character(.data$code)
+    ) |>
+    dplyr::filter(
+      code_chr == as.character(artificial_landform_code)
+    ) |>
+    dplyr::mutate(
+      artificial_modified = 1L
+    )
+
+  if (nrow(artificial_modified_land) == 0) {
+    warning(
+      artificial_landform_layer,
+      " に code == ",
+      artificial_landform_code,
+      " の地物がありません。人工改変地は0件として処理します。"
+    )
+
+    artificial_modified_land <- empty_artificial_modified_land(analysis_crs)
+  }
+} else {
+  warning(
+    artificial_landform_layer,
+    " がGPKGにありません。人工改変地は0件として処理します。"
+  )
+
+  artificial_modified_land <- empty_artificial_modified_land(analysis_crs)
+}
+
 cat("dwelling points:", nrow(dwelling_points), "\n")
 cat("trench polygons:", nrow(trench_polygon), "\n")
 cat("city boundary features:", nrow(city_boundary), "\n")
+cat("artificial modified land features:", nrow(artificial_modified_land), "\n")
 ```
 
 # 06. create-analysis-grid
@@ -538,6 +693,304 @@ names(response_code_r) <- "response_code"
 cat("presence cells:", sum(grid10_status$presence_flag), "\n")
 cat("absence cells:", sum(grid10_status$absence_flag), "\n")
 cat("no_data cells:", sum(grid10_status$no_data_flag), "\n")
+```
+
+```{r c05_read_data, eval=TRUE}
+gpkg_layers <- sf::st_layers(gpkg_path)$name
+
+print(gpkg_layers)
+
+required_layers <- c(
+  "jdwelling_point",
+  "trench_polygon",
+  "kokubunji_city_boundary"
+)
+
+missing_layers <- setdiff(required_layers, gpkg_layers)
+
+if (length(missing_layers) > 0) {
+  stop("GPKGに必要レイヤがありません: ", paste(missing_layers, collapse = ", "))
+}
+
+dwelling_points <- sf::st_read(
+  gpkg_path,
+  layer = "jdwelling_point",
+  quiet = TRUE
+) |>
+  sf::st_make_valid()
+
+trench_polygon <- sf::st_read(
+  gpkg_path,
+  layer = "trench_polygon",
+  quiet = TRUE
+) |>
+  sf::st_make_valid()
+
+city_boundary <- sf::st_read(
+  gpkg_path,
+  layer = "kokubunji_city_boundary",
+  quiet = TRUE
+) |>
+  sf::st_make_valid()
+
+analysis_crs <- sf::st_crs(city_boundary)
+
+if (is.na(analysis_crs)) {
+  stop("city_boundary のCRSが未定義です。")
+}
+
+dwelling_points <- sf::st_transform(dwelling_points, analysis_crs)
+trench_polygon <- sf::st_transform(trench_polygon, analysis_crs)
+city_boundary <- sf::st_transform(city_boundary, analysis_crs)
+
+city_boundary <- sf::st_sf(
+  city_id = 1L,
+  geometry = sf::st_union(sf::st_geometry(city_boundary)),
+  crs = analysis_crs
+) |>
+  sf::st_make_valid()
+
+dwelling_points <- dwelling_points |>
+  dplyr::mutate(dwelling_id = dplyr::row_number())
+
+# ------------------------------------------------------------
+# GSI人工地形分類から人工改変地を読み込む。
+# code == artificial_landform_code を、
+# score出力対象外・通過可能高cost領域として使う。
+# ------------------------------------------------------------
+
+empty_artificial_modified_land <- function(crs_obj) {
+  sf::st_sf(
+    code = integer(0),
+    code_chr = character(0),
+    artificial_modified = integer(0),
+    geometry = sf::st_sfc(crs = crs_obj)
+  )
+}
+
+if (!exists("artificial_landform_layer")) {
+  artificial_landform_layer <- "gsi_landform_artificial"
+}
+
+if (!exists("artificial_landform_code")) {
+  artificial_landform_code <- 11001
+}
+
+if (artificial_landform_layer %in% gpkg_layers) {
+  gsi_landform_artificial <- sf::st_read(
+    gpkg_path,
+    layer = artificial_landform_layer,
+    quiet = TRUE
+  ) |>
+    sf::st_make_valid() |>
+    sf::st_transform(analysis_crs)
+
+  if (!"code" %in% names(gsi_landform_artificial)) {
+    stop(
+      artificial_landform_layer,
+      " に code フィールドがありません。"
+    )
+  }
+
+  artificial_modified_land <- gsi_landform_artificial |>
+    dplyr::mutate(
+      code_chr = as.character(.data$code)
+    ) |>
+    dplyr::filter(
+      code_chr == as.character(artificial_landform_code)
+    ) |>
+    dplyr::mutate(
+      artificial_modified = 1L
+    )
+
+  if (nrow(artificial_modified_land) == 0) {
+    warning(
+      artificial_landform_layer,
+      " に code == ",
+      artificial_landform_code,
+      " の地物がありません。人工改変地は0件として処理します。"
+    )
+
+    artificial_modified_land <- empty_artificial_modified_land(analysis_crs)
+  }
+} else {
+  warning(
+    artificial_landform_layer,
+    " がGPKGにありません。人工改変地は0件として処理します。"
+  )
+
+  artificial_modified_land <- empty_artificial_modified_land(analysis_crs)
+}
+
+cat("dwelling points:", nrow(dwelling_points), "\n")
+cat("trench polygons:", nrow(trench_polygon), "\n")
+cat("city boundary features:", nrow(city_boundary), "\n")
+cat("artificial modified land features:", nrow(artificial_modified_land), "\n")
+```
+
+# 08b. rasterize-artificial-modified-land
+
+**目的**：GSI人工地形分類 code=11001 を、score対象外・通過可能高cost領域としてラスタ化する。
+
+```{r c08b_rasterize_artificial_modified_land, eval=TRUE}
+required_objects <- c(
+  "grid10_status",
+  "template_r",
+  "artificial_modified_land",
+  "no_data_binary_r"
+)
+
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
+
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
+}
+
+if (!exists("artificial_modified_min_cell_ratio")) {
+  artificial_modified_min_cell_ratio <- 0.05
+}
+
+if (!exists("artificial_modified_cost_multiplier")) {
+  artificial_modified_cost_multiplier <- 3
+}
+
+if (nrow(artificial_modified_land) > 0) {
+  artificial_modified_for_intersection <- artificial_modified_land |>
+    dplyr::select(
+      code,
+      code_chr,
+      artificial_modified
+    ) |>
+    sf::st_make_valid()
+
+  artificial_modified_inter <- suppressWarnings(
+    sf::st_intersection(
+      grid10_status |>
+        dplyr::select(
+          grid_id,
+          cell_area_m2
+        ),
+      artificial_modified_for_intersection
+    )
+  )
+
+  if (nrow(artificial_modified_inter) > 0) {
+    artificial_modified_inter$artificial_modified_intersection_area_m2 <-
+      as.numeric(sf::st_area(sf::st_geometry(artificial_modified_inter)))
+
+    artificial_modified_by_grid <- artificial_modified_inter |>
+      sf::st_drop_geometry() |>
+      dplyr::group_by(grid_id) |>
+      dplyr::summarise(
+        artificial_modified_area_m2 = sum(
+          artificial_modified_intersection_area_m2,
+          na.rm = TRUE
+        ),
+        .groups = "drop"
+      )
+  } else {
+    artificial_modified_by_grid <- tibble::tibble(
+      grid_id = integer(0),
+      artificial_modified_area_m2 = numeric(0)
+    )
+  }
+} else {
+  artificial_modified_by_grid <- tibble::tibble(
+    grid_id = integer(0),
+    artificial_modified_area_m2 = numeric(0)
+  )
+}
+
+artificial_modified_grid <- grid10_status |>
+  dplyr::left_join(
+    artificial_modified_by_grid,
+    by = "grid_id"
+  ) |>
+  dplyr::mutate(
+    artificial_modified_area_m2 = tidyr::replace_na(
+      artificial_modified_area_m2,
+      0
+    ),
+    artificial_modified_ratio = clamp01_numeric(
+      artificial_modified_area_m2 / cell_area_m2
+    ),
+    artificial_modified_flag = as.integer(
+      artificial_modified_ratio >= artificial_modified_min_cell_ratio
+    ),
+    modified_unavailable_no_data_flag = as.integer(
+      cell_status == "no_data" &
+        artificial_modified_flag == 1
+    ),
+    prediction_target_flag = as.integer(
+      cell_status == "no_data" &
+        artificial_modified_flag != 1
+    )
+  )
+
+artificial_modified_binary_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "artificial_modified_flag",
+  template_r,
+  background = 0
+)
+
+artificial_modified_area_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "artificial_modified_area_m2",
+  template_r,
+  background = 0
+)
+
+artificial_modified_ratio_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "artificial_modified_ratio",
+  template_r,
+  background = 0
+)
+
+modified_unavailable_no_data_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "modified_unavailable_no_data_flag",
+  template_r,
+  background = 0
+)
+
+prediction_target_binary_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "prediction_target_flag",
+  template_r,
+  background = 0
+)
+
+names(artificial_modified_binary_r) <- "artificial_modified_binary"
+names(artificial_modified_area_r) <- "artificial_modified_area_m2"
+names(artificial_modified_ratio_r) <- "artificial_modified_ratio"
+names(modified_unavailable_no_data_r) <- "modified_unavailable_no_data"
+names(prediction_target_binary_r) <- "prediction_target_binary"
+
+artificial_modified_summary <- artificial_modified_grid |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    artificial_modified_cells = sum(artificial_modified_flag, na.rm = TRUE),
+    modified_unavailable_no_data_cells = sum(
+      modified_unavailable_no_data_flag,
+      na.rm = TRUE
+    ),
+    prediction_target_cells = sum(prediction_target_flag, na.rm = TRUE),
+    artificial_modified_area_m2 = sum(
+      artificial_modified_area_m2,
+      na.rm = TRUE
+    )
+  )
+
+print(artificial_modified_summary)
+
+readr::write_csv(
+  artificial_modified_summary,
+  file.path(interim_csv_dir, "interim_artificial_modified_land_summary.csv")
+)
 ```
 
 # 09. local-context-rasters
@@ -2333,6 +2786,7 @@ supported_density_raw_r <- focal_sum_circle(
   supported_dwelling_count_r,
   source_density_radius_m
 )
+
 supported_density_score_r <- scale01_raster(log1p(supported_density_raw_r))
 names(supported_density_score_r) <- "supported_density_score"
 
@@ -2367,52 +2821,154 @@ if (!raster_has_positive(open_source_strength_r)) {
   names(open_source_strength_r) <- "open_source_strength"
 }
 
-# absence evidence：調査済み範囲に占めるabsenceの割合。
-local_absence_evidence <- focal_sum_circle(absence_area_r, absence_evidence_radius_m)
-local_surveyed_evidence <- focal_sum_circle(surveyed_area_r, absence_evidence_radius_m)
+# ------------------------------------------------------------
+# absenceを internal / external に分ける。
+# ------------------------------------------------------------
+
+macro_internal_context_sf <- macro_sources_final |>
+  dplyr::mutate(internal_context_value = 1) |>
+  sf::st_make_valid()
+
+if (internal_absence_buffer_m > 0) {
+  macro_internal_context_sf <- sf::st_buffer(
+    macro_internal_context_sf,
+    dist = internal_absence_buffer_m
+  )
+}
+
+macro_internal_context_r <- terra::rasterize(
+  terra::vect(macro_internal_context_sf),
+  template_r,
+  field = "internal_context_value",
+  fun = "max",
+  background = 0,
+  touches = TRUE
+)
+names(macro_internal_context_r) <- "macro_internal_context"
+
+internal_macro_absence_r <- terra::ifel(
+  absence_binary_r == 1 & macro_internal_context_r == 1,
+  1,
+  0
+)
+names(internal_macro_absence_r) <- "internal_macro_absence"
+
+external_absence_barrier_r <- terra::ifel(
+  absence_binary_r == 1 & internal_macro_absence_r != 1,
+  1,
+  0
+)
+names(external_absence_barrier_r) <- "external_absence_barrier"
+
+# ------------------------------------------------------------
+# external absence evidence
+# ------------------------------------------------------------
+
+external_absence_area_r <- terra::ifel(
+  external_absence_barrier_r == 1,
+  absence_area_r,
+  0
+)
+names(external_absence_area_r) <- "external_absence_area"
+
+local_external_absence_evidence <- focal_sum_circle(
+  external_absence_area_r,
+  absence_evidence_radius_m
+)
+
+local_surveyed_evidence <- focal_sum_circle(
+  surveyed_area_r,
+  absence_evidence_radius_m
+)
+
 local_surveyed_evidence_safe <- terra::ifel(
   is.na(local_surveyed_evidence) | local_surveyed_evidence < 1,
   1,
   local_surveyed_evidence
 )
 
-absence_evidence_r <- terra::clamp(
-  local_absence_evidence / local_surveyed_evidence_safe,
+external_absence_evidence_r <- terra::clamp(
+  local_external_absence_evidence / local_surveyed_evidence_safe,
   lower = 0,
   upper = 1,
   values = TRUE
 )
-names(absence_evidence_r) <- "absence_evidence"
+names(external_absence_evidence_r) <- "external_absence_evidence"
 
-# absence continuity：周辺内にabsenceセルがどの程度連続するか。
-absence_continuity_count_r <- focal_sum_circle(absence_binary_r, absence_continuity_radius_m)
-absence_continuity_window_cells <- sum(
+# external absence continuity
+external_absence_continuity_count_r <- focal_sum_circle(
+  external_absence_barrier_r,
+  absence_continuity_radius_m
+)
+
+external_absence_continuity_window_cells <- sum(
   make_circle_window(template_r, absence_continuity_radius_m),
   na.rm = TRUE
 )
 
-absence_continuity_score_r <- terra::clamp(
-  absence_continuity_count_r / max(absence_continuity_window_cells, 1),
+external_absence_continuity_score_r <- terra::clamp(
+  external_absence_continuity_count_r /
+    max(external_absence_continuity_window_cells, 1),
   lower = 0,
   upper = 1,
   values = TRUE
 )
-names(absence_continuity_score_r) <- "absence_continuity_score"
+names(external_absence_continuity_score_r) <- "external_absence_continuity_score"
+
+# external absence shadow：external absence周辺のno_dataに高コスト帯を与える。
+absence_shadow_count_r <- focal_sum_circle(
+  external_absence_barrier_r,
+  absence_shadow_radius_m
+)
+
+absence_shadow_window_cells <- sum(
+  make_circle_window(template_r, absence_shadow_radius_m),
+  na.rm = TRUE
+)
+
+absence_barrier_shadow_r <- terra::clamp(
+  absence_shadow_count_r / max(absence_shadow_window_cells, 1),
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+
+absence_barrier_shadow_r <- terra::ifel(
+  no_data_binary_r == 1,
+  absence_barrier_shadow_r,
+  0
+)
+names(absence_barrier_shadow_r) <- "absence_barrier_shadow"
+
+# ------------------------------------------------------------
+# final barrier strength
+# ------------------------------------------------------------
 
 absence_barrier_strength_r <- terra::clamp(
-  absence_evidence_weight * absence_evidence_r +
-    absence_continuity_weight * absence_continuity_score_r,
+  absence_evidence_weight * external_absence_evidence_r +
+    absence_continuity_weight * external_absence_continuity_score_r +
+    absence_shadow_weight * absence_barrier_shadow_r,
   lower = 0,
   upper = 1,
   values = TRUE
 )
 
-# absenceセル自体は必ず強いbarrierとする。
+# external absenceセル本体は強いbarrier。
 absence_barrier_strength_r <- terra::ifel(
-  absence_binary_r == 1,
+  external_absence_barrier_r == 1,
   1,
   absence_barrier_strength_r
 )
+
+# internal macro absence は弱いbarrierに留める。
+absence_barrier_strength_r <- terra::ifel(
+  internal_macro_absence_r == 1 &
+    external_absence_barrier_r != 1 &
+    absence_barrier_strength_r < internal_absence_barrier_strength,
+  internal_absence_barrier_strength,
+  absence_barrier_strength_r
+)
+
 absence_barrier_strength_r <- terra::clamp(
   absence_barrier_strength_r,
   lower = 0,
@@ -2421,60 +2977,71 @@ absence_barrier_strength_r <- terra::clamp(
 )
 names(absence_barrier_strength_r) <- "absence_barrier_strength"
 
-# 伝播可能域。
-# source、no_data、absenceを伝播対象とする。presenceがsourceでない場合は発信源にしない。
+# ------------------------------------------------------------
+# 伝播可能域
+# ------------------------------------------------------------
+# source + no_data + internal macro absence のみ通過可。
+# external absence は通過不可。
 directional_allowed_r <- terra::ifel(
   city_area_r > 0 &
+    external_absence_barrier_r != 1 &
     (
       no_data_binary_r == 1 |
-        absence_binary_r == 1 |
-        source_seed_strength_r > 0
+        source_seed_strength_r > 0 |
+        internal_macro_absence_r == 1
     ),
   1,
   0
 )
 names(directional_allowed_r) <- "directional_allowed"
 
-source_barrier_summary <- tibble::tibble(
-  layer = c(
-    "source_seed_strength",
-    "open_source_strength",
-    "supported_density_score",
-    "absence_evidence",
-    "absence_continuity_score",
-    "absence_barrier_strength",
-    "directional_allowed"
-  ),
-  min = c(
-    terra::global(source_seed_strength_r, "min", na.rm = TRUE)[1, 1],
-    terra::global(open_source_strength_r, "min", na.rm = TRUE)[1, 1],
-    terra::global(supported_density_score_r, "min", na.rm = TRUE)[1, 1],
-    terra::global(absence_evidence_r, "min", na.rm = TRUE)[1, 1],
-    terra::global(absence_continuity_score_r, "min", na.rm = TRUE)[1, 1],
-    terra::global(absence_barrier_strength_r, "min", na.rm = TRUE)[1, 1],
-    terra::global(directional_allowed_r, "min", na.rm = TRUE)[1, 1]
-  ),
-  mean = c(
-    terra::global(source_seed_strength_r, "mean", na.rm = TRUE)[1, 1],
-    terra::global(open_source_strength_r, "mean", na.rm = TRUE)[1, 1],
-    terra::global(supported_density_score_r, "mean", na.rm = TRUE)[1, 1],
-    terra::global(absence_evidence_r, "mean", na.rm = TRUE)[1, 1],
-    terra::global(absence_continuity_score_r, "mean", na.rm = TRUE)[1, 1],
-    terra::global(absence_barrier_strength_r, "mean", na.rm = TRUE)[1, 1],
-    terra::global(directional_allowed_r, "mean", na.rm = TRUE)[1, 1]
-  ),
-  max = c(
-    terra::global(source_seed_strength_r, "max", na.rm = TRUE)[1, 1],
-    terra::global(open_source_strength_r, "max", na.rm = TRUE)[1, 1],
-    terra::global(supported_density_score_r, "max", na.rm = TRUE)[1, 1],
-    terra::global(absence_evidence_r, "max", na.rm = TRUE)[1, 1],
-    terra::global(absence_continuity_score_r, "max", na.rm = TRUE)[1, 1],
-    terra::global(absence_barrier_strength_r, "max", na.rm = TRUE)[1, 1],
-    terra::global(directional_allowed_r, "max", na.rm = TRUE)[1, 1]
+summarise_global_layer <- function(r, layer_name) {
+  vals <- terra::values(r, mat = FALSE)
+  vals <- vals[is.finite(vals)]
+
+  if (length(vals) == 0) {
+    return(tibble::tibble(
+      layer = layer_name,
+      min = NA_real_,
+      mean = NA_real_,
+      max = NA_real_,
+      positive_cells = 0
+    ))
+  }
+
+  tibble::tibble(
+    layer = layer_name,
+    min = min(vals, na.rm = TRUE),
+    mean = mean(vals, na.rm = TRUE),
+    max = max(vals, na.rm = TRUE),
+    positive_cells = sum(vals > 0, na.rm = TRUE)
   )
+}
+
+source_barrier_layers <- list(
+  source_seed_strength = source_seed_strength_r,
+  open_source_strength = open_source_strength_r,
+  supported_density_score = supported_density_score_r,
+  no_data_contact = no_data_contact_r,
+  macro_internal_context = macro_internal_context_r,
+  internal_macro_absence = internal_macro_absence_r,
+  external_absence_barrier = external_absence_barrier_r,
+  external_absence_evidence = external_absence_evidence_r,
+  external_absence_continuity_score = external_absence_continuity_score_r,
+  absence_barrier_shadow = absence_barrier_shadow_r,
+  absence_barrier_strength = absence_barrier_strength_r,
+  directional_allowed = directional_allowed_r
+)
+
+source_barrier_summary <- purrr::imap_dfr(
+  source_barrier_layers,
+  summarise_global_layer
 )
 
 print(source_barrier_summary)
+
+dir.create(final_csv_dir, recursive = TRUE, showWarnings = FALSE)
+
 readr::write_csv(
   source_barrier_summary,
   file.path(final_csv_dir, "final_source_barrier_layer_summary.csv")
@@ -2491,8 +3058,8 @@ required_objects <- c(
   "open_source_strength_r",
   "absence_barrier_strength_r",
   "directional_allowed_r",
-  "no_data_binary_r",
-  "absence_binary_r",
+  "modified_unavailable_no_data_r",
+  "prediction_target_binary_r",
   "base_range_m"
 )
 
@@ -2504,13 +3071,16 @@ if (length(missing_objects) > 0) {
   stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
 }
 
+if (!exists("artificial_modified_cost_multiplier")) {
+  artificial_modified_cost_multiplier <- 3
+}
+
 run_directional_cost_propagation <- function(
   template_r,
   source_strength_r,
   barrier_strength_r,
   allowed_r,
-  no_data_r,
-  absence_r,
+  modified_unavailable_r,
   base_range_m,
   grid_cell_size_m,
   source_range_bonus,
@@ -2519,7 +3089,7 @@ run_directional_cost_propagation <- function(
   barrier_cost_multiplier,
   barrier_strength_power,
   barrier_vs_source_scale,
-  absence_cell_extra_cost,
+  artificial_modified_cost_multiplier,
   decay_power,
   max_normalized_cost,
   min_range_modifier,
@@ -2532,14 +3102,12 @@ run_directional_cost_propagation <- function(
   source_vals <- terra::values(source_strength_r, mat = FALSE)
   barrier_vals <- terra::values(barrier_strength_r, mat = FALSE)
   allowed_vals <- terra::values(allowed_r, mat = FALSE)
-  no_data_vals <- terra::values(no_data_r, mat = FALSE)
-  absence_vals <- terra::values(absence_r, mat = FALSE)
+  modified_vals <- terra::values(modified_unavailable_r, mat = FALSE)
 
   source_vals[!is.finite(source_vals)] <- 0
   barrier_vals[!is.finite(barrier_vals)] <- 0
   allowed_vals[!is.finite(allowed_vals)] <- 0
-  no_data_vals[!is.finite(no_data_vals)] <- 0
-  absence_vals[!is.finite(absence_vals)] <- 0
+  modified_vals[!is.finite(modified_vals)] <- 0
 
   allowed_logical <- allowed_vals > 0
   source_idx <- which(source_vals > 0 & allowed_logical)
@@ -2583,11 +3151,14 @@ run_directional_cost_propagation <- function(
     heap_range <<- c(heap_range, source_range)
 
     k <- length(heap_idx)
+
     while (k > 1) {
       parent <- k %/% 2
+
       if (heap_cost[parent] <= heap_cost[k]) {
         break
       }
+
       heap_swap(parent, k)
       k <- parent
     }
@@ -2626,6 +3197,7 @@ run_directional_cost_propagation <- function(
     heap_range <<- heap_range[-last]
 
     k <- 1
+
     repeat {
       left <- 2 * k
       right <- left + 1
@@ -2650,7 +3222,11 @@ run_directional_cost_propagation <- function(
     out
   }
 
-  source_strength_clean <- pmax(source_vals[source_idx], source_min_strength)
+  source_strength_clean <- pmax(
+    clamp01_numeric(source_vals[source_idx]),
+    source_min_strength
+  )
+
   source_range_vals <- base_range_m * (
     min_range_modifier +
       (1 - min_range_modifier) * (source_strength_clean ^ source_strength_power)
@@ -2662,9 +3238,11 @@ run_directional_cost_propagation <- function(
     idx <- source_idx[i]
     strength <- source_strength_clean[i]
     source_range <- source_range_vals[i]
+
     best_cost[idx] <- 0
     best_source_strength[idx] <- strength
     best_source_range[idx] <- source_range
+
     heap_push(idx, 0, strength, source_range)
   }
 
@@ -2688,6 +3266,7 @@ run_directional_cost_propagation <- function(
 
   repeat {
     item <- heap_pop()
+
     if (is.null(item)) {
       break
     }
@@ -2727,23 +3306,32 @@ run_directional_cost_propagation <- function(
       }
 
       barrier_j <- clamp01_numeric(barrier_vals[idx_j])
-      barrier_cost <- 1 + barrier_cost_multiplier *
-        ((barrier_j ^ barrier_strength_power) /
-           (barrier_vs_source_scale + item$strength))
 
-      if (absence_vals[idx_j] > 0) {
-        barrier_cost <- barrier_cost + absence_cell_extra_cost *
-          (1 + barrier_j) /
-          (barrier_vs_source_scale + item$strength)
-      }
+      source_barrier_discount <- 1 +
+        barrier_vs_source_scale * clamp01_numeric(item$strength)
 
-      step_cost <- neighbor_steps$step_m[s] * barrier_cost
+      barrier_cost <- 1 +
+        barrier_cost_multiplier *
+        (barrier_j ^ barrier_strength_power) /
+        source_barrier_discount
+
+      artificial_cost <- ifelse(
+        modified_vals[idx_j] > 0,
+        artificial_modified_cost_multiplier,
+        1
+      )
+
+      step_cost <- neighbor_steps$step_m[s] *
+        barrier_cost *
+        artificial_cost
+
       new_cost <- item$cost + step_cost / item$source_range
 
       if (new_cost < best_cost[idx_j] && new_cost <= max_normalized_cost) {
         best_cost[idx_j] <- new_cost
         best_source_strength[idx_j] <- item$strength
         best_source_range[idx_j] <- item$source_range
+
         heap_push(idx_j, new_cost, item$strength, item$source_range)
       }
     }
@@ -2763,8 +3351,11 @@ run_directional_cost_propagation <- function(
   terra::values(propagated_source_range_r) <- best_source_range
   names(propagated_source_range_r) <- "directional_source_range_m"
 
+  cost_clipped <- pmin(best_cost, max_normalized_cost)
+
   score_vals <- best_source_strength *
-    ((1 - pmin(best_cost, max_normalized_cost)) ^ decay_power)
+    ((1 - cost_clipped) ^ decay_power)
+
   score_vals[!is.finite(best_cost)] <- NA_real_
   score_vals[best_cost > max_normalized_cost] <- NA_real_
   score_vals <- clamp01_numeric(score_vals)
@@ -2788,8 +3379,7 @@ propagation_result <- run_directional_cost_propagation(
   source_strength_r = open_source_strength_r,
   barrier_strength_r = absence_barrier_strength_r,
   allowed_r = directional_allowed_r,
-  no_data_r = no_data_binary_r,
-  absence_r = absence_binary_r,
+  modified_unavailable_r = modified_unavailable_no_data_r,
   base_range_m = base_range_m,
   grid_cell_size_m = grid_cell_size_m,
   source_range_bonus = source_range_bonus,
@@ -2798,7 +3388,7 @@ propagation_result <- run_directional_cost_propagation(
   barrier_cost_multiplier = barrier_cost_multiplier,
   barrier_strength_power = barrier_strength_power,
   barrier_vs_source_scale = barrier_vs_source_scale,
-  absence_cell_extra_cost = absence_cell_extra_cost,
+  artificial_modified_cost_multiplier = artificial_modified_cost_multiplier,
   decay_power = decay_power,
   max_normalized_cost = max_normalized_cost,
   min_range_modifier = min_range_modifier,
@@ -2808,17 +3398,24 @@ propagation_result <- run_directional_cost_propagation(
 directional_normalized_cost_r <- propagation_result$normalized_cost_r
 directional_source_strength_r <- propagation_result$propagated_source_strength_r
 directional_source_range_m_r <- propagation_result$propagated_source_range_r
+
 directional_cluster_continuity_score_all_cells_r <- propagation_result$score_r
 names(directional_cluster_continuity_score_all_cells_r) <- "directional_cluster_continuity_score_all_cells"
 
 cluster_continuity_score_all_cells_r <- directional_cluster_continuity_score_all_cells_r
 names(cluster_continuity_score_all_cells_r) <- "cluster_continuity_score_all_cells"
 
-cluster_continuity_score_no_data_only_r <- terra::ifel(
-  no_data_binary_r == 1,
+# final score は通常no_dataのうち、
+# 人工改変地ではない prediction target のみに出す。
+cluster_continuity_score_prediction_target_r <- terra::ifel(
+  prediction_target_binary_r == 1,
   cluster_continuity_score_all_cells_r,
   NA_real_
 )
+names(cluster_continuity_score_prediction_target_r) <- "cluster_continuity_score_prediction_target"
+
+# 既存後続chunkとの互換性のため、従来名も維持する。
+cluster_continuity_score_no_data_only_r <- cluster_continuity_score_prediction_target_r
 names(cluster_continuity_score_no_data_only_r) <- "cluster_continuity_score_no_data_only"
 
 propagation_summary <- tibble::tibble(
@@ -2828,16 +3425,27 @@ propagation_summary <- tibble::tibble(
   max_normalized_cost = max_normalized_cost,
   decay_power = decay_power,
   barrier_cost_multiplier = barrier_cost_multiplier,
-  absence_cell_extra_cost = absence_cell_extra_cost
+  barrier_strength_power = barrier_strength_power,
+  barrier_vs_source_scale = barrier_vs_source_scale,
+  artificial_modified_cost_multiplier = artificial_modified_cost_multiplier,
+  modified_unavailable_no_data_cells = terra::global(
+    modified_unavailable_no_data_r,
+    "sum",
+    na.rm = TRUE
+  )[1, 1],
+  prediction_target_cells = terra::global(
+    prediction_target_binary_r,
+    "sum",
+    na.rm = TRUE
+  )[1, 1]
 )
 
 print(propagation_summary)
+
 readr::write_csv(
   propagation_summary,
   file.path(final_csv_dir, "final_directional_propagation_summary.csv")
 )
-
-print(terra::global(cluster_continuity_score_no_data_only_r, c("min", "mean", "max"), na.rm = TRUE))
 ```
 
 # 21. directional-score-diagnostics
@@ -2848,15 +3456,29 @@ print(terra::global(cluster_continuity_score_no_data_only_r, c("min", "mean", "m
 score_layers <- list(
   source_seed_strength = source_seed_strength_r,
   open_source_strength = open_source_strength_r,
+  no_data_contact = no_data_contact_r,
   supported_density_score = supported_density_score_r,
-  absence_evidence = absence_evidence_r,
-  absence_continuity_score = absence_continuity_score_r,
+  isolated_dwelling_signal = isolated_dwelling_signal_r,
+
+  macro_internal_context = macro_internal_context_r,
+  internal_macro_absence = internal_macro_absence_r,
+  external_absence_barrier = external_absence_barrier_r,
+  external_absence_evidence = external_absence_evidence_r,
+  external_absence_continuity_score = external_absence_continuity_score_r,
+  absence_barrier_shadow = absence_barrier_shadow_r,
   absence_barrier_strength = absence_barrier_strength_r,
+
+  artificial_modified_binary = artificial_modified_binary_r,
+  artificial_modified_ratio = artificial_modified_ratio_r,
+  modified_unavailable_no_data = modified_unavailable_no_data_r,
+  prediction_target_binary = prediction_target_binary_r,
+
+  directional_allowed = directional_allowed_r,
   directional_normalized_cost = directional_normalized_cost_r,
   directional_source_strength = directional_source_strength_r,
   directional_source_range_m = directional_source_range_m_r,
-  cluster_continuity_score_no_data_only = cluster_continuity_score_no_data_only_r,
-  isolated_dwelling_signal = isolated_dwelling_signal_r
+  cluster_continuity_score_all_cells = cluster_continuity_score_all_cells_r,
+  cluster_continuity_score_no_data_only = cluster_continuity_score_no_data_only_r
 )
 
 summarise_raster_values <- function(r, layer_name) {
@@ -2896,6 +3518,7 @@ final_directional_score_diagnostics <- purrr::imap_dfr(
 )
 
 print(final_directional_score_diagnostics)
+
 readr::write_csv(
   final_directional_score_diagnostics,
   file.path(final_csv_dir, "final_directional_score_diagnostics.csv")
@@ -2942,14 +3565,28 @@ raster_outputs <- list(
   no_data_contact = no_data_contact_r,
   supported_density_score = supported_density_score_r,
   isolated_dwelling_signal = isolated_dwelling_signal_r,
-  absence_evidence = absence_evidence_r,
-  absence_continuity_score = absence_continuity_score_r,
+
+  macro_internal_context = macro_internal_context_r,
+  internal_macro_absence = internal_macro_absence_r,
+  external_absence_barrier = external_absence_barrier_r,
+  external_absence_evidence = external_absence_evidence_r,
+  external_absence_continuity_score = external_absence_continuity_score_r,
+  absence_barrier_shadow = absence_barrier_shadow_r,
   absence_barrier_strength = absence_barrier_strength_r,
+
+  artificial_modified_binary = artificial_modified_binary_r,
+  artificial_modified_area_m2 = artificial_modified_area_r,
+  artificial_modified_ratio = artificial_modified_ratio_r,
+  modified_unavailable_no_data = modified_unavailable_no_data_r,
+  prediction_target_binary = prediction_target_binary_r,
+
   directional_allowed = directional_allowed_r,
   directional_normalized_cost = directional_normalized_cost_r,
   directional_source_strength = directional_source_strength_r,
   directional_source_range_m = directional_source_range_m_r,
+
   cluster_continuity_score_all_cells = cluster_continuity_score_all_cells_r,
+  cluster_continuity_score_prediction_target = cluster_continuity_score_prediction_target_r,
   cluster_continuity_score_no_data_only = cluster_continuity_score_no_data_only_r
 )
 
@@ -2969,6 +3606,7 @@ for (nm in names(raster_outputs)) {
 }
 
 expected_final_rasters <- paste0("final_", names(raster_outputs), ".tif")
+
 final_raster_check <- tibble::tibble(
   file = expected_final_rasters,
   path = file.path(final_raster_dir, expected_final_rasters),
@@ -2976,6 +3614,7 @@ final_raster_check <- tibble::tibble(
 )
 
 print(final_raster_check)
+
 readr::write_csv(
   final_raster_check,
   file.path(final_csv_dir, "final_raster_output_check.csv")
@@ -3034,12 +3673,46 @@ extract_one_final_raster <- function(r, value_name) {
 }
 
 final_grid_values <- dplyr::bind_cols(
-  extract_one_final_raster(cluster_continuity_score_no_data_only_r, "cluster_continuity_score_no_data_only"),
-  extract_one_final_raster(cluster_continuity_score_all_cells_r, "cluster_continuity_score_all_cells"),
-  extract_one_final_raster(directional_normalized_cost_r, "directional_normalized_cost"),
-  extract_one_final_raster(directional_source_strength_r, "directional_source_strength"),
-  extract_one_final_raster(absence_barrier_strength_r, "absence_barrier_strength"),
-  extract_one_final_raster(isolated_dwelling_signal_r, "isolated_dwelling_signal")
+  extract_one_final_raster(
+    cluster_continuity_score_no_data_only_r,
+    "cluster_continuity_score_no_data_only"
+  ),
+  extract_one_final_raster(
+    cluster_continuity_score_all_cells_r,
+    "cluster_continuity_score_all_cells"
+  ),
+  extract_one_final_raster(
+    directional_normalized_cost_r,
+    "directional_normalized_cost"
+  ),
+  extract_one_final_raster(
+    directional_source_strength_r,
+    "directional_source_strength"
+  ),
+  extract_one_final_raster(
+    absence_barrier_strength_r,
+    "absence_barrier_strength"
+  ),
+  extract_one_final_raster(
+    artificial_modified_binary_r,
+    "artificial_modified_binary"
+  ),
+  extract_one_final_raster(
+    artificial_modified_ratio_r,
+    "artificial_modified_ratio"
+  ),
+  extract_one_final_raster(
+    modified_unavailable_no_data_r,
+    "modified_unavailable_no_data"
+  ),
+  extract_one_final_raster(
+    prediction_target_binary_r,
+    "prediction_target_binary"
+  ),
+  extract_one_final_raster(
+    isolated_dwelling_signal_r,
+    "isolated_dwelling_signal"
+  )
 )
 
 final_score_grid <- dplyr::bind_cols(
@@ -3148,6 +3821,7 @@ chunk_index <- tibble::tribble(
   6, "c06_create_analysis_grid", "create-analysis-grid", "市域内に10mグリッドとラスタテンプレートを作成する。",
   7, "c07_assign_grid_response", "assign-grid-response", "各10mセルにpresence、absence、no_dataを付与する。",
   8, "c08_rasterize_status_layers", "rasterize-status-layers", "presence、absence、no_data、surveyed areaをラスタ化する。",
+  8, "c08b_rasterize_artificial_modified_land", "rasterize_artificial_modified_land", "GSI人工地形分類 code=11001 を、score対象外・通過可能高cost領域としてラスタ化する。",
   9, "c09_local_context_rasters", "local-context-rasters", "interim確認用のabsence penalty と open no_data scoreを作成する。",
   10, "c10_dwelling_neighbor_distances", "dwelling-neighbor-distances", "住居間距離を計算し、micro cluster候補パラメータを作る。",
   11, "c11_parameter_sweep_clustering", "parameter-sweep-clustering", "DBSCAN候補パラメータを評価する。",

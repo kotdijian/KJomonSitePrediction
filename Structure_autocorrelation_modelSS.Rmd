@@ -1,0 +1,4526 @@
+---
+title: "Shuseki Autocorrelation Model: Directional Presence-Absence-NoData Propagation"
+author: "Atsushi NOGUCHI / ChatGPT"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# 目的と基本方針
+
+このRmdは、縄文集石の既知分布から、未調査範囲へ構造的に連続する可能性を評価する自己相関モデルである。DEM等の地形情報は使用せず、集石点、調査区、調査済み非検出範囲、未調査範囲のみを用いる。
+
+本版では、手動ゲートを設けず、`interim` と `final` を一括して再生成する。最終モデルは、presenceの自己相関強度、no_dataへの開口方向、absenceの広さ・連続性による遮断を、累積コスト型の距離減衰に統合する。
+
+中心的な設計原理は以下である。
+
+1. presence / macro cluster が no_data に接する方向だけを positive source とする。
+2. absence は局所的な掛け算減衰ではなく、source から no_data へ向かう累積コストとして扱う。
+3. absence の効果は、absence領域の広さ・連続性と source strength の比較で決まる。
+4. 累積コストを用いるため、一度低下した positive score が外周で再上昇する双峰的ピークを避ける。
+
+# 01. setup
+
+**目的**：解析に必要なパッケージと共通関数を準備する。
+
+```{r c01_setup, eval=TRUE, message=FALSE, warning=FALSE}
+required_pkgs <- c(
+  "sf", "terra", "dplyr", "tidyr", "purrr", "tibble",
+  "readr", "ggplot2", "dbscan"
+)
+
+missing_pkgs <- required_pkgs[
+  !vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_pkgs) > 0) {
+  stop(
+    "以下のパッケージをインストールしてください: ",
+    paste(missing_pkgs, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(dbscan)
+})
+
+sf::sf_use_s2(FALSE)
+
+clamp01_numeric <- function(x) {
+  pmin(pmax(x, 0), 1)
+}
+
+na0_raster <- function(r) {
+  terra::ifel(is.na(r), 0, r)
+}
+
+scale01_raster <- function(r) {
+  r_min <- terra::global(r, "min", na.rm = TRUE)[1, 1]
+  r_max <- terra::global(r, "max", na.rm = TRUE)[1, 1]
+
+  if (!is.finite(r_min) || !is.finite(r_max) || abs(r_max - r_min) < 1e-12) {
+    out <- r * 0
+    names(out) <- names(r)
+    return(out)
+  }
+
+  out <- (r - r_min) / (r_max - r_min)
+  terra::clamp(out, lower = 0, upper = 1, values = TRUE)
+}
+
+make_circle_window <- function(r, radius_m) {
+  res_xy <- terra::res(r)
+  res_m <- mean(res_xy)
+  n <- ceiling(radius_m / res_m)
+  coords <- expand.grid(x = -n:n, y = -n:n)
+  dist_m <- sqrt(coords$x^2 + coords$y^2) * res_m
+  matrix(
+    ifelse(dist_m <= radius_m, 1, 0),
+    nrow = 2 * n + 1,
+    ncol = 2 * n + 1,
+    byrow = FALSE
+  )
+}
+
+focal_sum_circle <- function(r, radius_m) {
+  w <- make_circle_window(r, radius_m)
+  terra::focal(
+    r,
+    w = w,
+    fun = "sum",
+    na.policy = "all",
+    fillvalue = 0,
+    na.rm = TRUE
+  )
+}
+
+rasterize_grid_field <- function(grid_sf, field_name, template_r, background = NA_real_, touches = TRUE) {
+  if (!field_name %in% names(grid_sf)) {
+    stop("grid_sfにフィールドがありません: ", field_name)
+  }
+
+  out <- terra::rasterize(
+    terra::vect(grid_sf),
+    template_r,
+    field = field_name,
+    background = background,
+    touches = touches
+  )
+
+  names(out) <- field_name
+  out
+}
+
+write_gpkg_layer_safe <- function(x, dsn, layer) {
+  if (is.null(x)) {
+    message("スキップ: ", layer, " はNULLです。")
+    return(invisible(NULL))
+  }
+
+  if (!inherits(x, "sf")) {
+    stop("GPKGに書き出すオブジェクトがsfではありません: ", layer)
+  }
+
+  if (nrow(x) == 0) {
+    message("スキップ: ", layer, " は0件です。")
+    return(invisible(NULL))
+  }
+
+  x <- sf::st_make_valid(x)
+  sf::st_write(
+    x,
+    dsn = dsn,
+    layer = layer,
+    delete_layer = TRUE,
+    quiet = TRUE
+  )
+
+  message("出力: ", layer, " / ", dsn)
+  invisible(NULL)
+}
+
+focal_max_circle <- function(r, radius_m) {
+  w <- make_circle_window(r, radius_m)
+  terra::focal(
+    r,
+    w = w,
+    fun = "max",
+    na.policy = "all",
+    fillvalue = 0,
+    na.rm = TRUE
+  )
+}
+
+raster_has_positive <- function(r) {
+  x <- terra::global(r, "max", na.rm = TRUE)[1, 1]
+  is.finite(x) && x > 0
+}
+```
+
+# 02. paths
+
+**目的**：入力データと出力先フォルダを定義する。
+
+```{r c02_paths, eval=TRUE}
+raw_dir <- "data_raw"
+
+results_dir <- "auto-corSS-results"
+interim_dir <- file.path(results_dir, "interim")
+final_dir <- file.path(results_dir, "final")
+
+interim_csv_dir <- file.path(interim_dir, "csv")
+interim_raster_dir <- file.path(interim_dir, "raster")
+final_csv_dir <- file.path(final_dir, "csv")
+final_raster_dir <- file.path(final_dir, "raster")
+final_gpkg_dir <- file.path(final_dir, "gpkg")
+
+for (d in c(
+  raw_dir,
+  results_dir,
+  interim_dir,
+  final_dir,
+  interim_csv_dir,
+  interim_raster_dir,
+  final_csv_dir,
+  final_raster_dir,
+  final_gpkg_dir
+)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+gpkg_path <- file.path(raw_dir, "Kokubunji_Jomon.gpkg")
+raw_gpkg_url <- "https://raw.githubusercontent.com/kotdijian/KJomonSitePrediction/main/Kokubunji_Jomon.gpkg"
+final_gpkg <- file.path(final_gpkg_dir, "shuseki_autocorrelation_outputs.gpkg")
+
+cat("results_dir:", results_dir, "\n")
+cat("interim_dir:", interim_dir, "\n")
+cat("final_dir:", final_dir, "\n")
+cat("final_gpkg:", final_gpkg, "\n")
+```
+
+# 03. analysis-parameters
+
+**目的**：解析パラメータを設定し、記録用テーブルとして出力する。
+**方針*：**
+  - absenceは一律の絶対壁ではなく、internal / external に分けて扱う。
+  - external absence は強い方向遮断として扱う。
+  - internal macro absence は集石集中域内部空白として弱コストまたは通過可とする。
+
+```{r c03_analysis_parameters, eval=TRUE}
+
+grid_cell_size_m <- 10
+surveyed_ratio_min_for_absence <- 0.25
+
+small_cluster_max_n <- 3
+dense_cluster_min_n <- 8
+
+# source strength
+source_density_radius_m <- 40
+source_strength_power <- 1.5
+source_range_bonus <- 0.5
+source_min_strength <- 0.05
+
+# opening
+opening_neighbor_radius_m <- 15
+
+# distance decay
+base_range_min_m <- 80
+base_range_adj_multiplier <- 3
+decay_power <- 2
+
+# absence barrier
+absence_evidence_radius_m <- 50
+absence_continuity_radius_m <- 80
+
+# external absence の周辺no_dataに与えるshadow幅
+absence_shadow_radius_m <- 60
+
+# macro cluster内部のabsenceをinternal void側に寄せるための許容幅
+internal_absence_buffer_m <- 10
+
+# barrier strength 合成重み
+absence_evidence_weight <- 0.45
+absence_continuity_weight <- 0.30
+absence_shadow_weight <- 0.25
+
+# internal macro absence は弱いbarrierに留める
+internal_absence_barrier_strength <- 0.15
+
+# external absence は通過不可にする
+external_absence_hard_barrier <- TRUE
+
+# propagation cost
+barrier_strength_power <- 1.50
+barrier_cost_multiplier <- 18
+
+# source strengthによるbarrier緩和は弱くする
+barrier_vs_source_scale <- 1.0
+
+# source strengthが低い場合の最小到達距離比
+min_range_modifier <- 0.10
+
+max_normalized_cost <- 1.0
+directional_neighbor_mode <- "queen_8"
+monotonic_decay_enforce <- TRUE
+
+# 人工改変地：
+# GSI人工地形分類から、道路・鉄道・造成等により
+# 今後の確認が困難な no_data を抽出する。
+# negative evidence ではなく、通過可能な高cost領域として扱う。
+artificial_landform_layer <- "gsi_landform_artificial"
+artificial_landform_code <- 11001
+
+# 10mセル内に人工改変地がこの割合以上含まれる場合、
+# modified unavailable no_data として扱う。
+artificial_modified_min_cell_ratio <- 0.05
+
+# 人工改変地を通過する際の追加cost倍率。
+# 1なら通常no_dataと同じ、2〜5で通過しにくくなる。
+artificial_modified_cost_multiplier <- 3
+
+format_param_value <- function(x) {
+  if (is.null(x) || length(x) == 0) {
+    return(NA_character_)
+  }
+
+  if (is.logical(x)) {
+    return(as.character(x))
+  }
+
+  if (is.numeric(x)) {
+    return(format(x, trim = TRUE, scientific = FALSE))
+  }
+
+  as.character(x)
+}
+
+analysis_parameter_table <- tibble::tribble(
+  ~group, ~parameter, ~value, ~meaning,
+  "basic", "grid_cell_size_m", format_param_value(grid_cell_size_m), "解析グリッド解像度",
+  "basic", "surveyed_ratio_min_for_absence", format_param_value(surveyed_ratio_min_for_absence), "absenceセル判定に必要な最小調査済み面積比",
+
+  "cluster", "small_cluster_max_n", format_param_value(small_cluster_max_n), "小規模・孤立集石候補とする最大集石点数",
+  "cluster", "dense_cluster_min_n", format_param_value(dense_cluster_min_n), "密集集石cluster候補とする最小集石点数",
+
+  "source_strength", "source_density_radius_m", format_param_value(source_density_radius_m), "presence自己相関・局所密度の評価半径",
+  "source_strength", "source_strength_power", format_param_value(source_strength_power), "source strengthの非線形強調",
+  "source_strength", "source_range_bonus", format_param_value(source_range_bonus), "source strengthによる到達距離の増分",
+  "source_strength", "source_min_strength", format_param_value(source_min_strength), "伝播source strengthの下限",
+
+  "opening", "opening_neighbor_radius_m", format_param_value(opening_neighbor_radius_m), "no_dataに接するsource境界の判定半径",
+
+  "distance_decay", "base_range_min_m", format_param_value(base_range_min_m), "positive値の最小基本到達距離",
+  "distance_decay", "base_range_adj_multiplier", format_param_value(base_range_adj_multiplier), "selected_d_adj_mに対する到達距離倍率",
+  "distance_decay", "decay_power", format_param_value(decay_power), "距離減衰曲線の指数",
+
+  "absence_barrier", "absence_evidence_radius_m", format_param_value(absence_evidence_radius_m), "absence evidenceの局所評価半径",
+  "absence_barrier", "absence_continuity_radius_m", format_param_value(absence_continuity_radius_m), "absence領域の広さ・連続性評価半径",
+  "absence_barrier", "absence_shadow_radius_m", format_param_value(absence_shadow_radius_m), "external absence周辺no_dataに与えるshadow幅",
+  "absence_barrier", "internal_absence_buffer_m", format_param_value(internal_absence_buffer_m), "macro cluster内部absence判定の許容幅",
+  "absence_barrier", "absence_evidence_weight", format_param_value(absence_evidence_weight), "barrier strengthにおけるabsence evidence重み",
+  "absence_barrier", "absence_continuity_weight", format_param_value(absence_continuity_weight), "barrier strengthにおけるabsence連続性重み",
+  "absence_barrier", "absence_shadow_weight", format_param_value(absence_shadow_weight), "barrier strengthにおけるabsence shadow重み",
+  "absence_barrier", "internal_absence_barrier_strength", format_param_value(internal_absence_barrier_strength), "internal macro absenceに与える弱barrier",
+  "absence_barrier", "external_absence_hard_barrier", format_param_value(external_absence_hard_barrier), "external absenceを通過不可とするか",
+  "absence_barrier", "barrier_strength_power", format_param_value(barrier_strength_power), "absence遮断の非線形強調",
+  "absence_barrier", "barrier_cost_multiplier", format_param_value(barrier_cost_multiplier), "barrier strengthを累積コストへ変換する倍率",
+
+  "source_barrier_comparison", "barrier_vs_source_scale", format_param_value(barrier_vs_source_scale), "source strengthによるbarrier緩和尺度",
+  "source_barrier_comparison", "min_range_modifier", format_param_value(min_range_modifier), "source strengthが低い場合の最小到達距離比",
+
+  "modern_disturbance", "artificial_landform_layer", format_param_value(artificial_landform_layer), "人工改変地を取得するGPKGレイヤ",
+  "modern_disturbance", "artificial_landform_code", format_param_value(artificial_landform_code), "人工改変地として扱うGSI人工地形分類code",
+  "modern_disturbance", "artificial_modified_min_cell_ratio", format_param_value(artificial_modified_min_cell_ratio), "人工改変地セル判定の最小面積比",
+  "modern_disturbance", "artificial_modified_cost_multiplier", format_param_value(artificial_modified_cost_multiplier), "人工改変地通過時の追加cost倍率",
+  
+  "propagation", "max_normalized_cost", format_param_value(max_normalized_cost), "この値を超える伝播を停止する正規化コスト",
+  "propagation", "directional_neighbor_mode", format_param_value(directional_neighbor_mode), "伝播近傍設定",
+  "propagation", "monotonic_decay_enforce", format_param_value(monotonic_decay_enforce), "累積コストにより外周再上昇を防ぐ"
+)
+
+print(analysis_parameter_table)
+```
+
+# 04. download-data
+
+**目的**：必要な入力GPKGがローカルにない場合に取得する。
+
+```{r c04_download_data, eval=TRUE}
+if (!file.exists(gpkg_path)) {
+  cat("GPKGをダウンロードします。\n")
+  utils::download.file(
+    raw_gpkg_url,
+    gpkg_path,
+    mode = "wb",
+    quiet = FALSE
+  )
+}
+
+if (!file.exists(gpkg_path)) {
+  stop("GPKGが見つかりません: ", gpkg_path)
+}
+
+file.info(gpkg_path)
+```
+
+# 05. read-data
+
+**目的**：GPKGから集石点、調査区、市域ポリゴンを読み込む。
+
+```{r c05_read_data, eval=TRUE}
+gpkg_layers <- sf::st_layers(gpkg_path)$name
+
+print(gpkg_layers)
+
+required_layers <- c(
+  "jshuseki_point",
+  "trench_polygon",
+  "kokubunji_city_boundary"
+)
+
+missing_layers <- setdiff(required_layers, gpkg_layers)
+
+if (length(missing_layers) > 0) {
+  stop("GPKGに必要レイヤがありません: ", paste(missing_layers, collapse = ", "))
+}
+
+shuseki_points <- sf::st_read(
+  gpkg_path,
+  layer = "jshuseki_point",
+  quiet = TRUE
+) |>
+  sf::st_make_valid()
+
+trench_polygon <- sf::st_read(
+  gpkg_path,
+  layer = "trench_polygon",
+  quiet = TRUE
+) |>
+  sf::st_make_valid()
+
+city_boundary <- sf::st_read(
+  gpkg_path,
+  layer = "kokubunji_city_boundary",
+  quiet = TRUE
+) |>
+  sf::st_make_valid()
+
+analysis_crs <- sf::st_crs(city_boundary)
+
+if (is.na(analysis_crs)) {
+  stop("city_boundary のCRSが未定義です。")
+}
+
+shuseki_points <- sf::st_transform(shuseki_points, analysis_crs)
+trench_polygon <- sf::st_transform(trench_polygon, analysis_crs)
+city_boundary <- sf::st_transform(city_boundary, analysis_crs)
+
+city_boundary <- sf::st_sf(
+  city_id = 1L,
+  geometry = sf::st_union(sf::st_geometry(city_boundary)),
+  crs = analysis_crs
+) |>
+  sf::st_make_valid()
+
+shuseki_points <- shuseki_points |>
+  dplyr::mutate(shuseki_id = dplyr::row_number())
+
+# ------------------------------------------------------------
+# GSI人工地形分類から人工改変地を読み込む。
+# code == artificial_landform_code を、
+# score出力対象外・通過可能高cost領域として使う。
+# ------------------------------------------------------------
+
+empty_artificial_modified_land <- function(crs_obj) {
+  sf::st_sf(
+    code = integer(0),
+    code_chr = character(0),
+    artificial_modified = integer(0),
+    geometry = sf::st_sfc(crs = crs_obj)
+  )
+}
+
+if (!exists("artificial_landform_layer")) {
+  artificial_landform_layer <- "gsi_landform_artificial"
+}
+
+if (!exists("artificial_landform_code")) {
+  artificial_landform_code <- 11001
+}
+
+if (artificial_landform_layer %in% gpkg_layers) {
+  gsi_landform_artificial <- sf::st_read(
+    gpkg_path,
+    layer = artificial_landform_layer,
+    quiet = TRUE
+  ) |>
+    sf::st_make_valid() |>
+    sf::st_transform(analysis_crs)
+
+  if (!"code" %in% names(gsi_landform_artificial)) {
+    stop(
+      artificial_landform_layer,
+      " に code フィールドがありません。"
+    )
+  }
+
+  artificial_modified_land <- gsi_landform_artificial |>
+    dplyr::mutate(
+      code_chr = as.character(.data$code)
+    ) |>
+    dplyr::filter(
+      code_chr == as.character(artificial_landform_code)
+    ) |>
+    dplyr::mutate(
+      artificial_modified = 1L
+    )
+
+  if (nrow(artificial_modified_land) == 0) {
+    warning(
+      artificial_landform_layer,
+      " に code == ",
+      artificial_landform_code,
+      " の地物がありません。人工改変地は0件として処理します。"
+    )
+
+    artificial_modified_land <- empty_artificial_modified_land(analysis_crs)
+  }
+} else {
+  warning(
+    artificial_landform_layer,
+    " がGPKGにありません。人工改変地は0件として処理します。"
+  )
+
+  artificial_modified_land <- empty_artificial_modified_land(analysis_crs)
+}
+
+cat("shuseki points:", nrow(shuseki_points), "\n")
+cat("trench polygons:", nrow(trench_polygon), "\n")
+cat("city boundary features:", nrow(city_boundary), "\n")
+cat("artificial modified land features:", nrow(artificial_modified_land), "\n")
+```
+
+# 06. create-analysis-grid
+
+**目的**：市域内に10mグリッドとラスタテンプレートを作成する。
+
+```{r c06_create_analysis_grid, eval=TRUE}
+city_bbox <- sf::st_bbox(city_boundary)
+
+template_r <- terra::rast(
+  xmin = as.numeric(city_bbox["xmin"]),
+  xmax = as.numeric(city_bbox["xmax"]),
+  ymin = as.numeric(city_bbox["ymin"]),
+  ymax = as.numeric(city_bbox["ymax"]),
+  resolution = grid_cell_size_m,
+  crs = sf::st_crs(city_boundary)$wkt
+)
+
+city_mask_r <- terra::rasterize(
+  terra::vect(city_boundary),
+  template_r,
+  field = 1,
+  background = NA,
+  touches = TRUE
+)
+
+cell_id_r <- terra::init(city_mask_r, "cell")
+cell_id_r <- terra::mask(cell_id_r, city_mask_r)
+names(cell_id_r) <- "raster_cell_id"
+
+grid10 <- terra::as.polygons(
+  cell_id_r,
+  values = TRUE,
+  na.rm = TRUE,
+  dissolve = FALSE
+) |>
+  sf::st_as_sf() |>
+  sf::st_make_valid() |>
+  dplyr::rename(raster_cell_id = 1) |>
+  dplyr::mutate(
+    grid_id = dplyr::row_number()
+  )
+
+grid10$cell_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(grid10)))
+
+grid10 <- grid10 |>
+  dplyr::select(grid_id, raster_cell_id, cell_area_m2)
+
+cat("grid cells:", nrow(grid10), "\n")
+summary(grid10$cell_area_m2)
+```
+
+# 07. assign-grid-response
+
+**目的**：各10mセルにpresence、absence、no_dataを付与する。
+
+```{r c07_assign_grid_response, eval=TRUE}
+surveyed_union <- sf::st_sf(
+  surveyed_dummy = 1L,
+  geometry = sf::st_union(sf::st_geometry(trench_polygon)),
+  crs = sf::st_crs(grid10)
+) |>
+  sf::st_make_valid()
+
+# 集石点をセルに結合する。
+shuseki_join <- sf::st_join(
+  shuseki_points |>
+    dplyr::select(shuseki_id),
+  grid10 |>
+    dplyr::select(grid_id),
+  join = sf::st_within,
+  left = FALSE
+)
+
+shuseki_presence_by_grid <- shuseki_join |>
+  sf::st_drop_geometry() |>
+  dplyr::count(grid_id, name = "shuseki_count")
+
+# 調査区とセルの交差面積を求める。
+survey_inter <- suppressWarnings(
+  sf::st_intersection(
+    grid10 |>
+      dplyr::select(grid_id, cell_area_m2),
+    surveyed_union
+  )
+)
+
+if (nrow(survey_inter) > 0) {
+  survey_inter$survey_intersection_area_m2 <- as.numeric(
+    sf::st_area(sf::st_geometry(survey_inter))
+  )
+
+  surveyed_area_by_grid <- survey_inter |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(grid_id) |>
+    dplyr::summarise(
+      surveyed_area_m2 = sum(survey_intersection_area_m2, na.rm = TRUE),
+      .groups = "drop"
+    )
+} else {
+  surveyed_area_by_grid <- tibble::tibble(
+    grid_id = integer(0),
+    surveyed_area_m2 = numeric(0)
+  )
+}
+
+grid10 <- grid10 |>
+  dplyr::left_join(shuseki_presence_by_grid, by = "grid_id") |>
+  dplyr::left_join(surveyed_area_by_grid, by = "grid_id") |>
+  dplyr::mutate(
+    shuseki_count = tidyr::replace_na(shuseki_count, 0L),
+    surveyed_area_m2 = tidyr::replace_na(surveyed_area_m2, 0),
+    surveyed_ratio = clamp01_numeric(surveyed_area_m2 / cell_area_m2),
+    response = dplyr::case_when(
+      shuseki_count > 0 ~ 1L,
+      surveyed_ratio >= surveyed_ratio_min_for_absence ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    cell_status = dplyr::case_when(
+      !is.na(response) & response == 1L ~ "presence",
+      !is.na(response) & response == 0L ~ "absence",
+      is.na(response) ~ "no_data",
+      TRUE ~ "unknown"
+    )
+  )
+
+grid_response_summary <- grid10 |>
+  sf::st_drop_geometry() |>
+  dplyr::count(cell_status, name = "n_cells")
+
+print(grid_response_summary)
+
+readr::write_csv(
+  grid_response_summary,
+  file.path(interim_csv_dir, "interim_grid_response_summary.csv")
+)
+```
+
+# 08. rasterize-status-layers
+
+**目的**：presence、absence、no_data、surveyed areaをラスタ化する。
+
+```{r c08_rasterize_status_layers, eval=TRUE}
+grid10_status <- grid10 |>
+  dplyr::mutate(
+    presence_flag = dplyr::if_else(cell_status == "presence", 1, 0),
+    absence_flag = dplyr::if_else(cell_status == "absence", 1, 0),
+    no_data_flag = dplyr::if_else(cell_status == "no_data", 1, 0),
+    city_area_m2 = cell_area_m2,
+    presence_area_m2 = dplyr::if_else(cell_status == "presence", surveyed_area_m2, 0),
+    absence_area_m2 = dplyr::if_else(cell_status == "absence", surveyed_area_m2, 0),
+    no_data_area_m2 = dplyr::if_else(cell_status == "no_data", cell_area_m2, 0),
+    response_code = dplyr::case_when(
+      cell_status == "presence" ~ 1,
+      cell_status == "absence" ~ 0,
+      cell_status == "no_data" ~ -1,
+      TRUE ~ NA_real_
+    )
+  )
+
+presence_binary_r <- rasterize_grid_field(grid10_status, "presence_flag", template_r, background = 0)
+absence_binary_r <- rasterize_grid_field(grid10_status, "absence_flag", template_r, background = 0)
+no_data_binary_r <- rasterize_grid_field(grid10_status, "no_data_flag", template_r, background = 0)
+
+presence_area_r <- rasterize_grid_field(grid10_status, "presence_area_m2", template_r, background = 0)
+absence_area_r <- rasterize_grid_field(grid10_status, "absence_area_m2", template_r, background = 0)
+no_data_area_r <- rasterize_grid_field(grid10_status, "no_data_area_m2", template_r, background = 0)
+surveyed_area_r <- rasterize_grid_field(grid10_status, "surveyed_area_m2", template_r, background = 0)
+city_area_r <- rasterize_grid_field(grid10_status, "city_area_m2", template_r, background = 0)
+response_code_r <- rasterize_grid_field(grid10_status, "response_code", template_r, background = NA_real_)
+
+names(presence_binary_r) <- "presence_binary"
+names(absence_binary_r) <- "absence_binary"
+names(no_data_binary_r) <- "no_data_binary"
+names(presence_area_r) <- "presence_area_m2"
+names(absence_area_r) <- "absence_area_m2"
+names(no_data_area_r) <- "no_data_area_m2"
+names(surveyed_area_r) <- "surveyed_area_m2"
+names(city_area_r) <- "city_area_m2"
+names(response_code_r) <- "response_code"
+
+cat("presence cells:", sum(grid10_status$presence_flag), "\n")
+cat("absence cells:", sum(grid10_status$absence_flag), "\n")
+cat("no_data cells:", sum(grid10_status$no_data_flag), "\n")
+```
+
+# 08b. rasterize-artificial-modified-land
+
+**目的**：GSI人工地形分類 code=11001 を、score対象外・通過可能高cost領域としてラスタ化する。
+
+```{r c08b_rasterize_artificial_modified_land, eval=TRUE}
+required_objects <- c(
+  "grid10_status",
+  "template_r",
+  "artificial_modified_land",
+  "no_data_binary_r"
+)
+
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
+
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
+}
+
+if (!exists("artificial_modified_min_cell_ratio")) {
+  artificial_modified_min_cell_ratio <- 0.05
+}
+
+if (!exists("artificial_modified_cost_multiplier")) {
+  artificial_modified_cost_multiplier <- 3
+}
+
+if (nrow(artificial_modified_land) > 0) {
+  artificial_modified_for_intersection <- artificial_modified_land |>
+    dplyr::select(
+      code,
+      code_chr,
+      artificial_modified
+    ) |>
+    sf::st_make_valid()
+
+  artificial_modified_inter <- suppressWarnings(
+    sf::st_intersection(
+      grid10_status |>
+        dplyr::select(
+          grid_id,
+          cell_area_m2
+        ),
+      artificial_modified_for_intersection
+    )
+  )
+
+  if (nrow(artificial_modified_inter) > 0) {
+    artificial_modified_inter$artificial_modified_intersection_area_m2 <-
+      as.numeric(sf::st_area(sf::st_geometry(artificial_modified_inter)))
+
+    artificial_modified_by_grid <- artificial_modified_inter |>
+      sf::st_drop_geometry() |>
+      dplyr::group_by(grid_id) |>
+      dplyr::summarise(
+        artificial_modified_area_m2 = sum(
+          artificial_modified_intersection_area_m2,
+          na.rm = TRUE
+        ),
+        .groups = "drop"
+      )
+  } else {
+    artificial_modified_by_grid <- tibble::tibble(
+      grid_id = integer(0),
+      artificial_modified_area_m2 = numeric(0)
+    )
+  }
+} else {
+  artificial_modified_by_grid <- tibble::tibble(
+    grid_id = integer(0),
+    artificial_modified_area_m2 = numeric(0)
+  )
+}
+
+artificial_modified_grid <- grid10_status |>
+  dplyr::left_join(
+    artificial_modified_by_grid,
+    by = "grid_id"
+  ) |>
+  dplyr::mutate(
+    artificial_modified_area_m2 = tidyr::replace_na(
+      artificial_modified_area_m2,
+      0
+    ),
+    artificial_modified_ratio = clamp01_numeric(
+      artificial_modified_area_m2 / cell_area_m2
+    ),
+    artificial_modified_flag = as.integer(
+      artificial_modified_ratio >= artificial_modified_min_cell_ratio
+    ),
+    modified_unavailable_no_data_flag = as.integer(
+      cell_status == "no_data" &
+        artificial_modified_flag == 1
+    ),
+    prediction_target_flag = as.integer(
+      cell_status == "no_data" &
+        artificial_modified_flag != 1
+    )
+  )
+
+artificial_modified_binary_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "artificial_modified_flag",
+  template_r,
+  background = 0
+)
+
+artificial_modified_area_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "artificial_modified_area_m2",
+  template_r,
+  background = 0
+)
+
+artificial_modified_ratio_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "artificial_modified_ratio",
+  template_r,
+  background = 0
+)
+
+modified_unavailable_no_data_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "modified_unavailable_no_data_flag",
+  template_r,
+  background = 0
+)
+
+prediction_target_binary_r <- rasterize_grid_field(
+  artificial_modified_grid,
+  "prediction_target_flag",
+  template_r,
+  background = 0
+)
+
+names(artificial_modified_binary_r) <- "artificial_modified_binary"
+names(artificial_modified_area_r) <- "artificial_modified_area_m2"
+names(artificial_modified_ratio_r) <- "artificial_modified_ratio"
+names(modified_unavailable_no_data_r) <- "modified_unavailable_no_data"
+names(prediction_target_binary_r) <- "prediction_target_binary"
+
+artificial_modified_summary <- artificial_modified_grid |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    artificial_modified_cells = sum(artificial_modified_flag, na.rm = TRUE),
+    modified_unavailable_no_data_cells = sum(
+      modified_unavailable_no_data_flag,
+      na.rm = TRUE
+    ),
+    prediction_target_cells = sum(prediction_target_flag, na.rm = TRUE),
+    artificial_modified_area_m2 = sum(
+      artificial_modified_area_m2,
+      na.rm = TRUE
+    )
+  )
+
+print(artificial_modified_summary)
+
+readr::write_csv(
+  artificial_modified_summary,
+  file.path(interim_csv_dir, "interim_artificial_modified_land_summary.csv")
+)
+```
+
+# 09. local-context-rasters
+
+**目的**：interim確認用のabsence penalty と open no_data scoreを作成する。
+
+```{r c09_local_context_rasters, eval=TRUE}
+local_absence_50m <- focal_sum_circle(absence_area_r, 50)
+local_surveyed_50m <- focal_sum_circle(surveyed_area_r, 50)
+local_surveyed_50m_safe <- terra::ifel(
+  is.na(local_surveyed_50m) | local_surveyed_50m < 1,
+  1,
+  local_surveyed_50m
+)
+
+absence_ratio_50m_r <- terra::clamp(
+  local_absence_50m / local_surveyed_50m_safe,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(absence_ratio_50m_r) <- "absence_ratio_50m"
+
+absence_penalty_50m_r <- absence_ratio_50m_r
+names(absence_penalty_50m_r) <- "absence_penalty_50m"
+
+local_no_data_100m <- focal_sum_circle(no_data_area_r, 100)
+local_city_100m <- focal_sum_circle(city_area_r, 100)
+local_city_100m_safe <- terra::ifel(
+  is.na(local_city_100m) | local_city_100m < 1,
+  1,
+  local_city_100m
+)
+
+open_no_data_score_100m_r <- terra::clamp(
+  local_no_data_100m / local_city_100m_safe,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(open_no_data_score_100m_r) <- "open_no_data_score_100m"
+
+cat("absence penalty range:\n")
+print(terra::global(absence_penalty_50m_r, c("min", "mean", "max"), na.rm = TRUE))
+cat("open no_data score range:\n")
+print(terra::global(open_no_data_score_100m_r, c("min", "mean", "max"), na.rm = TRUE))
+```
+
+# 10. shuseki-neighbor-distances
+
+**目的**：集石間距離を計算し、micro cluster候補パラメータを作る。
+
+```{r c10_shuseki_neighbor_distances, eval=TRUE}
+coords <- sf::st_coordinates(shuseki_points)
+
+if (nrow(coords) < 2) {
+  stop("集石点が2点未満のため、自己相関モデルを構築できません。")
+}
+
+dist_mat <- as.matrix(stats::dist(coords))
+diag(dist_mat) <- NA_real_
+
+nearest_distance_m <- apply(dist_mat, 1, min, na.rm = TRUE)
+second_nearest_distance_m <- apply(
+  dist_mat,
+  1,
+  function(x) {
+    x <- sort(x[is.finite(x)])
+    if (length(x) >= 2) x[2] else NA_real_
+  }
+)
+
+neighbor_distance_summary <- tibble::tibble(
+  metric = c("nearest", "second_nearest"),
+  q25 = c(
+    stats::quantile(nearest_distance_m, 0.25, na.rm = TRUE),
+    stats::quantile(second_nearest_distance_m, 0.25, na.rm = TRUE)
+  ),
+  median = c(
+    stats::median(nearest_distance_m, na.rm = TRUE),
+    stats::median(second_nearest_distance_m, na.rm = TRUE)
+  ),
+  q75 = c(
+    stats::quantile(nearest_distance_m, 0.75, na.rm = TRUE),
+    stats::quantile(second_nearest_distance_m, 0.75, na.rm = TRUE)
+  ),
+  q90 = c(
+    stats::quantile(nearest_distance_m, 0.90, na.rm = TRUE),
+    stats::quantile(second_nearest_distance_m, 0.90, na.rm = TRUE)
+  )
+)
+
+print(neighbor_distance_summary)
+
+readr::write_csv(
+  neighbor_distance_summary,
+  file.path(interim_csv_dir, "interim_neighbor_distance_summary.csv")
+)
+
+eps_candidates <- sort(unique(round(c(
+  15, 20, 25, 30, 35, 40, 45, 50, 60, 70,
+  stats::quantile(nearest_distance_m, c(0.50, 0.75, 0.90), na.rm = TRUE),
+  stats::quantile(second_nearest_distance_m, c(0.50, 0.75), na.rm = TRUE)
+))))
+
+eps_candidates <- eps_candidates[is.finite(eps_candidates) & eps_candidates > 0]
+min_pts_candidates <- c(3, 4, 5)
+
+cat("eps candidates:", paste(eps_candidates, collapse = ", "), "\n")
+```
+
+# 11. parameter-sweep-clustering
+
+**目的**：DBSCAN候補パラメータを評価する。
+
+```{r c11_parameter_sweep_clustering, eval=TRUE}
+run_dbscan_summary <- function(eps_value, min_pts_value, coords_matrix) {
+  db <- dbscan::dbscan(coords_matrix, eps = eps_value, minPts = min_pts_value)
+
+  cluster_id <- db$cluster
+  is_core <- if (!is.null(db$isseed)) db$isseed else rep(FALSE, length(cluster_id))
+
+  cluster_sizes <- tibble::tibble(dbscan_cluster_id = cluster_id) |>
+    dplyr::filter(dbscan_cluster_id > 0) |>
+    dplyr::count(dbscan_cluster_id, name = "n_shuseki")
+
+  n_clusters <- nrow(cluster_sizes)
+  noise_count <- sum(cluster_id == 0)
+  clustered_count <- sum(cluster_id > 0)
+
+  n_dense_clusters <- sum(cluster_sizes$n_shuseki >= dense_cluster_min_n)
+  n_small_clusters <- sum(cluster_sizes$n_shuseki <= small_cluster_max_n)
+  n_intermediate_clusters <- sum(
+    cluster_sizes$n_shuseki > small_cluster_max_n &
+      cluster_sizes$n_shuseki < dense_cluster_min_n
+  )
+
+  tibble::tibble(
+    eps_m = eps_value,
+    min_pts = min_pts_value,
+    n_points = length(cluster_id),
+    n_clusters = n_clusters,
+    noise_count = noise_count,
+    clustered_count = clustered_count,
+    noise_ratio = noise_count / length(cluster_id),
+    clustered_ratio = clustered_count / length(cluster_id),
+    n_dense_clusters = n_dense_clusters,
+    n_intermediate_clusters = n_intermediate_clusters,
+    n_small_clusters = n_small_clusters,
+    max_cluster_size = ifelse(n_clusters > 0, max(cluster_sizes$n_shuseki), 0),
+    median_cluster_size = ifelse(n_clusters > 0, stats::median(cluster_sizes$n_shuseki), 0),
+    core_point_count = sum(is_core, na.rm = TRUE),
+    core_point_ratio = sum(is_core, na.rm = TRUE) / length(cluster_id)
+  )
+}
+
+parameter_sweep <- purrr::map_dfr(
+  eps_candidates,
+  function(eps_value) {
+    purrr::map_dfr(
+      min_pts_candidates,
+      function(min_pts_value) {
+        run_dbscan_summary(eps_value, min_pts_value, coords)
+      }
+    )
+  }
+) |>
+  dplyr::mutate(
+    # 判断支援用の目安。過分割・過結合を避け、密集候補を拾いつつ孤立点も残す設定を高く評価する。
+    score_clustered_ratio = 1 - abs(clustered_ratio - 0.70),
+    score_noise_ratio = 1 - abs(noise_ratio - 0.30),
+    score_dense_presence = dplyr::if_else(n_dense_clusters >= 1, 1, 0),
+    score_not_overmerged = dplyr::if_else(max_cluster_size <= 120, 1, 0.5),
+    parameter_score =
+      0.30 * score_clustered_ratio +
+      0.25 * score_noise_ratio +
+      0.30 * score_dense_presence +
+      0.15 * score_not_overmerged,
+    interpretation = dplyr::case_when(
+      n_dense_clusters == 0 ~ "密集候補を拾えていない可能性",
+      noise_ratio < 0.05 ~ "ノイズが少なすぎ、孤立点を吸収しすぎる可能性",
+      noise_ratio > 0.60 ~ "ノイズが多すぎ、密集範囲を分断しすぎる可能性",
+      max_cluster_size > 120 ~ "最大クラスタが大きく、過結合の可能性",
+      TRUE ~ "候補として検討可能"
+    )
+  ) |>
+  dplyr::arrange(dplyr::desc(parameter_score), eps_m, min_pts)
+
+print(parameter_sweep)
+
+readr::write_csv(
+  parameter_sweep,
+  file.path(interim_csv_dir, "interim_parameter_sweep.csv")
+)
+```
+
+# 12. select-candidate-parameters
+
+**目的**：候補パラメータからselected_eps_m、selected_min_pts、selected_d_adj_mを定義する。
+
+```{r c12_select_candidate_parameters, eval=TRUE}
+selected_parameter <- parameter_sweep |>
+  dplyr::filter(interpretation == "候補として検討可能") |>
+  dplyr::slice_max(parameter_score, n = 1, with_ties = FALSE)
+
+if (nrow(selected_parameter) == 0) {
+  selected_parameter <- parameter_sweep |>
+    dplyr::slice_max(parameter_score, n = 1, with_ties = FALSE)
+}
+
+selected_eps_m <- selected_parameter$eps_m[1]
+selected_min_pts <- selected_parameter$min_pts[1]
+
+# 密集範囲内の通常隣接距離 d_adj は、選択eps以下の最近傍距離の90%分位を基準にする。
+d_adj_candidates <- nearest_distance_m[
+  is.finite(nearest_distance_m) & nearest_distance_m <= selected_eps_m
+]
+
+selected_d_adj_m <- ifelse(
+  length(d_adj_candidates) > 0,
+  as.numeric(stats::quantile(d_adj_candidates, 0.90, na.rm = TRUE)),
+  selected_eps_m
+)
+
+selected_parameter_summary <- selected_parameter |>
+  dplyr::mutate(
+    selected_d_adj_m = selected_d_adj_m,
+    validation_note = paste(
+      "QGISでinterim_shuseki_points_groupedとinterim_group_geometriesを確認し、",
+      "dense_candidateが密集範囲を拾い、small_or_isolated_candidateが孤立点を過剰に吸収していないか確認する。",
+      "その後、macro clusterで大きな集石集中域構造が復元されるか確認する。"
+    )
+  )
+
+print(selected_parameter_summary)
+
+readr::write_csv(
+  selected_parameter_summary,
+  file.path(interim_csv_dir, "interim_selected_parameter_summary.csv")
+)
+```
+
+# 13. build-interim-micro-cluster-layers
+
+**目的**：選択パラメータで集石点をmicro clusterに分類する。
+
+```{r c13_build_interim_micro_cluster_layers, eval=TRUE}
+selected_dbscan <- dbscan::dbscan(
+  coords,
+  eps = selected_eps_m,
+  minPts = selected_min_pts
+)
+
+selected_cluster_id <- selected_dbscan$cluster
+selected_is_core <- if (!is.null(selected_dbscan$isseed)) {
+  selected_dbscan$isseed
+} else {
+  rep(FALSE, length(selected_cluster_id))
+}
+
+neighbor_count <- vapply(
+  seq_len(nrow(dist_mat)),
+  function(i) {
+    sum(dist_mat[i, ] <= selected_eps_m, na.rm = TRUE)
+  },
+  numeric(1)
+)
+
+shuseki_points_grouped <- shuseki_points |>
+  dplyr::mutate(
+    dbscan_cluster_id = selected_cluster_id,
+    is_core = selected_is_core,
+    neighbor_count = neighbor_count,
+    group_id = dplyr::if_else(
+      dbscan_cluster_id > 0,
+      paste0("C", dbscan_cluster_id),
+      paste0("N", shuseki_id)
+    )
+  ) |>
+  dplyr::group_by(group_id) |>
+  dplyr::mutate(
+    group_size = dplyr::n(),
+    interim_group_type = dplyr::case_when(
+      group_size >= dense_cluster_min_n ~ "dense_candidate",
+      group_size <= small_cluster_max_n ~ "small_or_isolated_candidate",
+      TRUE ~ "intermediate_candidate"
+    )
+  ) |>
+  dplyr::ungroup()
+
+make_group_geometry_one <- function(pts_sf, buffer_m) {
+  n <- nrow(pts_sf)
+  geom <- sf::st_geometry(pts_sf)
+
+  if (n >= 3) {
+    g <- sf::st_convex_hull(sf::st_combine(geom))
+    g <- sf::st_buffer(g, buffer_m)
+  } else if (n == 2) {
+    xy <- sf::st_coordinates(pts_sf)[, 1:2, drop = FALSE]
+    g <- sf::st_sfc(
+      sf::st_linestring(xy),
+      crs = sf::st_crs(pts_sf)
+    ) |>
+      sf::st_buffer(buffer_m)
+  } else if (n == 1) {
+    g <- sf::st_buffer(geom, buffer_m)
+  } else {
+    g <- sf::st_sfc(crs = sf::st_crs(pts_sf))
+  }
+
+  g <- sf::st_make_valid(g)
+  suppressWarnings(sf::st_collection_extract(g, "POLYGON"))
+}
+
+build_group_geometries <- function(points_sf, group_col = "group_id") {
+  point_groups <- split(points_sf, points_sf[[group_col]])
+  group_names <- names(point_groups)
+  buffer_m <- max(selected_d_adj_m / 3, 3, na.rm = TRUE)
+
+  geom_list <- vector("list", length(point_groups))
+  attr_rows <- vector("list", length(point_groups))
+
+  for (i in seq_along(point_groups)) {
+    pts <- point_groups[[i]]
+    gid <- group_names[i]
+
+    g <- make_group_geometry_one(pts, buffer_m)
+
+    if (length(g) == 0 || all(sf::st_is_empty(g))) {
+      next
+    }
+
+    geom_list[[i]] <- g[[1]]
+
+    attr_rows[[i]] <- tibble::tibble(
+      group_id = gid,
+      n_shuseki = nrow(pts),
+      dbscan_cluster_id = ifelse(
+        all(pts$dbscan_cluster_id == 0),
+        0,
+        unique(pts$dbscan_cluster_id[pts$dbscan_cluster_id > 0])[1]
+      ),
+      has_noise_point = any(pts$dbscan_cluster_id == 0),
+      n_core_points = sum(pts$is_core, na.rm = TRUE),
+      mean_neighbor_count = mean(pts$neighbor_count, na.rm = TRUE),
+      group_geom_buffer_m = buffer_m
+    )
+  }
+
+  valid_idx <- vapply(geom_list, function(x) !is.null(x), logical(1))
+
+  sf::st_sf(
+    dplyr::bind_rows(attr_rows[valid_idx]),
+    geometry = do.call(
+      sf::st_sfc,
+      c(geom_list[valid_idx], list(crs = sf::st_crs(points_sf)))
+    )
+  ) |>
+    sf::st_make_valid()
+}
+
+group_geometries_interim <- build_group_geometries(
+  shuseki_points_grouped,
+  group_col = "group_id"
+) |>
+  dplyr::mutate(
+    interim_group_type = dplyr::case_when(
+      n_shuseki >= dense_cluster_min_n ~ "dense_candidate",
+      n_shuseki <= small_cluster_max_n ~ "small_or_isolated_candidate",
+      TRUE ~ "intermediate_candidate"
+    ),
+    selected_eps_m = selected_eps_m,
+    selected_min_pts = selected_min_pts,
+    selected_d_adj_m = selected_d_adj_m
+  )
+
+interim_cluster_summary <- group_geometries_interim |>
+  sf::st_drop_geometry() |>
+  dplyr::arrange(group_id)
+
+print(interim_cluster_summary)
+
+readr::write_csv(
+  interim_cluster_summary,
+  file.path(interim_csv_dir, "interim_selected_group_summary.csv")
+)
+```
+
+# 14. build-interim-macro-cluster-groups
+
+**目的**：micro cluster間関係からmacro clusterを作成する。
+
+```{r c14_build_interim_macro_cluster_groups, eval=TRUE}
+required_objects <- c(
+  "group_geometries_interim",
+  "shuseki_points_grouped",
+  "grid10",
+  "selected_d_adj_m",
+  "dense_cluster_min_n",
+  "small_cluster_max_n"
+)
+
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
+
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
+}
+
+selected_d_adj_safe_m <- ifelse(
+  is.finite(selected_d_adj_m),
+  selected_d_adj_m,
+  25
+)
+
+macro_link_max_boundary_distance_m <- max(4 * selected_d_adj_safe_m, 100)
+macro_nearest_shuseki_link_m <- max(3 * selected_d_adj_safe_m, 80)
+macro_corridor_width_m <- max(selected_d_adj_safe_m, 20)
+macro_min_group_n_for_link <- 3
+macro_min_internal_void_area_m2 <- 500
+
+# 重い処理を抑制するための上限値。
+macro_all_pair_combn_threshold <- 50000
+macro_max_screened_pairs <- 100000
+macro_max_detailed_pairs <- 3000
+macro_max_corridor_context_pairs <- 800
+macro_max_internal_void_macro_count <- 100
+macro_max_void_polygons_per_macro <- 10
+macro_max_void_context_polygons <- 300
+
+macro_pair_preselect_centroid_distance_m <- max(
+  macro_link_max_boundary_distance_m * 3,
+  macro_nearest_shuseki_link_m * 3,
+  selected_d_adj_safe_m * 6,
+  150,
+  na.rm = TRUE
+)
+
+macro_hull_buffer_m <- max(selected_d_adj_safe_m / 2, 5)
+void_shuseki_buffer_m <- max(selected_d_adj_safe_m / 2, 5)
+
+cat("macro_link_max_boundary_distance_m:", macro_link_max_boundary_distance_m, "\n")
+cat("macro_nearest_shuseki_link_m:", macro_nearest_shuseki_link_m, "\n")
+cat("macro_corridor_width_m:", macro_corridor_width_m, "\n")
+cat("macro_pair_preselect_centroid_distance_m:", macro_pair_preselect_centroid_distance_m, "\n")
+
+make_centroid_line <- function(g1, g2, crs_value) {
+  c1 <- sf::st_coordinates(
+    suppressWarnings(sf::st_centroid(sf::st_geometry(g1)))
+  )[1, 1:2]
+
+  c2 <- sf::st_coordinates(
+    suppressWarnings(sf::st_centroid(sf::st_geometry(g2)))
+  )[1, 1:2]
+
+  sf::st_sfc(
+    sf::st_linestring(rbind(c1, c2)),
+    crs = crs_value
+  )
+}
+
+compute_polygon_context <- function(poly_sfc, grid_sf) {
+  grid_context <- grid_sf
+
+  if (!"cell_status" %in% names(grid_context)) {
+    grid_context <- grid_context |>
+      dplyr::mutate(
+        cell_status = dplyr::case_when(
+          !is.na(response) & response == 1L ~ "presence",
+          !is.na(response) & response == 0L ~ "absence",
+          is.na(response) ~ "no_data",
+          TRUE ~ "unknown"
+        )
+      )
+  }
+
+  if (!"surveyed_area_m2" %in% names(grid_context)) {
+    grid_context$surveyed_area_m2 <- 0
+  }
+
+  if (!"cell_area_m2" %in% names(grid_context)) {
+    grid_context$cell_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(grid_context)))
+  }
+
+  poly_sf <- sf::st_sf(
+    context_dummy = seq_along(poly_sfc),
+    geometry = poly_sfc,
+    crs = sf::st_crs(grid_context)
+  ) |>
+    sf::st_make_valid()
+
+  poly_area_m2 <- sum(as.numeric(sf::st_area(sf::st_geometry(poly_sf))), na.rm = TRUE)
+
+  if (!is.finite(poly_area_m2) || poly_area_m2 <= 0) {
+    return(tibble::tibble(
+      context_area_m2 = poly_area_m2,
+      surveyed_area_m2 = 0,
+      absence_area_m2 = 0,
+      no_data_area_m2 = 0,
+      surveyed_ratio = 0,
+      absence_ratio_in_surveyed = 0,
+      no_data_ratio = 0
+    ))
+  }
+
+  grid_subset <- grid_context |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      cell_area_m2,
+      surveyed_area_m2
+    )
+
+  grid_candidate <- suppressWarnings(
+    sf::st_filter(
+      grid_subset,
+      poly_sf,
+      .predicate = sf::st_intersects
+    )
+  )
+
+  if (nrow(grid_candidate) == 0) {
+    return(tibble::tibble(
+      context_area_m2 = poly_area_m2,
+      surveyed_area_m2 = 0,
+      absence_area_m2 = 0,
+      no_data_area_m2 = 0,
+      surveyed_ratio = 0,
+      absence_ratio_in_surveyed = 0,
+      no_data_ratio = 0
+    ))
+  }
+
+  inter <- suppressWarnings(sf::st_intersection(grid_candidate, poly_sf))
+
+  if (nrow(inter) == 0) {
+    return(tibble::tibble(
+      context_area_m2 = poly_area_m2,
+      surveyed_area_m2 = 0,
+      absence_area_m2 = 0,
+      no_data_area_m2 = 0,
+      surveyed_ratio = 0,
+      absence_ratio_in_surveyed = 0,
+      no_data_ratio = 0
+    ))
+  }
+
+  inter <- inter |>
+    sf::st_make_valid()
+
+  inter$intersect_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(inter)))
+
+  inter_df <- inter |>
+    sf::st_drop_geometry() |>
+    dplyr::mutate(
+      cell_fraction = dplyr::if_else(
+        cell_area_m2 > 0,
+        intersect_area_m2 / cell_area_m2,
+        0
+      ),
+      surveyed_area_part_m2 = surveyed_area_m2 * cell_fraction,
+      absence_area_part_m2 = dplyr::if_else(
+        !is.na(response) & response == 0L,
+        surveyed_area_m2 * cell_fraction,
+        0
+      ),
+      no_data_area_part_m2 = dplyr::if_else(
+        is.na(response),
+        intersect_area_m2,
+        0
+      )
+    )
+
+  surveyed_area <- sum(inter_df$surveyed_area_part_m2, na.rm = TRUE)
+  absence_area <- sum(inter_df$absence_area_part_m2, na.rm = TRUE)
+  no_data_area <- sum(inter_df$no_data_area_part_m2, na.rm = TRUE)
+
+  tibble::tibble(
+    context_area_m2 = poly_area_m2,
+    surveyed_area_m2 = surveyed_area,
+    absence_area_m2 = absence_area,
+    no_data_area_m2 = no_data_area,
+    surveyed_ratio = clamp01_numeric(surveyed_area / poly_area_m2),
+    absence_ratio_in_surveyed = clamp01_numeric(absence_area / max(surveyed_area, 1)),
+    no_data_ratio = clamp01_numeric(no_data_area / poly_area_m2)
+  )
+}
+
+nearest_shuseki_between_groups <- function(point_sf, group_a, group_b) {
+  pts_a <- point_sf[point_sf$group_id == group_a, ]
+  pts_b <- point_sf[point_sf$group_id == group_b, ]
+
+  if (nrow(pts_a) == 0 || nrow(pts_b) == 0) {
+    return(NA_real_)
+  }
+
+  coords_a <- sf::st_coordinates(pts_a)
+  coords_b <- sf::st_coordinates(pts_b)
+
+  d <- as.matrix(stats::dist(rbind(coords_a, coords_b)))
+  n_a <- nrow(coords_a)
+  d_ab <- d[seq_len(n_a), n_a + seq_len(nrow(coords_b)), drop = FALSE]
+
+  min(d_ab, na.rm = TRUE)
+}
+
+build_connected_components <- function(node_ids, edge_from, edge_to, prefix = "M") {
+  node_ids <- unique(as.character(node_ids))
+  edge_from <- as.character(edge_from)
+  edge_to <- as.character(edge_to)
+
+  adjacency <- stats::setNames(vector("list", length(node_ids)), node_ids)
+
+  if (length(edge_from) > 0) {
+    for (i in seq_along(edge_from)) {
+      a <- edge_from[i]
+      b <- edge_to[i]
+
+      if (is.na(a) || is.na(b)) {
+        next
+      }
+
+      if (!a %in% node_ids || !b %in% node_ids) {
+        next
+      }
+
+      adjacency[[a]] <- unique(c(adjacency[[a]], b))
+      adjacency[[b]] <- unique(c(adjacency[[b]], a))
+    }
+  }
+
+  visited <- stats::setNames(rep(FALSE, length(node_ids)), node_ids)
+  component_id <- stats::setNames(rep(NA_character_, length(node_ids)), node_ids)
+  component_counter <- 0L
+
+  for (node in node_ids) {
+    if (visited[[node]]) {
+      next
+    }
+
+    component_counter <- component_counter + 1L
+    cid <- paste0(prefix, component_counter)
+    queue <- node
+    visited[[node]] <- TRUE
+
+    while (length(queue) > 0) {
+      current <- queue[1]
+      queue <- queue[-1]
+      component_id[[current]] <- cid
+
+      neighbors <- adjacency[[current]]
+
+      if (length(neighbors) > 0) {
+        for (nb in neighbors) {
+          if (!visited[[nb]]) {
+            visited[[nb]] <- TRUE
+            queue <- c(queue, nb)
+          }
+        }
+      }
+    }
+  }
+
+  tibble::tibble(
+    group_id = names(component_id),
+    macro_cluster_id = unname(component_id)
+  )
+}
+
+group_geometries_interim <- group_geometries_interim |>
+  dplyr::mutate(group_id = as.character(group_id))
+
+shuseki_points_grouped_for_pairs <- shuseki_points_grouped |>
+  dplyr::mutate(group_id = as.character(group_id))
+
+micro_group_ids <- unique(as.character(group_geometries_interim$group_id))
+
+if (length(micro_group_ids) < 2) {
+  cluster_pair_metrics <- tibble::tibble()
+  cluster_pair_screening_metrics <- tibble::tibble()
+
+  macro_cluster_link_edges <- sf::st_sf(
+    tibble::tibble(),
+    geometry = sf::st_sfc(crs = sf::st_crs(group_geometries_interim))
+  )
+
+  macro_assignment <- tibble::tibble(
+    group_id = micro_group_ids,
+    macro_cluster_id = paste0("M", seq_along(micro_group_ids))
+  )
+
+} else {
+  micro_centroids <- suppressWarnings(sf::st_point_on_surface(group_geometries_interim))
+  centroid_xy <- sf::st_coordinates(micro_centroids)
+
+  group_attr <- group_geometries_interim |>
+    sf::st_drop_geometry() |>
+    dplyr::mutate(
+      group_id = as.character(group_id),
+      micro_index = dplyr::row_number(),
+      centroid_x = centroid_xy[, 1],
+      centroid_y = centroid_xy[, 2]
+    ) |>
+    dplyr::select(
+      micro_index,
+      group_id,
+      n_shuseki,
+      interim_group_type,
+      centroid_x,
+      centroid_y
+    )
+
+  n_micro_groups <- nrow(group_attr)
+  n_all_pairs <- n_micro_groups * (n_micro_groups - 1) / 2
+
+  cat("micro cluster count:", n_micro_groups, "\n")
+  cat("theoretical all pair count:", n_all_pairs, "\n")
+
+  if (n_all_pairs <= macro_all_pair_combn_threshold) {
+    pair_index <- utils::combn(seq_len(n_micro_groups), 2)
+
+    pair_seed <- tibble::tibble(
+      idx_a = pair_index[1, ],
+      idx_b = pair_index[2, ],
+      pair_generation_method = "all_pairs_combn"
+    )
+
+  } else {
+    within_list <- sf::st_is_within_distance(
+      sf::st_geometry(micro_centroids),
+      sf::st_geometry(micro_centroids),
+      dist = macro_pair_preselect_centroid_distance_m
+    )
+
+    pair_seed_list <- vector("list", length(within_list))
+
+    for (i in seq_along(within_list)) {
+      j <- within_list[[i]]
+      j <- j[j > i]
+
+      if (length(j) == 0) {
+        pair_seed_list[[i]] <- NULL
+      } else {
+        pair_seed_list[[i]] <- tibble::tibble(
+          idx_a = i,
+          idx_b = j,
+          pair_generation_method = "centroid_within_distance"
+        )
+      }
+    }
+
+    pair_seed <- dplyr::bind_rows(pair_seed_list)
+  }
+
+  if (nrow(pair_seed) == 0) {
+    pair_screening <- tibble::tibble()
+  } else {
+    pair_screening <- pair_seed |>
+      dplyr::left_join(
+        group_attr |>
+          dplyr::rename(
+            idx_a = micro_index,
+            group_id_1 = group_id,
+            n_shuseki_1 = n_shuseki,
+            interim_group_type_1 = interim_group_type,
+            centroid_x_1 = centroid_x,
+            centroid_y_1 = centroid_y
+          ),
+        by = "idx_a"
+      ) |>
+      dplyr::left_join(
+        group_attr |>
+          dplyr::rename(
+            idx_b = micro_index,
+            group_id_2 = group_id,
+            n_shuseki_2 = n_shuseki,
+            interim_group_type_2 = interim_group_type,
+            centroid_x_2 = centroid_x,
+            centroid_y_2 = centroid_y
+          ),
+        by = "idx_b"
+      ) |>
+      dplyr::mutate(
+        centroid_distance_m = sqrt(
+          (centroid_x_1 - centroid_x_2)^2 +
+            (centroid_y_1 - centroid_y_2)^2
+        ),
+        both_linkable_size =
+          n_shuseki_1 >= macro_min_group_n_for_link &
+          n_shuseki_2 >= macro_min_group_n_for_link,
+        at_least_one_dense =
+          n_shuseki_1 >= dense_cluster_min_n |
+          n_shuseki_2 >= dense_cluster_min_n,
+        centroid_preselect =
+          centroid_distance_m <= macro_pair_preselect_centroid_distance_m,
+        pair_size_score_pre = clamp01_numeric(
+          (n_shuseki_1 + n_shuseki_2) / (2 * dense_cluster_min_n)
+        ),
+        evaluate_pair =
+          both_linkable_size &
+          at_least_one_dense &
+          centroid_preselect
+      )
+  }
+
+  if (nrow(pair_screening) == 0) {
+    cluster_pair_screening_metrics <- tibble::tibble(
+      group_id_1 = character(0),
+      group_id_2 = character(0),
+      n_shuseki_1 = numeric(0),
+      n_shuseki_2 = numeric(0),
+      interim_group_type_1 = character(0),
+      interim_group_type_2 = character(0),
+      centroid_distance_m = numeric(0),
+      both_linkable_size = logical(0),
+      at_least_one_dense = logical(0),
+      centroid_preselect = logical(0),
+      pair_size_score_pre = numeric(0),
+      evaluate_pair = logical(0),
+      evaluate_order = integer(0),
+      detailed_evaluation_selected = logical(0),
+      pair_generation_method = character(0)
+    )
+
+    pairs_to_evaluate <- tibble::tibble()
+
+  } else {
+    if (nrow(pair_screening) > macro_max_screened_pairs) {
+      cat(
+        "pair_screening is large. Keeping nearest pairs only:",
+        macro_max_screened_pairs,
+        "of",
+        nrow(pair_screening),
+        "\n"
+      )
+
+      pair_screening <- pair_screening |>
+        dplyr::arrange(centroid_distance_m) |>
+        dplyr::slice_head(n = macro_max_screened_pairs)
+    }
+
+    pair_screening <- pair_screening |>
+      dplyr::arrange(
+        dplyr::desc(evaluate_pair),
+        dplyr::desc(pair_size_score_pre),
+        centroid_distance_m
+      ) |>
+      dplyr::mutate(
+        evaluate_order = dplyr::if_else(
+          evaluate_pair,
+          cumsum(evaluate_pair),
+          NA_integer_
+        ),
+        detailed_evaluation_selected =
+          evaluate_pair &
+          evaluate_order <= macro_max_detailed_pairs
+      )
+
+    cluster_pair_screening_metrics <- pair_screening |>
+      dplyr::select(
+        group_id_1,
+        group_id_2,
+        n_shuseki_1,
+        n_shuseki_2,
+        interim_group_type_1,
+        interim_group_type_2,
+        centroid_distance_m,
+        both_linkable_size,
+        at_least_one_dense,
+        centroid_preselect,
+        pair_size_score_pre,
+        evaluate_pair,
+        evaluate_order,
+        detailed_evaluation_selected,
+        pair_generation_method
+      )
+
+    pairs_to_evaluate <- pair_screening |>
+      dplyr::filter(detailed_evaluation_selected) |>
+      dplyr::arrange(evaluate_order)
+  }
+
+  cat("screened pair count:", nrow(pair_screening), "\n")
+  cat("pairs selected for detailed distance check:", nrow(pairs_to_evaluate), "\n")
+
+  if (nrow(pairs_to_evaluate) == 0) {
+    cluster_pair_metrics <- tibble::tibble()
+    link_edges_df <- tibble::tibble()
+
+    macro_cluster_link_edges <- sf::st_sf(
+      tibble::tibble(),
+      geometry = sf::st_sfc(crs = sf::st_crs(group_geometries_interim))
+    )
+
+    macro_assignment <- tibble::tibble(
+      group_id = micro_group_ids,
+      macro_cluster_id = paste0("M", seq_along(micro_group_ids))
+    )
+
+  } else {
+    pair_rows <- vector("list", nrow(pairs_to_evaluate))
+    edge_geometries <- vector("list", nrow(pairs_to_evaluate))
+    corridor_context_counter <- 0L
+
+    for (i in seq_len(nrow(pairs_to_evaluate))) {
+      idx_a <- pairs_to_evaluate$idx_a[i]
+      idx_b <- pairs_to_evaluate$idx_b[i]
+
+      g1 <- group_geometries_interim[idx_a, ]
+      g2 <- group_geometries_interim[idx_b, ]
+
+      group_id_1 <- as.character(g1$group_id[1])
+      group_id_2 <- as.character(g2$group_id[1])
+      n1 <- as.numeric(g1$n_shuseki[1])
+      n2 <- as.numeric(g2$n_shuseki[1])
+
+      boundary_distance_m <- as.numeric(
+        sf::st_distance(
+          sf::st_geometry(g1),
+          sf::st_geometry(g2),
+          by_element = TRUE
+        )
+      )
+
+      centroid_distance_m <- pairs_to_evaluate$centroid_distance_m[i]
+
+      nearest_between_m <- nearest_shuseki_between_groups(
+        shuseki_points_grouped_for_pairs,
+        group_id_1,
+        group_id_2
+      )
+
+      distance_condition <-
+        isTRUE(boundary_distance_m <= macro_link_max_boundary_distance_m) ||
+        isTRUE(nearest_between_m <= macro_nearest_shuseki_link_m)
+
+      macro_link_candidate <- isTRUE(distance_condition)
+
+      proximity_score <- ifelse(
+        is.finite(boundary_distance_m),
+        clamp01_numeric(1 - boundary_distance_m / macro_link_max_boundary_distance_m),
+        0
+      )
+
+      pair_size_score <- clamp01_numeric((n1 + n2) / (2 * dense_cluster_min_n))
+      macro_link_score <- proximity_score * pair_size_score
+
+      context_evaluated <- FALSE
+      context_note <- "not_evaluated_not_link_candidate"
+
+      if (macro_link_candidate) {
+        line_sfc <- make_centroid_line(g1, g2, sf::st_crs(group_geometries_interim))
+        edge_geometries[[i]] <- line_sfc[[1]]
+
+        if (corridor_context_counter < macro_max_corridor_context_pairs) {
+          corridor_context_counter <- corridor_context_counter + 1L
+          corridor_sfc <- sf::st_buffer(line_sfc, macro_corridor_width_m)
+          context <- compute_polygon_context(corridor_sfc, grid10)
+          context_evaluated <- TRUE
+          context_note <- "evaluated"
+        } else {
+          context <- tibble::tibble(
+            context_area_m2 = NA_real_,
+            surveyed_area_m2 = NA_real_,
+            absence_area_m2 = NA_real_,
+            no_data_area_m2 = NA_real_,
+            surveyed_ratio = NA_real_,
+            absence_ratio_in_surveyed = NA_real_,
+            no_data_ratio = NA_real_
+          )
+          context_note <- "skipped_by_corridor_context_limit"
+        }
+      } else {
+        context <- tibble::tibble(
+          context_area_m2 = NA_real_,
+          surveyed_area_m2 = NA_real_,
+          absence_area_m2 = NA_real_,
+          no_data_area_m2 = NA_real_,
+          surveyed_ratio = NA_real_,
+          absence_ratio_in_surveyed = NA_real_,
+          no_data_ratio = NA_real_
+        )
+        edge_geometries[[i]] <- NULL
+      }
+
+      pair_rows[[i]] <- dplyr::bind_cols(
+        tibble::tibble(
+          group_id_1 = group_id_1,
+          group_id_2 = group_id_2,
+          n_shuseki_1 = n1,
+          n_shuseki_2 = n2,
+          interim_group_type_1 = as.character(g1$interim_group_type[1]),
+          interim_group_type_2 = as.character(g2$interim_group_type[1]),
+          boundary_distance_m = boundary_distance_m,
+          centroid_distance_m = centroid_distance_m,
+          nearest_shuseki_between_groups_m = nearest_between_m,
+          macro_corridor_width_m = macro_corridor_width_m,
+          macro_link_max_boundary_distance_m = macro_link_max_boundary_distance_m,
+          macro_nearest_shuseki_link_m = macro_nearest_shuseki_link_m,
+          macro_link_score = macro_link_score,
+          macro_link_candidate = macro_link_candidate,
+          corridor_context_evaluated = context_evaluated,
+          corridor_context_note = context_note
+        ),
+        context
+      ) |>
+        dplyr::mutate(
+          pair_interpretation = dplyr::case_when(
+            macro_link_candidate &
+              corridor_context_evaluated &
+              !is.na(surveyed_ratio) &
+              surveyed_ratio >= 0.30 &
+              !is.na(absence_ratio_in_surveyed) &
+              absence_ratio_in_surveyed >= 0.50 ~
+              "macro_link_with_possible_internal_void_or_plaza",
+            macro_link_candidate &
+              corridor_context_evaluated &
+              !is.na(no_data_ratio) &
+              no_data_ratio >= 0.50 ~
+              "macro_link_open_to_no_data",
+            macro_link_candidate & !corridor_context_evaluated ~
+              "macro_link_candidate_context_not_evaluated",
+            macro_link_candidate ~ "macro_link_candidate",
+            TRUE ~ "not_linked_after_detailed_distance_check"
+          )
+        )
+    }
+
+    cluster_pair_metrics <- dplyr::bind_rows(pair_rows)
+    link_edges_df <- cluster_pair_metrics |>
+      dplyr::filter(macro_link_candidate)
+
+    if (nrow(link_edges_df) > 0) {
+      link_edge_indices <- which(cluster_pair_metrics$macro_link_candidate)
+      macro_cluster_link_edges <- sf::st_sf(
+        link_edges_df,
+        geometry = do.call(
+          sf::st_sfc,
+          c(edge_geometries[link_edge_indices], list(crs = sf::st_crs(group_geometries_interim)))
+        )
+      ) |>
+        sf::st_make_valid()
+    } else {
+      macro_cluster_link_edges <- sf::st_sf(
+        link_edges_df,
+        geometry = sf::st_sfc(crs = sf::st_crs(group_geometries_interim))
+      )
+    }
+
+    macro_assignment <- build_connected_components(
+      node_ids = micro_group_ids,
+      edge_from = link_edges_df$group_id_1,
+      edge_to = link_edges_df$group_id_2,
+      prefix = "M"
+    )
+  }
+}
+
+micro_group_macro_table <- group_geometries_interim |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(group_id = as.character(group_id)) |>
+  dplyr::left_join(macro_assignment, by = "group_id") |>
+  dplyr::arrange(macro_cluster_id, group_id)
+
+shuseki_points_grouped_macro <- shuseki_points_grouped |>
+  dplyr::mutate(group_id = as.character(group_id)) |>
+  dplyr::select(-dplyr::any_of("macro_cluster_id")) |>
+  dplyr::left_join(macro_assignment, by = "group_id")
+
+macro_ids <- unique(micro_group_macro_table$macro_cluster_id)
+macro_ids <- macro_ids[!is.na(macro_ids)]
+
+macro_geom_list <- list()
+macro_attr_rows <- list()
+macro_counter <- 0L
+
+for (mid in macro_ids) {
+  micro_ids <- micro_group_macro_table |>
+    dplyr::filter(macro_cluster_id == mid) |>
+    dplyr::pull(group_id)
+
+  micro_attrs <- group_geometries_interim |>
+    sf::st_drop_geometry() |>
+    dplyr::mutate(group_id = as.character(group_id)) |>
+    dplyr::filter(group_id %in% micro_ids)
+
+  macro_pts <- shuseki_points_grouped_macro |>
+    dplyr::filter(macro_cluster_id == mid)
+
+  if (nrow(macro_pts) > 0) {
+    combined_points <- sf::st_combine(sf::st_geometry(macro_pts))
+    hull_geom <- sf::st_convex_hull(combined_points)
+    hull_geom <- sf::st_buffer(hull_geom, macro_hull_buffer_m)
+  } else {
+    micro_geoms <- group_geometries_interim[
+      as.character(group_geometries_interim$group_id) %in% micro_ids,
+    ]
+    combined_centroids <- sf::st_combine(
+      suppressWarnings(sf::st_centroid(sf::st_geometry(micro_geoms)))
+    )
+    hull_geom <- sf::st_convex_hull(combined_centroids)
+    hull_geom <- sf::st_buffer(hull_geom, macro_hull_buffer_m)
+  }
+
+  hull_geom <- sf::st_make_valid(hull_geom)
+  hull_geom <- suppressWarnings(sf::st_collection_extract(hull_geom, "POLYGON"))
+
+  if (length(hull_geom) == 0 || all(sf::st_is_empty(hull_geom))) {
+    next
+  }
+
+  macro_counter <- macro_counter + 1L
+  macro_geom_list[[macro_counter]] <- hull_geom[[1]]
+
+  n_shuseki_total <- sum(micro_attrs$n_shuseki, na.rm = TRUE)
+  n_micro_groups <- nrow(micro_attrs)
+  n_dense_micro_groups <- sum(micro_attrs$n_shuseki >= dense_cluster_min_n, na.rm = TRUE)
+  n_intermediate_micro_groups <- sum(
+    micro_attrs$n_shuseki > small_cluster_max_n & micro_attrs$n_shuseki < dense_cluster_min_n,
+    na.rm = TRUE
+  )
+  n_small_micro_groups <- sum(micro_attrs$n_shuseki <= small_cluster_max_n, na.rm = TRUE)
+
+  macro_group_type_value <- dplyr::case_when(
+    n_micro_groups >= 2 & n_shuseki_total >= dense_cluster_min_n ~
+      "macro_settlement_complex_candidate",
+    n_shuseki_total >= dense_cluster_min_n ~ "single_dense_micro_cluster",
+    n_shuseki_total <= small_cluster_max_n ~ "small_or_isolated_candidate",
+    TRUE ~ "intermediate_candidate"
+  )
+
+  macro_attr_rows[[macro_counter]] <- tibble::tibble(
+    macro_cluster_id = mid,
+    micro_group_ids = paste(micro_ids, collapse = ";"),
+    n_micro_groups = n_micro_groups,
+    n_shuseki = n_shuseki_total,
+    n_dense_micro_groups = n_dense_micro_groups,
+    n_intermediate_micro_groups = n_intermediate_micro_groups,
+    n_small_micro_groups = n_small_micro_groups,
+    macro_group_type = macro_group_type_value,
+    selected_eps_m = selected_eps_m,
+    selected_min_pts = selected_min_pts,
+    selected_d_adj_m = selected_d_adj_m,
+    selected_d_adj_safe_m = selected_d_adj_safe_m,
+    macro_hull_buffer_m = macro_hull_buffer_m,
+    macro_link_max_boundary_distance_m = macro_link_max_boundary_distance_m,
+    macro_nearest_shuseki_link_m = macro_nearest_shuseki_link_m,
+    macro_corridor_width_m = macro_corridor_width_m
+  )
+}
+
+if (length(macro_attr_rows) > 0) {
+  macro_group_geometries_interim <- sf::st_sf(
+    dplyr::bind_rows(macro_attr_rows),
+    geometry = do.call(
+      sf::st_sfc,
+      c(macro_geom_list, list(crs = sf::st_crs(group_geometries_interim)))
+    )
+  ) |>
+    sf::st_make_valid()
+} else {
+  macro_group_geometries_interim <- sf::st_sf(
+    tibble::tibble(
+      macro_cluster_id = character(0),
+      micro_group_ids = character(0),
+      n_micro_groups = integer(0),
+      n_shuseki = numeric(0),
+      n_dense_micro_groups = integer(0),
+      n_intermediate_micro_groups = integer(0),
+      n_small_micro_groups = integer(0),
+      macro_group_type = character(0),
+      selected_eps_m = numeric(0),
+      selected_min_pts = numeric(0),
+      selected_d_adj_m = numeric(0),
+      selected_d_adj_safe_m = numeric(0),
+      macro_hull_buffer_m = numeric(0),
+      macro_link_max_boundary_distance_m = numeric(0),
+      macro_nearest_shuseki_link_m = numeric(0),
+      macro_corridor_width_m = numeric(0)
+    ),
+    geometry = sf::st_sfc(crs = sf::st_crs(group_geometries_interim))
+  )
+}
+
+macro_cluster_summary_interim <- macro_group_geometries_interim |>
+  sf::st_drop_geometry()
+
+void_target_macros <- macro_group_geometries_interim |>
+  dplyr::filter(
+    n_micro_groups >= 2,
+    n_shuseki >= dense_cluster_min_n
+  ) |>
+  dplyr::arrange(dplyr::desc(n_shuseki), dplyr::desc(n_micro_groups))
+
+if (nrow(void_target_macros) > macro_max_internal_void_macro_count) {
+  cat(
+    "internal void target macro clusters limited:",
+    macro_max_internal_void_macro_count,
+    "of",
+    nrow(void_target_macros),
+    "\n"
+  )
+  void_target_macros <- void_target_macros |>
+    dplyr::slice_head(n = macro_max_internal_void_macro_count)
+}
+
+void_rows <- list()
+void_geoms <- list()
+void_counter <- 0L
+void_context_counter <- 0L
+
+if (nrow(void_target_macros) > 0) {
+  for (i in seq_len(nrow(void_target_macros))) {
+    macro_row <- void_target_macros[i, ]
+
+    macro_pts <- shuseki_points_grouped_macro |>
+      dplyr::filter(macro_cluster_id == macro_row$macro_cluster_id)
+
+    if (nrow(macro_pts) == 0) {
+      next
+    }
+
+    shuseki_buffer_union <- sf::st_union(
+      sf::st_buffer(sf::st_geometry(macro_pts), void_shuseki_buffer_m)
+    )
+
+    void_geom <- tryCatch(
+      {
+        suppressWarnings(
+          sf::st_difference(sf::st_geometry(macro_row), shuseki_buffer_union)
+        )
+      },
+      error = function(e) {
+        sf::st_sfc(crs = sf::st_crs(macro_group_geometries_interim))
+      }
+    )
+
+    void_geom <- sf::st_make_valid(void_geom)
+    void_geom <- suppressWarnings(sf::st_collection_extract(void_geom, "POLYGON"))
+
+    if (length(void_geom) == 0 || all(sf::st_is_empty(void_geom))) {
+      next
+    }
+
+    void_sf <- sf::st_sf(
+      macro_cluster_id = rep(macro_row$macro_cluster_id, length(void_geom)),
+      geometry = void_geom,
+      crs = sf::st_crs(macro_group_geometries_interim)
+    ) |>
+      sf::st_make_valid()
+
+    void_sf$void_area_m2 <- as.numeric(sf::st_area(sf::st_geometry(void_sf)))
+
+    void_sf <- void_sf |>
+      dplyr::filter(void_area_m2 >= macro_min_internal_void_area_m2) |>
+      dplyr::arrange(dplyr::desc(void_area_m2))
+
+    if (nrow(void_sf) == 0) {
+      next
+    }
+
+    if (nrow(void_sf) > macro_max_void_polygons_per_macro) {
+      void_sf <- void_sf |>
+        dplyr::slice_head(n = macro_max_void_polygons_per_macro)
+    }
+
+    for (j in seq_len(nrow(void_sf))) {
+      void_counter <- void_counter + 1L
+
+      if (void_context_counter < macro_max_void_context_polygons) {
+        void_context_counter <- void_context_counter + 1L
+        context <- compute_polygon_context(sf::st_geometry(void_sf[j, ]), grid10)
+        void_context_evaluated <- TRUE
+        void_context_note <- "evaluated"
+      } else {
+        context <- tibble::tibble(
+          context_area_m2 = NA_real_,
+          surveyed_area_m2 = NA_real_,
+          absence_area_m2 = NA_real_,
+          no_data_area_m2 = NA_real_,
+          surveyed_ratio = NA_real_,
+          absence_ratio_in_surveyed = NA_real_,
+          no_data_ratio = NA_real_
+        )
+        void_context_evaluated <- FALSE
+        void_context_note <- "skipped_by_void_context_limit"
+      }
+
+      void_rows[[void_counter]] <- dplyr::bind_cols(
+        tibble::tibble(
+          void_id = paste0("V", void_counter),
+          macro_cluster_id = as.character(macro_row$macro_cluster_id[1]),
+          void_area_m2 = void_sf$void_area_m2[j],
+          void_shuseki_buffer_m = void_shuseki_buffer_m,
+          void_context_evaluated = void_context_evaluated,
+          void_context_note = void_context_note
+        ),
+        context
+      ) |>
+        dplyr::mutate(
+          void_interpretation = dplyr::case_when(
+            void_context_evaluated &
+              !is.na(surveyed_ratio) &
+              surveyed_ratio >= 0.30 &
+              !is.na(absence_ratio_in_surveyed) &
+              absence_ratio_in_surveyed >= 0.50 ~
+              "surveyed_absence_internal_void_or_plaza_candidate",
+            void_context_evaluated &
+              !is.na(no_data_ratio) &
+              no_data_ratio >= 0.50 ~
+              "no_data_internal_void_unconfirmed",
+            !void_context_evaluated ~ "internal_void_candidate_context_not_evaluated",
+            TRUE ~ "internal_void_candidate"
+          )
+        )
+
+      void_geoms[[void_counter]] <- sf::st_geometry(void_sf[j, ])[[1]]
+    }
+  }
+}
+
+if (length(void_rows) > 0) {
+  internal_void_candidates <- sf::st_sf(
+    dplyr::bind_rows(void_rows),
+    geometry = do.call(
+      sf::st_sfc,
+      c(void_geoms, list(crs = sf::st_crs(macro_group_geometries_interim)))
+    )
+  ) |>
+    sf::st_make_valid()
+} else {
+  internal_void_candidates <- sf::st_sf(
+    tibble::tibble(
+      void_id = character(0),
+      macro_cluster_id = character(0),
+      void_area_m2 = numeric(0),
+      void_shuseki_buffer_m = numeric(0),
+      void_context_evaluated = logical(0),
+      void_context_note = character(0),
+      context_area_m2 = numeric(0),
+      surveyed_area_m2 = numeric(0),
+      absence_area_m2 = numeric(0),
+      no_data_area_m2 = numeric(0),
+      surveyed_ratio = numeric(0),
+      absence_ratio_in_surveyed = numeric(0),
+      no_data_ratio = numeric(0),
+      void_interpretation = character(0)
+    ),
+    geometry = sf::st_sfc(crs = sf::st_crs(macro_group_geometries_interim))
+  )
+}
+
+readr::write_csv(
+  cluster_pair_screening_metrics,
+  file.path(interim_csv_dir, "interim_cluster_pair_screening_metrics.csv")
+)
+
+readr::write_csv(
+  cluster_pair_metrics,
+  file.path(interim_csv_dir, "interim_cluster_pair_metrics.csv")
+)
+
+readr::write_csv(
+  micro_group_macro_table,
+  file.path(interim_csv_dir, "interim_micro_to_macro_cluster_assignment.csv")
+)
+
+readr::write_csv(
+  macro_cluster_summary_interim,
+  file.path(interim_csv_dir, "interim_macro_cluster_summary.csv")
+)
+
+readr::write_csv(
+  internal_void_candidates |>
+    sf::st_drop_geometry(),
+  file.path(interim_csv_dir, "interim_internal_void_candidates.csv")
+)
+
+cat("macro cluster count:", nrow(macro_group_geometries_interim), "\n")
+cat("macro link edge count:", nrow(macro_cluster_link_edges), "\n")
+cat("internal void candidate count:", nrow(internal_void_candidates), "\n")
+
+macro_group_geometries_interim |>
+  sf::st_drop_geometry() |>
+  dplyr::count(macro_group_type, name = "n_macro_clusters")
+```
+
+# 15. export-interim-rasters
+
+**目的**：中間確認用ラスタをGeoTIFFとして出力する。
+
+```{r c15_export_interim_rasters, eval=TRUE}
+interim_raster_outputs <- list(
+  interim_absence_penalty_50m = absence_penalty_50m_r,
+  interim_open_no_data_score_100m = open_no_data_score_100m_r
+)
+
+for (nm in names(interim_raster_outputs)) {
+  out_path <- file.path(interim_raster_dir, paste0(nm, ".tif"))
+  terra::writeRaster(
+    interim_raster_outputs[[nm]],
+    out_path,
+    overwrite = TRUE
+  )
+  cat("interim raster:", out_path, "\n")
+}
+```
+
+# 16. export-interim-gpkg-layers
+
+**目的**：中間確認用ベクタレイヤをGPKGに出力する。
+
+```{r c16_export_interim_gpkg_layers, eval=TRUE}
+if (file.exists(final_gpkg)) {
+  unlink(final_gpkg)
+}
+
+write_gpkg_layer_safe(
+  shuseki_points_grouped_macro,
+  final_gpkg,
+  "interim_shuseki_points_grouped"
+)
+
+write_gpkg_layer_safe(
+  group_geometries_interim,
+  final_gpkg,
+  "interim_shuseki_group_geometries"
+)
+
+write_gpkg_layer_safe(
+  macro_group_geometries_interim,
+  final_gpkg,
+  "interim_shuseki_macro_cluster_geometries"
+)
+
+write_gpkg_layer_safe(
+  macro_cluster_link_edges,
+  final_gpkg,
+  "interim_shuseki_macro_cluster_link_edges"
+)
+
+write_gpkg_layer_safe(
+  internal_void_candidates,
+  final_gpkg,
+  "interim_shuseki_internal_void_candidates"
+)
+
+write_gpkg_layer_safe(
+  grid10_status |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      shuseki_count,
+      surveyed_ratio,
+      surveyed_area_m2,
+      cell_area_m2
+    ),
+  final_gpkg,
+  "interim_shuseki_grid_status"
+)
+
+cat("interim gpkg:", final_gpkg, "\n")
+```
+
+# 17. check-interim-outputs
+
+**目的**：interim出力の過不足を確認する。
+
+```{r c17_check_interim_outputs, eval=TRUE}
+expected_interim_csv <- c(
+  "interim_grid_response_summary.csv",
+  "interim_neighbor_distance_summary.csv",
+  "interim_parameter_sweep.csv",
+  "interim_selected_parameter_summary.csv",
+  "interim_selected_group_summary.csv",
+  "interim_cluster_pair_screening_metrics.csv",
+  "interim_cluster_pair_metrics.csv",
+  "interim_micro_to_macro_cluster_assignment.csv",
+  "interim_macro_cluster_summary.csv",
+  "interim_internal_void_candidates.csv"
+)
+
+expected_interim_raster <- c(
+  "interim_absence_penalty_50m.tif",
+  "interim_open_no_data_score_100m.tif"
+)
+
+expected_interim_gpkg_layers <- c(
+  "interim_shuseki_points_grouped",
+  "interim_shuseki_group_geometries",
+  "interim_shuseki_macro_cluster_geometries",
+  "interim_shuseki_macro_cluster_link_edges",
+  "interim_shuseki_internal_void_candidates",
+  "interim_shuseki_grid_status"
+)
+
+csv_check <- tibble::tibble(
+  output_type = "csv",
+  output_name = expected_interim_csv,
+  path = file.path(interim_csv_dir, expected_interim_csv),
+  exists = file.exists(path),
+  note = dplyr::if_else(exists, "ok", "missing")
+)
+
+raster_check <- tibble::tibble(
+  output_type = "raster",
+  output_name = expected_interim_raster,
+  path = file.path(interim_raster_dir, expected_interim_raster),
+  exists = file.exists(path),
+  note = dplyr::if_else(exists, "ok", "missing")
+)
+
+actual_layers <- if (file.exists(final_gpkg)) {
+  sf::st_layers(final_gpkg)$name
+} else {
+  character(0)
+}
+
+layer_object_rows <- tibble::tibble(
+  output_name = expected_interim_gpkg_layers,
+  object_name = c(
+    "shuseki_points_grouped_macro",
+    "group_geometries_interim",
+    "macro_group_geometries_interim",
+    "macro_cluster_link_edges",
+    "internal_void_candidates",
+    "grid10_status"
+  )
+) |>
+  dplyr::rowwise() |>
+  dplyr::mutate(
+    object_exists = exists(object_name),
+    object_n = if (object_exists) {
+      obj <- get(object_name)
+      if (inherits(obj, "sf")) nrow(obj) else NA_integer_
+    } else {
+      NA_integer_
+    }
+  ) |>
+  dplyr::ungroup()
+
+gpkg_layer_check <- layer_object_rows |>
+  dplyr::mutate(
+    output_type = "gpkg_layer",
+    path = final_gpkg,
+    exists = output_name %in% actual_layers,
+    note = dplyr::case_when(
+      exists ~ "ok",
+      !exists & !is.na(object_n) & object_n == 0 ~ "skipped_empty_ok",
+      TRUE ~ "missing"
+    )
+  ) |>
+  dplyr::select(output_type, output_name, path, exists, note, object_name, object_exists, object_n)
+
+interim_output_check <- dplyr::bind_rows(
+  csv_check,
+  raster_check,
+  gpkg_layer_check
+)
+
+print(interim_output_check)
+
+readr::write_csv(
+  interim_output_check,
+  file.path(interim_csv_dir, "interim_output_check.csv")
+)
+
+missing_required <- interim_output_check |>
+  dplyr::filter(note == "missing")
+
+if (nrow(missing_required) > 0) {
+  warning(
+    "中間出力に不足があります: ",
+    paste(missing_required$output_name, collapse = ", ")
+  )
+}
+```
+
+# 18. compute-macro-isolation-support
+
+**目的**：macro clusterごとに孤立度と集石集中域連続性への寄与度を計算する。
+
+```{r c18_compute_macro_isolation_support, eval=TRUE}
+  compute_ring_stats_one <- function(group_sf, grid_sf, inner_m, outer_m) {
+    outer <- sf::st_buffer(sf::st_geometry(group_sf), outer_m)
+    inner <- sf::st_buffer(sf::st_geometry(group_sf), inner_m)
+    ring <- suppressWarnings(sf::st_difference(outer, inner))
+    ring <- sf::st_make_valid(ring)
+    context <- compute_polygon_context(ring, grid_sf)
+
+    tibble::tibble(
+      macro_cluster_id = group_sf$macro_cluster_id,
+      isolation_ring_inner_m = inner_m,
+      isolation_ring_outer_m = outer_m
+    ) |>
+      dplyr::bind_cols(context)
+  }
+
+  isolation_ring_inner_m <- selected_d_adj_safe_m
+  isolation_ring_outer_m <- max(3 * selected_d_adj_safe_m, 50)
+
+  macro_centroids <- suppressWarnings(sf::st_point_on_surface(macro_group_geometries_interim))
+
+  if (nrow(macro_centroids) >= 2) {
+    macro_dist <- as.matrix(sf::st_distance(macro_centroids))
+    diag(macro_dist) <- NA_real_
+    nearest_macro_distance_m <- apply(macro_dist, 1, min, na.rm = TRUE)
+  } else {
+    nearest_macro_distance_m <- Inf
+  }
+
+  macro_ring_stats <- purrr::map_dfr(
+    seq_len(nrow(macro_group_geometries_interim)),
+    function(i) {
+      compute_ring_stats_one(
+        macro_group_geometries_interim[i, ],
+        grid10,
+        inner_m = isolation_ring_inner_m,
+        outer_m = isolation_ring_outer_m
+      )
+    }
+  )
+
+  macro_support_table <- macro_group_geometries_interim |>
+    sf::st_drop_geometry() |>
+    dplyr::mutate(
+      nearest_macro_distance_m = nearest_macro_distance_m
+    ) |>
+    dplyr::left_join(macro_ring_stats, by = "macro_cluster_id") |>
+    dplyr::mutate(
+      small_size_factor = clamp01_numeric(
+        (dense_cluster_min_n - n_shuseki) /
+          max(dense_cluster_min_n - small_cluster_max_n, 1)
+      ),
+      spacing_factor = clamp01_numeric(
+        nearest_macro_distance_m / max(selected_d_adj_safe_m * 3, 1)
+      ),
+      absence_enclosure_factor = clamp01_numeric(absence_ratio_in_surveyed),
+      surveyed_coverage_factor = clamp01_numeric(surveyed_ratio),
+      isolation_score = clamp01_numeric(
+        small_size_factor *
+          spacing_factor *
+          absence_enclosure_factor *
+          surveyed_coverage_factor
+      ),
+      size_support_factor = clamp01_numeric(
+        (n_shuseki - small_cluster_max_n) /
+          max(dense_cluster_min_n - small_cluster_max_n, 1)
+      ),
+      macro_structure_bonus = dplyr::case_when(
+        macro_group_type == "macro_settlement_complex_candidate" ~ 0.90,
+        macro_group_type == "single_dense_micro_cluster" ~ 0.75,
+        TRUE ~ 0
+      ),
+      cluster_support = clamp01_numeric(
+        pmax(size_support_factor, macro_structure_bonus) *
+          (1 - isolation_score)
+      ),
+      isolated_shuseki_weight = clamp01_numeric(isolation_score)
+    )
+
+  macro_group_geometries_final <- macro_group_geometries_interim |>
+    dplyr::left_join(
+      macro_support_table,
+      by = c(
+        "macro_cluster_id",
+        "micro_group_ids",
+        "n_micro_groups",
+        "n_shuseki",
+        "n_dense_micro_groups",
+        "n_intermediate_micro_groups",
+        "n_small_micro_groups",
+        "macro_group_type",
+        "selected_eps_m",
+        "selected_min_pts",
+        "selected_d_adj_m",
+        "selected_d_adj_safe_m",
+        "macro_hull_buffer_m",
+        "macro_link_max_boundary_distance_m",
+        "macro_nearest_shuseki_link_m",
+        "macro_corridor_width_m"
+      )
+    )
+
+  shuseki_points_final <- shuseki_points_grouped_macro |>
+    dplyr::left_join(
+      macro_support_table |>
+        dplyr::select(
+          macro_cluster_id,
+          macro_group_type,
+          isolation_score,
+          cluster_support,
+          isolated_shuseki_weight
+        ),
+      by = "macro_cluster_id"
+    )
+
+  readr::write_csv(
+    macro_support_table,
+    file.path(final_csv_dir, "final_macro_cluster_support.csv")
+  )
+
+  print(
+    macro_support_table |>
+      dplyr::arrange(dplyr::desc(cluster_support))
+  )
+```
+
+# 19. build-directional-source-barrier-rasters
+
+**目的**：開口source、source strength、absence barrier strengthを作成する。
+
+```{r c19_build_directional_source_barrier_rasters, eval=TRUE}
+required_objects <- c(
+  "macro_group_geometries_final",
+  "macro_support_table",
+  "shuseki_points_final",
+  "template_r",
+  "grid10_status",
+  "presence_binary_r",
+  "absence_binary_r",
+  "no_data_binary_r",
+  "absence_area_r",
+  "surveyed_area_r",
+  "city_area_r",
+  "selected_d_adj_safe_m"
+)
+
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
+
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
+}
+
+base_range_m <- max(
+  base_range_adj_multiplier * selected_d_adj_safe_m,
+  base_range_min_m,
+  na.rm = TRUE
+)
+
+cat("base_range_m:", base_range_m, "\n")
+
+# source strength：macro cluster supportを基本とする。
+macro_sources_final <- macro_group_geometries_final |>
+  dplyr::filter(
+    !is.na(cluster_support),
+    cluster_support > 0.01
+  ) |>
+  dplyr::mutate(
+    source_strength = clamp01_numeric(cluster_support ^ source_strength_power),
+    source_seed_value = pmax(source_strength, source_min_strength)
+  )
+
+if (nrow(macro_sources_final) == 0) {
+  stop("sourceとして使えるmacro clusterがありません。macro_support_tableを確認してください。")
+}
+
+source_seed_strength_r <- terra::rasterize(
+  terra::vect(macro_sources_final),
+  template_r,
+  field = "source_seed_value",
+  fun = "max",
+  background = 0,
+  touches = TRUE
+)
+names(source_seed_strength_r) <- "source_seed_strength"
+
+# supported density：source strengthの診断用。最終スコアには直接加算しない。
+shuseki_points_for_strength <- shuseki_points_final |>
+  dplyr::mutate(
+    point_cluster_support = pmax(
+      tidyr::replace_na(cluster_support, 0),
+      source_min_strength * tidyr::replace_na(as.numeric(cluster_support > 0), 0)
+    ),
+    point_isolated_weight = tidyr::replace_na(isolated_shuseki_weight, 0)
+  )
+
+supported_shuseki_count_r <- terra::rasterize(
+  terra::vect(shuseki_points_for_strength),
+  template_r,
+  field = "point_cluster_support",
+  fun = "sum",
+  background = 0
+)
+names(supported_shuseki_count_r) <- "supported_shuseki_count"
+
+supported_density_raw_r <- focal_sum_circle(
+  supported_shuseki_count_r,
+  source_density_radius_m
+)
+
+supported_density_score_r <- scale01_raster(log1p(supported_density_raw_r))
+names(supported_density_score_r) <- "supported_density_score"
+
+isolated_shuseki_count_r <- terra::rasterize(
+  terra::vect(shuseki_points_for_strength),
+  template_r,
+  field = "point_isolated_weight",
+  fun = "sum",
+  background = 0
+)
+names(isolated_shuseki_count_r) <- "isolated_shuseki_count"
+
+isolated_shuseki_signal_r <- scale01_raster(
+  focal_sum_circle(isolated_shuseki_count_r, source_density_radius_m)
+)
+names(isolated_shuseki_signal_r) <- "isolated_shuseki_signal"
+
+# no_dataに接するsourceセルをopening sourceにする。
+no_data_contact_r <- terra::ifel(
+  focal_max_circle(no_data_binary_r, opening_neighbor_radius_m) > 0,
+  1,
+  0
+)
+names(no_data_contact_r) <- "no_data_contact"
+
+open_source_strength_r <- source_seed_strength_r * no_data_contact_r
+names(open_source_strength_r) <- "open_source_strength"
+
+if (!raster_has_positive(open_source_strength_r)) {
+  warning("no_dataに接するsourceセルがありません。source_seed_strength_rをfallbackとして使います。")
+  open_source_strength_r <- source_seed_strength_r
+  names(open_source_strength_r) <- "open_source_strength"
+}
+
+# ------------------------------------------------------------
+# absenceを internal / external に分ける。
+# ------------------------------------------------------------
+
+macro_internal_context_sf <- macro_sources_final |>
+  dplyr::mutate(internal_context_value = 1) |>
+  sf::st_make_valid()
+
+if (internal_absence_buffer_m > 0) {
+  macro_internal_context_sf <- sf::st_buffer(
+    macro_internal_context_sf,
+    dist = internal_absence_buffer_m
+  )
+}
+
+macro_internal_context_r <- terra::rasterize(
+  terra::vect(macro_internal_context_sf),
+  template_r,
+  field = "internal_context_value",
+  fun = "max",
+  background = 0,
+  touches = TRUE
+)
+names(macro_internal_context_r) <- "macro_internal_context"
+
+internal_macro_absence_r <- terra::ifel(
+  absence_binary_r == 1 & macro_internal_context_r == 1,
+  1,
+  0
+)
+names(internal_macro_absence_r) <- "internal_macro_absence"
+
+external_absence_barrier_r <- terra::ifel(
+  absence_binary_r == 1 & internal_macro_absence_r != 1,
+  1,
+  0
+)
+names(external_absence_barrier_r) <- "external_absence_barrier"
+
+# ------------------------------------------------------------
+# external absence evidence
+# ------------------------------------------------------------
+
+external_absence_area_r <- terra::ifel(
+  external_absence_barrier_r == 1,
+  absence_area_r,
+  0
+)
+names(external_absence_area_r) <- "external_absence_area"
+
+local_external_absence_evidence <- focal_sum_circle(
+  external_absence_area_r,
+  absence_evidence_radius_m
+)
+
+local_surveyed_evidence <- focal_sum_circle(
+  surveyed_area_r,
+  absence_evidence_radius_m
+)
+
+local_surveyed_evidence_safe <- terra::ifel(
+  is.na(local_surveyed_evidence) | local_surveyed_evidence < 1,
+  1,
+  local_surveyed_evidence
+)
+
+external_absence_evidence_r <- terra::clamp(
+  local_external_absence_evidence / local_surveyed_evidence_safe,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(external_absence_evidence_r) <- "external_absence_evidence"
+
+# external absence continuity
+external_absence_continuity_count_r <- focal_sum_circle(
+  external_absence_barrier_r,
+  absence_continuity_radius_m
+)
+
+external_absence_continuity_window_cells <- sum(
+  make_circle_window(template_r, absence_continuity_radius_m),
+  na.rm = TRUE
+)
+
+external_absence_continuity_score_r <- terra::clamp(
+  external_absence_continuity_count_r /
+    max(external_absence_continuity_window_cells, 1),
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(external_absence_continuity_score_r) <- "external_absence_continuity_score"
+
+# external absence shadow：external absence周辺のno_dataに高コスト帯を与える。
+absence_shadow_count_r <- focal_sum_circle(
+  external_absence_barrier_r,
+  absence_shadow_radius_m
+)
+
+absence_shadow_window_cells <- sum(
+  make_circle_window(template_r, absence_shadow_radius_m),
+  na.rm = TRUE
+)
+
+absence_barrier_shadow_r <- terra::clamp(
+  absence_shadow_count_r / max(absence_shadow_window_cells, 1),
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+
+absence_barrier_shadow_r <- terra::ifel(
+  no_data_binary_r == 1,
+  absence_barrier_shadow_r,
+  0
+)
+names(absence_barrier_shadow_r) <- "absence_barrier_shadow"
+
+# ------------------------------------------------------------
+# final barrier strength
+# ------------------------------------------------------------
+
+absence_barrier_strength_r <- terra::clamp(
+  absence_evidence_weight * external_absence_evidence_r +
+    absence_continuity_weight * external_absence_continuity_score_r +
+    absence_shadow_weight * absence_barrier_shadow_r,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+
+# external absenceセル本体は強いbarrier。
+absence_barrier_strength_r <- terra::ifel(
+  external_absence_barrier_r == 1,
+  1,
+  absence_barrier_strength_r
+)
+
+# internal macro absence は弱いbarrierに留める。
+absence_barrier_strength_r <- terra::ifel(
+  internal_macro_absence_r == 1 &
+    external_absence_barrier_r != 1 &
+    absence_barrier_strength_r < internal_absence_barrier_strength,
+  internal_absence_barrier_strength,
+  absence_barrier_strength_r
+)
+
+absence_barrier_strength_r <- terra::clamp(
+  absence_barrier_strength_r,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(absence_barrier_strength_r) <- "absence_barrier_strength"
+
+# ------------------------------------------------------------
+# 伝播可能域
+# ------------------------------------------------------------
+# source + no_data + internal macro absence のみ通過可。
+# external absence は通過不可。
+directional_allowed_r <- terra::ifel(
+  city_area_r > 0 &
+    external_absence_barrier_r != 1 &
+    (
+      no_data_binary_r == 1 |
+        source_seed_strength_r > 0 |
+        internal_macro_absence_r == 1
+    ),
+  1,
+  0
+)
+names(directional_allowed_r) <- "directional_allowed"
+
+summarise_global_layer <- function(r, layer_name) {
+  vals <- terra::values(r, mat = FALSE)
+  vals <- vals[is.finite(vals)]
+
+  if (length(vals) == 0) {
+    return(tibble::tibble(
+      layer = layer_name,
+      min = NA_real_,
+      mean = NA_real_,
+      max = NA_real_,
+      positive_cells = 0
+    ))
+  }
+
+  tibble::tibble(
+    layer = layer_name,
+    min = min(vals, na.rm = TRUE),
+    mean = mean(vals, na.rm = TRUE),
+    max = max(vals, na.rm = TRUE),
+    positive_cells = sum(vals > 0, na.rm = TRUE)
+  )
+}
+
+source_barrier_layers <- list(
+  source_seed_strength = source_seed_strength_r,
+  open_source_strength = open_source_strength_r,
+  supported_density_score = supported_density_score_r,
+  no_data_contact = no_data_contact_r,
+  macro_internal_context = macro_internal_context_r,
+  internal_macro_absence = internal_macro_absence_r,
+  external_absence_barrier = external_absence_barrier_r,
+  external_absence_evidence = external_absence_evidence_r,
+  external_absence_continuity_score = external_absence_continuity_score_r,
+  absence_barrier_shadow = absence_barrier_shadow_r,
+  absence_barrier_strength = absence_barrier_strength_r,
+  directional_allowed = directional_allowed_r
+)
+
+source_barrier_summary <- purrr::imap_dfr(
+  source_barrier_layers,
+  summarise_global_layer
+)
+
+print(source_barrier_summary)
+
+dir.create(final_csv_dir, recursive = TRUE, showWarnings = FALSE)
+
+readr::write_csv(
+  source_barrier_summary,
+  file.path(final_csv_dir, "final_source_barrier_layer_summary.csv")
+)
+```
+
+# 20. build-directional-propagation-score
+
+**目的**：累積コスト型のdirectional propagationにより最終スコアを作成する。
+
+```{r c20_build_directional_propagation_score, eval=TRUE}
+required_objects <- c(
+  "template_r",
+  "open_source_strength_r",
+  "absence_barrier_strength_r",
+  "directional_allowed_r",
+  "modified_unavailable_no_data_r",
+  "prediction_target_binary_r",
+  "base_range_m"
+)
+
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
+
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
+}
+
+if (!exists("artificial_modified_cost_multiplier")) {
+  artificial_modified_cost_multiplier <- 3
+}
+
+run_directional_cost_propagation <- function(
+  template_r,
+  source_strength_r,
+  barrier_strength_r,
+  allowed_r,
+  modified_unavailable_r,
+  base_range_m,
+  grid_cell_size_m,
+  source_range_bonus,
+  source_strength_power,
+  source_min_strength,
+  barrier_cost_multiplier,
+  barrier_strength_power,
+  barrier_vs_source_scale,
+  artificial_modified_cost_multiplier,
+  decay_power,
+  max_normalized_cost,
+  min_range_modifier,
+  neighbor_mode = "queen_8"
+) {
+  n_cells <- terra::ncell(template_r)
+  n_rows <- terra::nrow(template_r)
+  n_cols <- terra::ncol(template_r)
+
+  source_vals <- terra::values(source_strength_r, mat = FALSE)
+  barrier_vals <- terra::values(barrier_strength_r, mat = FALSE)
+  allowed_vals <- terra::values(allowed_r, mat = FALSE)
+  modified_vals <- terra::values(modified_unavailable_r, mat = FALSE)
+
+  source_vals[!is.finite(source_vals)] <- 0
+  barrier_vals[!is.finite(barrier_vals)] <- 0
+  allowed_vals[!is.finite(allowed_vals)] <- 0
+  modified_vals[!is.finite(modified_vals)] <- 0
+
+  allowed_logical <- allowed_vals > 0
+  source_idx <- which(source_vals > 0 & allowed_logical)
+
+  if (length(source_idx) == 0) {
+    stop("伝播開始sourceセルがありません。open_source_strength_rを確認してください。")
+  }
+
+  best_cost <- rep(Inf, n_cells)
+  best_source_strength <- rep(NA_real_, n_cells)
+  best_source_range <- rep(NA_real_, n_cells)
+  visited <- rep(FALSE, n_cells)
+
+  heap_idx <- integer(0)
+  heap_cost <- numeric(0)
+  heap_strength <- numeric(0)
+  heap_range <- numeric(0)
+
+  heap_swap <- function(i, j) {
+    tmp <- heap_idx[i]
+    heap_idx[i] <<- heap_idx[j]
+    heap_idx[j] <<- tmp
+
+    tmp <- heap_cost[i]
+    heap_cost[i] <<- heap_cost[j]
+    heap_cost[j] <<- tmp
+
+    tmp <- heap_strength[i]
+    heap_strength[i] <<- heap_strength[j]
+    heap_strength[j] <<- tmp
+
+    tmp <- heap_range[i]
+    heap_range[i] <<- heap_range[j]
+    heap_range[j] <<- tmp
+  }
+
+  heap_push <- function(idx, cost, strength, source_range) {
+    heap_idx <<- c(heap_idx, idx)
+    heap_cost <<- c(heap_cost, cost)
+    heap_strength <<- c(heap_strength, strength)
+    heap_range <<- c(heap_range, source_range)
+
+    k <- length(heap_idx)
+
+    while (k > 1) {
+      parent <- k %/% 2
+
+      if (heap_cost[parent] <= heap_cost[k]) {
+        break
+      }
+
+      heap_swap(parent, k)
+      k <- parent
+    }
+  }
+
+  heap_pop <- function() {
+    if (length(heap_idx) == 0) {
+      return(NULL)
+    }
+
+    out <- list(
+      idx = heap_idx[1],
+      cost = heap_cost[1],
+      strength = heap_strength[1],
+      source_range = heap_range[1]
+    )
+
+    last <- length(heap_idx)
+
+    if (last == 1) {
+      heap_idx <<- integer(0)
+      heap_cost <<- numeric(0)
+      heap_strength <<- numeric(0)
+      heap_range <<- numeric(0)
+      return(out)
+    }
+
+    heap_idx[1] <<- heap_idx[last]
+    heap_cost[1] <<- heap_cost[last]
+    heap_strength[1] <<- heap_strength[last]
+    heap_range[1] <<- heap_range[last]
+
+    heap_idx <<- heap_idx[-last]
+    heap_cost <<- heap_cost[-last]
+    heap_strength <<- heap_strength[-last]
+    heap_range <<- heap_range[-last]
+
+    k <- 1
+
+    repeat {
+      left <- 2 * k
+      right <- left + 1
+      smallest <- k
+
+      if (left <= length(heap_idx) && heap_cost[left] < heap_cost[smallest]) {
+        smallest <- left
+      }
+
+      if (right <= length(heap_idx) && heap_cost[right] < heap_cost[smallest]) {
+        smallest <- right
+      }
+
+      if (smallest == k) {
+        break
+      }
+
+      heap_swap(k, smallest)
+      k <- smallest
+    }
+
+    out
+  }
+
+  source_strength_clean <- pmax(
+    clamp01_numeric(source_vals[source_idx]),
+    source_min_strength
+  )
+
+  source_range_vals <- base_range_m * (
+    min_range_modifier +
+      (1 - min_range_modifier) * (source_strength_clean ^ source_strength_power)
+  ) * (
+    1 + source_range_bonus * (source_strength_clean ^ source_strength_power)
+  )
+
+  for (i in seq_along(source_idx)) {
+    idx <- source_idx[i]
+    strength <- source_strength_clean[i]
+    source_range <- source_range_vals[i]
+
+    best_cost[idx] <- 0
+    best_source_strength[idx] <- strength
+    best_source_range[idx] <- source_range
+
+    heap_push(idx, 0, strength, source_range)
+  }
+
+  if (neighbor_mode == "rook_4") {
+    neighbor_steps <- tibble::tibble(
+      dr = c(-1L, 1L, 0L, 0L),
+      dc = c(0L, 0L, -1L, 1L),
+      step_m = rep(grid_cell_size_m, 4)
+    )
+  } else {
+    neighbor_steps <- tibble::tibble(
+      dr = c(-1L, -1L, -1L, 0L, 0L, 1L, 1L, 1L),
+      dc = c(-1L, 0L, 1L, -1L, 1L, -1L, 0L, 1L),
+      step_m = c(
+        sqrt(2), 1, sqrt(2), 1, 1, sqrt(2), 1, sqrt(2)
+      ) * grid_cell_size_m
+    )
+  }
+
+  processed_n <- 0L
+
+  repeat {
+    item <- heap_pop()
+
+    if (is.null(item)) {
+      break
+    }
+
+    idx <- item$idx
+
+    if (visited[idx]) {
+      next
+    }
+
+    if (item$cost > best_cost[idx] + 1e-12) {
+      next
+    }
+
+    visited[idx] <- TRUE
+    processed_n <- processed_n + 1L
+
+    if (item$cost >= max_normalized_cost) {
+      next
+    }
+
+    row_i <- ((idx - 1L) %/% n_cols) + 1L
+    col_i <- ((idx - 1L) %% n_cols) + 1L
+
+    for (s in seq_len(nrow(neighbor_steps))) {
+      row_j <- row_i + neighbor_steps$dr[s]
+      col_j <- col_i + neighbor_steps$dc[s]
+
+      if (row_j < 1L || row_j > n_rows || col_j < 1L || col_j > n_cols) {
+        next
+      }
+
+      idx_j <- (row_j - 1L) * n_cols + col_j
+
+      if (!allowed_logical[idx_j] || visited[idx_j]) {
+        next
+      }
+
+      barrier_j <- clamp01_numeric(barrier_vals[idx_j])
+
+      source_barrier_discount <- 1 +
+        barrier_vs_source_scale * clamp01_numeric(item$strength)
+
+      barrier_cost <- 1 +
+        barrier_cost_multiplier *
+        (barrier_j ^ barrier_strength_power) /
+        source_barrier_discount
+
+      artificial_cost <- ifelse(
+        modified_vals[idx_j] > 0,
+        artificial_modified_cost_multiplier,
+        1
+      )
+
+      step_cost <- neighbor_steps$step_m[s] *
+        barrier_cost *
+        artificial_cost
+
+      new_cost <- item$cost + step_cost / item$source_range
+
+      if (new_cost < best_cost[idx_j] && new_cost <= max_normalized_cost) {
+        best_cost[idx_j] <- new_cost
+        best_source_strength[idx_j] <- item$strength
+        best_source_range[idx_j] <- item$source_range
+
+        heap_push(idx_j, new_cost, item$strength, item$source_range)
+      }
+    }
+  }
+
+  normalized_cost_r <- template_r
+  normalized_cost_vals <- best_cost
+  normalized_cost_vals[!is.finite(normalized_cost_vals)] <- NA_real_
+  terra::values(normalized_cost_r) <- normalized_cost_vals
+  names(normalized_cost_r) <- "directional_normalized_cost"
+
+  propagated_source_strength_r <- template_r
+  terra::values(propagated_source_strength_r) <- best_source_strength
+  names(propagated_source_strength_r) <- "directional_source_strength"
+
+  propagated_source_range_r <- template_r
+  terra::values(propagated_source_range_r) <- best_source_range
+  names(propagated_source_range_r) <- "directional_source_range_m"
+
+  cost_clipped <- pmin(best_cost, max_normalized_cost)
+
+  score_vals <- best_source_strength *
+    ((1 - cost_clipped) ^ decay_power)
+
+  score_vals[!is.finite(best_cost)] <- NA_real_
+  score_vals[best_cost > max_normalized_cost] <- NA_real_
+  score_vals <- clamp01_numeric(score_vals)
+
+  score_r <- template_r
+  terra::values(score_r) <- score_vals
+  names(score_r) <- "directional_cluster_continuity_score"
+
+  list(
+    normalized_cost_r = normalized_cost_r,
+    propagated_source_strength_r = propagated_source_strength_r,
+    propagated_source_range_r = propagated_source_range_r,
+    score_r = score_r,
+    processed_n = processed_n,
+    source_n = length(source_idx)
+  )
+}
+
+propagation_result <- run_directional_cost_propagation(
+  template_r = template_r,
+  source_strength_r = open_source_strength_r,
+  barrier_strength_r = absence_barrier_strength_r,
+  allowed_r = directional_allowed_r,
+  modified_unavailable_r = modified_unavailable_no_data_r,
+  base_range_m = base_range_m,
+  grid_cell_size_m = grid_cell_size_m,
+  source_range_bonus = source_range_bonus,
+  source_strength_power = source_strength_power,
+  source_min_strength = source_min_strength,
+  barrier_cost_multiplier = barrier_cost_multiplier,
+  barrier_strength_power = barrier_strength_power,
+  barrier_vs_source_scale = barrier_vs_source_scale,
+  artificial_modified_cost_multiplier = artificial_modified_cost_multiplier,
+  decay_power = decay_power,
+  max_normalized_cost = max_normalized_cost,
+  min_range_modifier = min_range_modifier,
+  neighbor_mode = directional_neighbor_mode
+)
+
+directional_normalized_cost_r <- propagation_result$normalized_cost_r
+directional_source_strength_r <- propagation_result$propagated_source_strength_r
+directional_source_range_m_r <- propagation_result$propagated_source_range_r
+
+directional_cluster_continuity_score_all_cells_r <- propagation_result$score_r
+names(directional_cluster_continuity_score_all_cells_r) <- "directional_cluster_continuity_score_all_cells"
+
+cluster_continuity_score_all_cells_r <- directional_cluster_continuity_score_all_cells_r
+names(cluster_continuity_score_all_cells_r) <- "cluster_continuity_score_all_cells"
+
+# final score は通常no_dataのうち、
+# 人工改変地ではない prediction target のみに出す。
+cluster_continuity_score_prediction_target_r <- terra::ifel(
+  prediction_target_binary_r == 1,
+  cluster_continuity_score_all_cells_r,
+  NA_real_
+)
+names(cluster_continuity_score_prediction_target_r) <- "cluster_continuity_score_prediction_target"
+
+# 既存後続chunkとの互換性のため、従来名も維持する。
+cluster_continuity_score_no_data_only_r <- cluster_continuity_score_prediction_target_r
+names(cluster_continuity_score_no_data_only_r) <- "cluster_continuity_score_no_data_only"
+
+propagation_summary <- tibble::tibble(
+  source_cells = propagation_result$source_n,
+  processed_cells = propagation_result$processed_n,
+  base_range_m = base_range_m,
+  max_normalized_cost = max_normalized_cost,
+  decay_power = decay_power,
+  barrier_cost_multiplier = barrier_cost_multiplier,
+  barrier_strength_power = barrier_strength_power,
+  barrier_vs_source_scale = barrier_vs_source_scale,
+  artificial_modified_cost_multiplier = artificial_modified_cost_multiplier,
+  modified_unavailable_no_data_cells = terra::global(
+    modified_unavailable_no_data_r,
+    "sum",
+    na.rm = TRUE
+  )[1, 1],
+  prediction_target_cells = terra::global(
+    prediction_target_binary_r,
+    "sum",
+    na.rm = TRUE
+  )[1, 1]
+)
+
+print(propagation_summary)
+
+readr::write_csv(
+  propagation_summary,
+  file.path(final_csv_dir, "final_directional_propagation_summary.csv")
+)
+```
+
+# 20b. build-micro-continuity-diagnostic
+
+**目的**：macro clusterではなく、micro cluster単位のsourceから集石分布の連続性を診断用に計算する。
+
+# 20b. build-micro-continuity-diagnostic
+
+**目的**：集石の密集型 continuity と散在型 continuity を分けて、2成分diagnostic scoreを作成する。
+
+```{r c20b_build_micro_continuity_diagnostic, eval=TRUE}
+required_objects <- c(
+  "group_geometries_interim",
+  "template_r",
+  "city_area_r",
+  "no_data_binary_r",
+  "prediction_target_binary_r",
+  "external_absence_barrier_r",
+  "internal_macro_absence_r",
+  "absence_barrier_strength_r",
+  "modified_unavailable_no_data_r",
+  "base_range_m",
+  "selected_d_adj_safe_m",
+  "run_directional_cost_propagation"
+)
+
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
+
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
+}
+
+# ------------------------------------------------------------
+# 2成分diagnostic用パラメータ
+# ------------------------------------------------------------
+# dense:
+#   密集型集石。micro cluster単位の局所的な連続性を重視する。
+# dispersed:
+#   単独と密集の中間的な散在型集石。
+#   小cluster・中間clusterが広い範囲に繰り返し出る状況を評価する。
+
+dense_component_base_range_multiplier <- 0.75
+dispersed_component_base_range_multiplier <- 1.25
+
+dense_component_source_cap <- 1.00
+dispersed_component_source_cap <- 0.55
+
+dense_component_min_strength <- source_min_strength
+dispersed_component_min_strength <- source_min_strength * 0.75
+
+dispersed_context_radius_m <- max(
+  4 * selected_d_adj_safe_m,
+  80,
+  na.rm = TRUE
+)
+
+dispersed_min_context_groups <- 3
+dispersed_min_context_shuseki <- 5
+
+dense_n_weight <- 0.70
+dense_neighbor_weight <- 0.30
+
+dispersed_context_group_weight <- 0.60
+dispersed_context_shuseki_weight <- 0.40
+
+dense_component_base_range_m <- base_range_m * dense_component_base_range_multiplier
+dispersed_component_base_range_m <- base_range_m * dispersed_component_base_range_multiplier
+
+cat("dense_component_base_range_m:", dense_component_base_range_m, "\n")
+cat("dispersed_component_base_range_m:", dispersed_component_base_range_m, "\n")
+cat("dispersed_context_radius_m:", dispersed_context_radius_m, "\n")
+
+# ------------------------------------------------------------
+# micro groupごとの dense / dispersed / isolated 分類
+# ------------------------------------------------------------
+
+component_sources_all <- group_geometries_interim |>
+  sf::st_make_valid() |>
+  dplyr::mutate(
+    group_id = as.character(.data$group_id),
+    n_shuseki_num = as.numeric(.data$n_shuseki),
+    mean_neighbor_count_num = as.numeric(.data$mean_neighbor_count)
+  )
+
+component_sources_all$n_shuseki_num[
+  !is.finite(component_sources_all$n_shuseki_num)
+] <- 0
+
+component_sources_all$mean_neighbor_count_num[
+  !is.finite(component_sources_all$mean_neighbor_count_num)
+] <- 0
+
+component_points <- suppressWarnings(
+  sf::st_point_on_surface(component_sources_all)
+)
+
+within_list <- sf::st_is_within_distance(
+  component_points,
+  component_points,
+  dist = dispersed_context_radius_m
+)
+
+context_group_n <- integer(nrow(component_sources_all))
+context_shuseki_n <- numeric(nrow(component_sources_all))
+
+for (i in seq_len(nrow(component_sources_all))) {
+  idx <- within_list[[i]]
+  idx <- idx[idx != i]
+
+  context_group_n[i] <- length(idx)
+
+  if (length(idx) > 0) {
+    context_shuseki_n[i] <- sum(
+      component_sources_all$n_shuseki_num[idx],
+      na.rm = TRUE
+    )
+  } else {
+    context_shuseki_n[i] <- 0
+  }
+}
+
+component_sources_all$context_group_n <- context_group_n
+component_sources_all$context_shuseki_n <- context_shuseki_n
+
+max_log_n <- max(log1p(component_sources_all$n_shuseki_num), na.rm = TRUE)
+if (!is.finite(max_log_n) || max_log_n <= 0) {
+  max_log_n <- 1
+}
+
+max_neighbor <- max(component_sources_all$mean_neighbor_count_num, na.rm = TRUE)
+if (!is.finite(max_neighbor) || max_neighbor <= 0) {
+  max_neighbor <- 1
+}
+
+max_context_group_n <- max(component_sources_all$context_group_n, na.rm = TRUE)
+if (!is.finite(max_context_group_n) || max_context_group_n <= 0) {
+  max_context_group_n <- 1
+}
+
+max_context_shuseki_n <- max(component_sources_all$context_shuseki_n, na.rm = TRUE)
+if (!is.finite(max_context_shuseki_n) || max_context_shuseki_n <= 0) {
+  max_context_shuseki_n <- 1
+}
+
+component_sources_all <- component_sources_all |>
+  dplyr::mutate(
+    dense_n_score = clamp01_numeric(
+      log1p(n_shuseki_num) / max_log_n
+    ),
+    dense_neighbor_score = clamp01_numeric(
+      mean_neighbor_count_num / max_neighbor
+    ),
+    dense_source_strength = clamp01_numeric(
+      dense_n_weight * dense_n_score +
+        dense_neighbor_weight * dense_neighbor_score
+    ),
+    dense_source_strength = pmin(
+      dense_source_strength,
+      dense_component_source_cap
+    ),
+
+    dispersed_context_group_score = clamp01_numeric(
+      context_group_n / max_context_group_n
+    ),
+    dispersed_context_shuseki_score = clamp01_numeric(
+      context_shuseki_n / max_context_shuseki_n
+    ),
+    dispersed_source_strength = clamp01_numeric(
+      dispersed_context_group_weight * dispersed_context_group_score +
+        dispersed_context_shuseki_weight * dispersed_context_shuseki_score
+    ),
+    dispersed_source_strength = pmin(
+      dispersed_source_strength,
+      dispersed_component_source_cap
+    ),
+
+    shuseki_component_type = dplyr::case_when(
+      interim_group_type == "dense_candidate" ~ "dense",
+      interim_group_type == "intermediate_candidate" ~ "dispersed",
+      interim_group_type == "small_or_isolated_candidate" &
+        (
+          context_group_n >= dispersed_min_context_groups |
+            context_shuseki_n >= dispersed_min_context_shuseki
+        ) ~ "dispersed",
+      TRUE ~ "isolated"
+    ),
+
+    dense_source_seed_value = dplyr::if_else(
+      shuseki_component_type == "dense",
+      pmax(dense_source_strength, dense_component_min_strength),
+      0
+    ),
+
+    dispersed_source_seed_value = dplyr::if_else(
+      shuseki_component_type == "dispersed",
+      pmax(dispersed_source_strength, dispersed_component_min_strength),
+      0
+    )
+  )
+
+shuseki_two_component_source_summary <- component_sources_all |>
+  sf::st_drop_geometry() |>
+  dplyr::select(
+    group_id,
+    n_shuseki,
+    interim_group_type,
+    shuseki_component_type,
+    mean_neighbor_count,
+    context_group_n,
+    context_shuseki_n,
+    dense_n_score,
+    dense_neighbor_score,
+    dense_source_strength,
+    dense_source_seed_value,
+    dispersed_context_group_score,
+    dispersed_context_shuseki_score,
+    dispersed_source_strength,
+    dispersed_source_seed_value
+  ) |>
+  dplyr::arrange(
+    shuseki_component_type,
+    dplyr::desc(n_shuseki)
+  )
+
+print(shuseki_two_component_source_summary)
+
+readr::write_csv(
+  shuseki_two_component_source_summary,
+  file.path(final_csv_dir, "final_shuseki_two_component_source_summary.csv")
+)
+
+# GPKG出力用に保持する。
+shuseki_two_component_sources_final <- component_sources_all
+
+dense_micro_sources_final <- component_sources_all |>
+  dplyr::filter(dense_source_seed_value > 0)
+
+dispersed_micro_sources_final <- component_sources_all |>
+  dplyr::filter(dispersed_source_seed_value > 0)
+
+cat("dense micro sources:", nrow(dense_micro_sources_final), "\n")
+cat("dispersed micro sources:", nrow(dispersed_micro_sources_final), "\n")
+
+# ------------------------------------------------------------
+# component別 propagation helper
+# ------------------------------------------------------------
+
+make_empty_component_rasters <- function(prefix) {
+  zero_r <- template_r
+  terra::values(zero_r) <- 0
+
+  na_r <- template_r
+  terra::values(na_r) <- NA_real_
+
+  list(
+    source_seed_strength_r = {
+      r <- zero_r
+      names(r) <- paste0(prefix, "_micro_source_seed_strength")
+      r
+    },
+    no_data_contact_r = {
+      r <- zero_r
+      names(r) <- paste0(prefix, "_micro_no_data_contact")
+      r
+    },
+    open_source_strength_r = {
+      r <- zero_r
+      names(r) <- paste0(prefix, "_micro_open_source_strength")
+      r
+    },
+    directional_allowed_r = {
+      r <- zero_r
+      names(r) <- paste0(prefix, "_micro_directional_allowed")
+      r
+    },
+    normalized_cost_r = {
+      r <- na_r
+      names(r) <- paste0(prefix, "_micro_directional_normalized_cost")
+      r
+    },
+    source_strength_r = {
+      r <- na_r
+      names(r) <- paste0(prefix, "_micro_directional_source_strength")
+      r
+    },
+    source_range_m_r = {
+      r <- na_r
+      names(r) <- paste0(prefix, "_micro_directional_source_range_m")
+      r
+    },
+    score_all_cells_r = {
+      r <- na_r
+      names(r) <- paste0(prefix, "_micro_cluster_continuity_score_all_cells")
+      r
+    },
+    score_prediction_target_r = {
+      r <- na_r
+      names(r) <- paste0(prefix, "_micro_cluster_continuity_score_prediction_target")
+      r
+    },
+    score_no_data_only_r = {
+      r <- na_r
+      names(r) <- paste0(prefix, "_micro_cluster_continuity_score_no_data_only")
+      r
+    },
+    processed_n = 0L,
+    source_n = 0L
+  )
+}
+
+run_component_continuity <- function(
+  sources_sf,
+  prefix,
+  seed_field,
+  component_base_range_m
+) {
+  if (nrow(sources_sf) == 0) {
+    warning(prefix, " component source が0件です。空のdiagnostic rasterを作成します。")
+    return(make_empty_component_rasters(prefix))
+  }
+
+  source_seed_strength_r <- terra::rasterize(
+    terra::vect(sources_sf),
+    template_r,
+    field = seed_field,
+    fun = "max",
+    background = 0,
+    touches = TRUE
+  )
+  names(source_seed_strength_r) <- paste0(prefix, "_micro_source_seed_strength")
+
+  no_data_contact_r <- terra::ifel(
+    focal_max_circle(no_data_binary_r, opening_neighbor_radius_m) > 0,
+    1,
+    0
+  )
+  names(no_data_contact_r) <- paste0(prefix, "_micro_no_data_contact")
+
+  open_source_strength_r <- source_seed_strength_r * no_data_contact_r
+  names(open_source_strength_r) <- paste0(prefix, "_micro_open_source_strength")
+
+  if (!raster_has_positive(open_source_strength_r)) {
+    warning(prefix, " componentにno_data接触sourceがありません。source_seed_strength_rをfallbackとして使います。")
+    open_source_strength_r <- source_seed_strength_r
+    names(open_source_strength_r) <- paste0(prefix, "_micro_open_source_strength")
+  }
+
+  directional_allowed_r <- terra::ifel(
+    city_area_r > 0 &
+      external_absence_barrier_r != 1 &
+      (
+        no_data_binary_r == 1 |
+          source_seed_strength_r > 0 |
+          internal_macro_absence_r == 1
+      ),
+    1,
+    0
+  )
+  names(directional_allowed_r) <- paste0(prefix, "_micro_directional_allowed")
+
+  result <- run_directional_cost_propagation(
+    template_r = template_r,
+    source_strength_r = open_source_strength_r,
+    barrier_strength_r = absence_barrier_strength_r,
+    allowed_r = directional_allowed_r,
+    modified_unavailable_r = modified_unavailable_no_data_r,
+    base_range_m = component_base_range_m,
+    grid_cell_size_m = grid_cell_size_m,
+    source_range_bonus = source_range_bonus,
+    source_strength_power = source_strength_power,
+    source_min_strength = source_min_strength,
+    barrier_cost_multiplier = barrier_cost_multiplier,
+    barrier_strength_power = barrier_strength_power,
+    barrier_vs_source_scale = barrier_vs_source_scale,
+    artificial_modified_cost_multiplier = artificial_modified_cost_multiplier,
+    decay_power = decay_power,
+    max_normalized_cost = max_normalized_cost,
+    min_range_modifier = min_range_modifier,
+    neighbor_mode = directional_neighbor_mode
+  )
+
+  normalized_cost_r <- result$normalized_cost_r
+  names(normalized_cost_r) <- paste0(prefix, "_micro_directional_normalized_cost")
+
+  source_strength_r <- result$propagated_source_strength_r
+  names(source_strength_r) <- paste0(prefix, "_micro_directional_source_strength")
+
+  source_range_m_r <- result$propagated_source_range_r
+  names(source_range_m_r) <- paste0(prefix, "_micro_directional_source_range_m")
+
+  score_all_cells_r <- result$score_r
+  names(score_all_cells_r) <- paste0(prefix, "_micro_cluster_continuity_score_all_cells")
+
+  score_prediction_target_r <- terra::ifel(
+    prediction_target_binary_r == 1,
+    score_all_cells_r,
+    NA_real_
+  )
+  names(score_prediction_target_r) <- paste0(prefix, "_micro_cluster_continuity_score_prediction_target")
+
+  score_no_data_only_r <- score_prediction_target_r
+  names(score_no_data_only_r) <- paste0(prefix, "_micro_cluster_continuity_score_no_data_only")
+
+  list(
+    source_seed_strength_r = source_seed_strength_r,
+    no_data_contact_r = no_data_contact_r,
+    open_source_strength_r = open_source_strength_r,
+    directional_allowed_r = directional_allowed_r,
+    normalized_cost_r = normalized_cost_r,
+    source_strength_r = source_strength_r,
+    source_range_m_r = source_range_m_r,
+    score_all_cells_r = score_all_cells_r,
+    score_prediction_target_r = score_prediction_target_r,
+    score_no_data_only_r = score_no_data_only_r,
+    processed_n = result$processed_n,
+    source_n = result$source_n
+  )
+}
+
+# ------------------------------------------------------------
+# dense / dispersed component propagation
+# ------------------------------------------------------------
+
+dense_component_result <- run_component_continuity(
+  sources_sf = dense_micro_sources_final,
+  prefix = "dense",
+  seed_field = "dense_source_seed_value",
+  component_base_range_m = dense_component_base_range_m
+)
+
+dispersed_component_result <- run_component_continuity(
+  sources_sf = dispersed_micro_sources_final,
+  prefix = "dispersed",
+  seed_field = "dispersed_source_seed_value",
+  component_base_range_m = dispersed_component_base_range_m
+)
+
+dense_micro_source_seed_strength_r <- dense_component_result$source_seed_strength_r
+dense_micro_no_data_contact_r <- dense_component_result$no_data_contact_r
+dense_micro_open_source_strength_r <- dense_component_result$open_source_strength_r
+dense_micro_directional_allowed_r <- dense_component_result$directional_allowed_r
+dense_micro_directional_normalized_cost_r <- dense_component_result$normalized_cost_r
+dense_micro_directional_source_strength_r <- dense_component_result$source_strength_r
+dense_micro_directional_source_range_m_r <- dense_component_result$source_range_m_r
+dense_micro_cluster_continuity_score_all_cells_r <- dense_component_result$score_all_cells_r
+dense_micro_cluster_continuity_score_prediction_target_r <- dense_component_result$score_prediction_target_r
+dense_micro_cluster_continuity_score_no_data_only_r <- dense_component_result$score_no_data_only_r
+
+dispersed_micro_source_seed_strength_r <- dispersed_component_result$source_seed_strength_r
+dispersed_micro_no_data_contact_r <- dispersed_component_result$no_data_contact_r
+dispersed_micro_open_source_strength_r <- dispersed_component_result$open_source_strength_r
+dispersed_micro_directional_allowed_r <- dispersed_component_result$directional_allowed_r
+dispersed_micro_directional_normalized_cost_r <- dispersed_component_result$normalized_cost_r
+dispersed_micro_directional_source_strength_r <- dispersed_component_result$source_strength_r
+dispersed_micro_directional_source_range_m_r <- dispersed_component_result$source_range_m_r
+dispersed_micro_cluster_continuity_score_all_cells_r <- dispersed_component_result$score_all_cells_r
+dispersed_micro_cluster_continuity_score_prediction_target_r <- dispersed_component_result$score_prediction_target_r
+dispersed_micro_cluster_continuity_score_no_data_only_r <- dispersed_component_result$score_no_data_only_r
+
+# ------------------------------------------------------------
+# 2成分の合成diagnostic
+# ------------------------------------------------------------
+# 合成値はfinal score本体ではなく、dense / dispersed のどちらが優勢かを見る診断用。
+# 1 = dense優勢、2 = dispersed優勢
+
+dense_score_zero_r <- terra::ifel(
+  is.na(dense_micro_cluster_continuity_score_no_data_only_r),
+  0,
+  dense_micro_cluster_continuity_score_no_data_only_r
+)
+
+dispersed_score_zero_r <- terra::ifel(
+  is.na(dispersed_micro_cluster_continuity_score_no_data_only_r),
+  0,
+  dispersed_micro_cluster_continuity_score_no_data_only_r
+)
+
+shuseki_two_component_score_no_data_only_r <- terra::ifel(
+  prediction_target_binary_r == 1,
+  terra::ifel(
+    dense_score_zero_r >= dispersed_score_zero_r,
+    dense_score_zero_r,
+    dispersed_score_zero_r
+  ),
+  NA_real_
+)
+names(shuseki_two_component_score_no_data_only_r) <- "shuseki_two_component_score_no_data_only"
+
+shuseki_two_component_dominant_component_r <- terra::ifel(
+  prediction_target_binary_r == 1 &
+    (
+      dense_score_zero_r > 0 |
+        dispersed_score_zero_r > 0
+    ),
+  terra::ifel(
+    dense_score_zero_r >= dispersed_score_zero_r,
+    1,
+    2
+  ),
+  NA_real_
+)
+names(shuseki_two_component_dominant_component_r) <- "shuseki_two_component_dominant_component"
+
+shuseki_two_component_score_summary <- tibble::tibble(
+  component = c("dense", "dispersed"),
+  source_groups = c(
+    nrow(dense_micro_sources_final),
+    nrow(dispersed_micro_sources_final)
+  ),
+  source_cells = c(
+    dense_component_result$source_n,
+    dispersed_component_result$source_n
+  ),
+  processed_cells = c(
+    dense_component_result$processed_n,
+    dispersed_component_result$processed_n
+  ),
+  base_range_m = c(
+    dense_component_base_range_m,
+    dispersed_component_base_range_m
+  ),
+  source_cap = c(
+    dense_component_source_cap,
+    dispersed_component_source_cap
+  )
+)
+
+print(shuseki_two_component_score_summary)
+
+readr::write_csv(
+  shuseki_two_component_score_summary,
+  file.path(final_csv_dir, "final_shuseki_two_component_score_summary.csv")
+)
+```
+
+# 21. directional-score-diagnostics
+
+**目的**：directional modelの構成ラスタと最終スコアを数値診断する。
+
+```{r c21_directional_score_diagnostics, eval=TRUE}
+score_layers <- list(
+  source_seed_strength = source_seed_strength_r,
+  open_source_strength = open_source_strength_r,
+  no_data_contact = no_data_contact_r,
+  supported_density_score = supported_density_score_r,
+  isolated_shuseki_signal = isolated_shuseki_signal_r,
+
+  macro_internal_context = macro_internal_context_r,
+  internal_macro_absence = internal_macro_absence_r,
+  external_absence_barrier = external_absence_barrier_r,
+  external_absence_evidence = external_absence_evidence_r,
+  external_absence_continuity_score = external_absence_continuity_score_r,
+  absence_barrier_shadow = absence_barrier_shadow_r,
+  absence_barrier_strength = absence_barrier_strength_r,
+
+  artificial_modified_binary = artificial_modified_binary_r,
+  artificial_modified_ratio = artificial_modified_ratio_r,
+  modified_unavailable_no_data = modified_unavailable_no_data_r,
+  prediction_target_binary = prediction_target_binary_r,
+
+  directional_allowed = directional_allowed_r,
+  directional_normalized_cost = directional_normalized_cost_r,
+  directional_source_strength = directional_source_strength_r,
+  directional_source_range_m = directional_source_range_m_r,
+  cluster_continuity_score_all_cells = cluster_continuity_score_all_cells_r,
+  cluster_continuity_score_no_data_only = cluster_continuity_score_no_data_only_r
+)
+
+optional_component_rasters <- c(
+  dense_micro_source_seed_strength = "dense_micro_source_seed_strength_r",
+  dense_micro_no_data_contact = "dense_micro_no_data_contact_r",
+  dense_micro_open_source_strength = "dense_micro_open_source_strength_r",
+  dense_micro_directional_allowed = "dense_micro_directional_allowed_r",
+  dense_micro_directional_normalized_cost = "dense_micro_directional_normalized_cost_r",
+  dense_micro_directional_source_strength = "dense_micro_directional_source_strength_r",
+  dense_micro_directional_source_range_m = "dense_micro_directional_source_range_m_r",
+  dense_micro_cluster_continuity_score_all_cells = "dense_micro_cluster_continuity_score_all_cells_r",
+  dense_micro_cluster_continuity_score_prediction_target = "dense_micro_cluster_continuity_score_prediction_target_r",
+  dense_micro_cluster_continuity_score_no_data_only = "dense_micro_cluster_continuity_score_no_data_only_r",
+
+  dispersed_micro_source_seed_strength = "dispersed_micro_source_seed_strength_r",
+  dispersed_micro_no_data_contact = "dispersed_micro_no_data_contact_r",
+  dispersed_micro_open_source_strength = "dispersed_micro_open_source_strength_r",
+  dispersed_micro_directional_allowed = "dispersed_micro_directional_allowed_r",
+  dispersed_micro_directional_normalized_cost = "dispersed_micro_directional_normalized_cost_r",
+  dispersed_micro_directional_source_strength = "dispersed_micro_directional_source_strength_r",
+  dispersed_micro_directional_source_range_m = "dispersed_micro_directional_source_range_m_r",
+  dispersed_micro_cluster_continuity_score_all_cells = "dispersed_micro_cluster_continuity_score_all_cells_r",
+  dispersed_micro_cluster_continuity_score_prediction_target = "dispersed_micro_cluster_continuity_score_prediction_target_r",
+  dispersed_micro_cluster_continuity_score_no_data_only = "dispersed_micro_cluster_continuity_score_no_data_only_r",
+
+  shuseki_two_component_score_no_data_only = "shuseki_two_component_score_no_data_only_r",
+  shuseki_two_component_dominant_component = "shuseki_two_component_dominant_component_r"
+)
+
+for (nm in names(optional_component_rasters)) {
+  obj_name <- optional_component_rasters[[nm]]
+
+  if (exists(obj_name)) {
+    score_layers[[nm]] <- get(obj_name)
+  }
+}
+
+summarise_raster_values <- function(r, layer_name) {
+  vals <- terra::values(r, mat = FALSE)
+  vals <- vals[is.finite(vals)]
+
+  if (length(vals) == 0) {
+    return(tibble::tibble(
+      layer = layer_name,
+      n = 0,
+      n_positive = 0,
+      min = NA_real_,
+      q25 = NA_real_,
+      median = NA_real_,
+      q75 = NA_real_,
+      q95 = NA_real_,
+      max = NA_real_
+    ))
+  }
+
+  tibble::tibble(
+    layer = layer_name,
+    n = length(vals),
+    n_positive = sum(vals > 0, na.rm = TRUE),
+    min = min(vals, na.rm = TRUE),
+    q25 = as.numeric(stats::quantile(vals, 0.25, na.rm = TRUE)),
+    median = stats::median(vals, na.rm = TRUE),
+    q75 = as.numeric(stats::quantile(vals, 0.75, na.rm = TRUE)),
+    q95 = as.numeric(stats::quantile(vals, 0.95, na.rm = TRUE)),
+    max = max(vals, na.rm = TRUE)
+  )
+}
+
+final_directional_score_diagnostics <- purrr::imap_dfr(
+  score_layers,
+  summarise_raster_values
+)
+
+print(final_directional_score_diagnostics)
+
+readr::write_csv(
+  final_directional_score_diagnostics,
+  file.path(final_csv_dir, "final_directional_score_diagnostics.csv")
+)
+
+final_directional_parameters <- dplyr::bind_rows(
+  analysis_parameter_table |>
+    dplyr::transmute(
+      group,
+      parameter,
+      value = as.character(value),
+      meaning
+    ),
+  tibble::tibble(
+    group = "runtime",
+    parameter = "selected_d_adj_safe_m",
+    value = as.character(selected_d_adj_safe_m),
+    meaning = "DBSCAN候補から求めた代表的隣接距離"
+  ),
+  tibble::tibble(
+    group = "runtime",
+    parameter = "base_range_m",
+    value = as.character(base_range_m),
+    meaning = "selected_d_adj_safe_mとbase_range_min_mから計算した基本到達距離"
+  ),
+  tibble::tibble(
+    group = "runtime",
+    parameter = "dense_component_base_range_m",
+    value = ifelse(
+      exists("dense_component_base_range_m"),
+      as.character(dense_component_base_range_m),
+      NA_character_
+    ),
+    meaning = "dense component diagnostic用の基本到達距離"
+  ),
+  tibble::tibble(
+    group = "runtime",
+    parameter = "dispersed_component_base_range_m",
+    value = ifelse(
+      exists("dispersed_component_base_range_m"),
+      as.character(dispersed_component_base_range_m),
+      NA_character_
+    ),
+    meaning = "dispersed component diagnostic用の基本到達距離"
+  ),
+  tibble::tibble(
+    group = "runtime",
+    parameter = "dispersed_context_radius_m",
+    value = ifelse(
+      exists("dispersed_context_radius_m"),
+      as.character(dispersed_context_radius_m),
+      NA_character_
+    ),
+    meaning = "dispersed component判定に用いるmicro group近傍半径"
+  )
+)
+
+readr::write_csv(
+  final_directional_parameters,
+  file.path(final_csv_dir, "final_directional_parameters.csv")
+)
+```
+
+# 22. export-final-rasters
+
+**目的**：final成果ラスタをGeoTIFFとして出力する。
+
+```{r c22_export_final_rasters, eval=TRUE}
+dir.create(final_raster_dir, recursive = TRUE, showWarnings = FALSE)
+
+raster_outputs <- list(
+  source_seed_strength = source_seed_strength_r,
+  open_source_strength = open_source_strength_r,
+  no_data_contact = no_data_contact_r,
+  supported_density_score = supported_density_score_r,
+  isolated_shuseki_signal = isolated_shuseki_signal_r,
+
+  macro_internal_context = macro_internal_context_r,
+  internal_macro_absence = internal_macro_absence_r,
+  external_absence_barrier = external_absence_barrier_r,
+  external_absence_evidence = external_absence_evidence_r,
+  external_absence_continuity_score = external_absence_continuity_score_r,
+  absence_barrier_shadow = absence_barrier_shadow_r,
+  absence_barrier_strength = absence_barrier_strength_r,
+
+  artificial_modified_binary = artificial_modified_binary_r,
+  artificial_modified_area_m2 = artificial_modified_area_r,
+  artificial_modified_ratio = artificial_modified_ratio_r,
+  modified_unavailable_no_data = modified_unavailable_no_data_r,
+  prediction_target_binary = prediction_target_binary_r,
+
+  directional_allowed = directional_allowed_r,
+  directional_normalized_cost = directional_normalized_cost_r,
+  directional_source_strength = directional_source_strength_r,
+  directional_source_range_m = directional_source_range_m_r,
+
+  cluster_continuity_score_all_cells = cluster_continuity_score_all_cells_r,
+  cluster_continuity_score_prediction_target = cluster_continuity_score_prediction_target_r,
+  cluster_continuity_score_no_data_only = cluster_continuity_score_no_data_only_r
+)
+
+optional_component_rasters <- c(
+  dense_micro_source_seed_strength = "dense_micro_source_seed_strength_r",
+  dense_micro_no_data_contact = "dense_micro_no_data_contact_r",
+  dense_micro_open_source_strength = "dense_micro_open_source_strength_r",
+  dense_micro_directional_allowed = "dense_micro_directional_allowed_r",
+  dense_micro_directional_normalized_cost = "dense_micro_directional_normalized_cost_r",
+  dense_micro_directional_source_strength = "dense_micro_directional_source_strength_r",
+  dense_micro_directional_source_range_m = "dense_micro_directional_source_range_m_r",
+  dense_micro_cluster_continuity_score_all_cells = "dense_micro_cluster_continuity_score_all_cells_r",
+  dense_micro_cluster_continuity_score_prediction_target = "dense_micro_cluster_continuity_score_prediction_target_r",
+  dense_micro_cluster_continuity_score_no_data_only = "dense_micro_cluster_continuity_score_no_data_only_r",
+
+  dispersed_micro_source_seed_strength = "dispersed_micro_source_seed_strength_r",
+  dispersed_micro_no_data_contact = "dispersed_micro_no_data_contact_r",
+  dispersed_micro_open_source_strength = "dispersed_micro_open_source_strength_r",
+  dispersed_micro_directional_allowed = "dispersed_micro_directional_allowed_r",
+  dispersed_micro_directional_normalized_cost = "dispersed_micro_directional_normalized_cost_r",
+  dispersed_micro_directional_source_strength = "dispersed_micro_directional_source_strength_r",
+  dispersed_micro_directional_source_range_m = "dispersed_micro_directional_source_range_m_r",
+  dispersed_micro_cluster_continuity_score_all_cells = "dispersed_micro_cluster_continuity_score_all_cells_r",
+  dispersed_micro_cluster_continuity_score_prediction_target = "dispersed_micro_cluster_continuity_score_prediction_target_r",
+  dispersed_micro_cluster_continuity_score_no_data_only = "dispersed_micro_cluster_continuity_score_no_data_only_r",
+
+  shuseki_two_component_score_no_data_only = "shuseki_two_component_score_no_data_only_r",
+  shuseki_two_component_dominant_component = "shuseki_two_component_dominant_component_r"
+)
+
+for (nm in names(optional_component_rasters)) {
+  obj_name <- optional_component_rasters[[nm]]
+
+  if (exists(obj_name)) {
+    raster_outputs[[nm]] <- get(obj_name)
+  }
+}
+
+for (nm in names(raster_outputs)) {
+  out_path <- file.path(
+    final_raster_dir,
+    paste0("final_", nm, ".tif")
+  )
+
+  terra::writeRaster(
+    raster_outputs[[nm]],
+    out_path,
+    overwrite = TRUE
+  )
+
+  cat("raster written:", out_path, "\n")
+}
+
+expected_final_rasters <- paste0("final_", names(raster_outputs), ".tif")
+
+final_raster_check <- tibble::tibble(
+  file = expected_final_rasters,
+  path = file.path(final_raster_dir, expected_final_rasters),
+  exists = file.exists(file.path(final_raster_dir, expected_final_rasters))
+)
+
+print(final_raster_check)
+
+readr::write_csv(
+  final_raster_check,
+  file.path(final_csv_dir, "final_raster_output_check.csv")
+)
+```
+
+# 23. export-final-gpkg
+
+**目的**：interimとfinal成果をGeoPackageにまとめる。
+
+```{r c23_export_final_gpkg, eval=TRUE}
+if (file.exists(final_gpkg)) {
+  unlink(final_gpkg)
+}
+
+# interimレイヤも同じGPKGに再出力する。
+write_gpkg_layer_safe(shuseki_points_grouped_macro, final_gpkg, "interim_shuseki_points_grouped")
+write_gpkg_layer_safe(group_geometries_interim, final_gpkg, "interim_shuseki_group_geometries")
+write_gpkg_layer_safe(macro_group_geometries_interim, final_gpkg, "interim_shuseki_macro_cluster_geometries")
+write_gpkg_layer_safe(macro_cluster_link_edges, final_gpkg, "interim_shuseki_macro_cluster_link_edges")
+write_gpkg_layer_safe(internal_void_candidates, final_gpkg, "interim_shuseki_internal_void_candidates")
+write_gpkg_layer_safe(
+  grid10_status |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      shuseki_count,
+      surveyed_ratio,
+      surveyed_area_m2,
+      cell_area_m2
+    ),
+  final_gpkg,
+  "interim_shuseki_grid_status"
+)
+
+# finalレイヤ。
+write_gpkg_layer_safe(shuseki_points_final, final_gpkg, "final_shuseki_points_with_support")
+write_gpkg_layer_safe(macro_group_geometries_final, final_gpkg, "final_shuseki_macro_cluster_isolation_support")
+
+if (exists("shuseki_two_component_sources_final")) {
+  write_gpkg_layer_safe(
+    shuseki_two_component_sources_final,
+    final_gpkg,
+    "final_shuseki_two_component_micro_sources"
+  )
+}
+
+if (exists("dense_micro_sources_final")) {
+  write_gpkg_layer_safe(
+    dense_micro_sources_final,
+    final_gpkg,
+    "final_shuseki_dense_micro_sources"
+  )
+}
+
+if (exists("dispersed_micro_sources_final")) {
+  write_gpkg_layer_safe(
+    dispersed_micro_sources_final,
+    final_gpkg,
+    "final_shuseki_dispersed_micro_sources"
+  )
+}
+
+if (exists("micro_sources_final")) {
+  write_gpkg_layer_safe(
+    micro_sources_final,
+    final_gpkg,
+    "final_shuseki_micro_cluster_sources"
+  )
+}
+
+final_grid_extract_points <- suppressWarnings(sf::st_point_on_surface(grid10))
+
+extract_one_final_raster <- function(r, value_name) {
+  r_tmp <- r
+  names(r_tmp) <- value_name
+  values_tmp <- terra::extract(
+    r_tmp,
+    terra::vect(final_grid_extract_points),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  values_tmp <- values_tmp[, 1, drop = FALSE]
+  names(values_tmp) <- value_name
+  values_tmp
+}
+
+final_grid_values <- dplyr::bind_cols(
+  extract_one_final_raster(
+    cluster_continuity_score_no_data_only_r,
+    "cluster_continuity_score_no_data_only"
+  ),
+  extract_one_final_raster(
+    cluster_continuity_score_all_cells_r,
+    "cluster_continuity_score_all_cells"
+  ),
+  extract_one_final_raster(
+    directional_normalized_cost_r,
+    "directional_normalized_cost"
+  ),
+  extract_one_final_raster(
+    directional_source_strength_r,
+    "directional_source_strength"
+  ),
+  extract_one_final_raster(
+    absence_barrier_strength_r,
+    "absence_barrier_strength"
+  ),
+  extract_one_final_raster(
+    artificial_modified_binary_r,
+    "artificial_modified_binary"
+  ),
+  extract_one_final_raster(
+    artificial_modified_ratio_r,
+    "artificial_modified_ratio"
+  ),
+  extract_one_final_raster(
+    modified_unavailable_no_data_r,
+    "modified_unavailable_no_data"
+  ),
+  extract_one_final_raster(
+    prediction_target_binary_r,
+    "prediction_target_binary"
+  ),
+  extract_one_final_raster(
+    isolated_shuseki_signal_r,
+    "isolated_shuseki_signal"
+  )
+)
+
+if (exists("micro_cluster_continuity_score_no_data_only_r")) {
+  micro_grid_values <- dplyr::bind_cols(
+    extract_one_final_raster(
+      micro_cluster_continuity_score_no_data_only_r,
+      "micro_cluster_continuity_score_no_data_only"
+    ),
+    extract_one_final_raster(
+      micro_cluster_continuity_score_all_cells_r,
+      "micro_cluster_continuity_score_all_cells"
+    ),
+    extract_one_final_raster(
+      micro_directional_normalized_cost_r,
+      "micro_directional_normalized_cost"
+    ),
+    extract_one_final_raster(
+      micro_directional_source_strength_r,
+      "micro_directional_source_strength"
+    ),
+    extract_one_final_raster(
+      micro_source_seed_strength_r,
+      "micro_source_seed_strength"
+    )
+  )
+
+  final_grid_values <- dplyr::bind_cols(
+    final_grid_values,
+    micro_grid_values
+  )
+}
+
+final_score_grid <- dplyr::bind_cols(
+  grid10 |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      shuseki_count,
+      surveyed_ratio
+    ),
+  final_grid_values
+)
+
+if (exists("shuseki_two_component_score_no_data_only_r")) {
+  component_grid_values <- dplyr::bind_cols(
+    extract_one_final_raster(
+      dense_micro_cluster_continuity_score_no_data_only_r,
+      "dense_micro_cluster_continuity_score_no_data_only"
+    ),
+    extract_one_final_raster(
+      dispersed_micro_cluster_continuity_score_no_data_only_r,
+      "dispersed_micro_cluster_continuity_score_no_data_only"
+    ),
+    extract_one_final_raster(
+      shuseki_two_component_score_no_data_only_r,
+      "shuseki_two_component_score_no_data_only"
+    ),
+    extract_one_final_raster(
+      shuseki_two_component_dominant_component_r,
+      "shuseki_two_component_dominant_component"
+    ),
+    extract_one_final_raster(
+      dense_micro_directional_normalized_cost_r,
+      "dense_micro_directional_normalized_cost"
+    ),
+    extract_one_final_raster(
+      dispersed_micro_directional_normalized_cost_r,
+      "dispersed_micro_directional_normalized_cost"
+    ),
+    extract_one_final_raster(
+      dense_micro_source_seed_strength_r,
+      "dense_micro_source_seed_strength"
+    ),
+    extract_one_final_raster(
+      dispersed_micro_source_seed_strength_r,
+      "dispersed_micro_source_seed_strength"
+    )
+  )
+
+  final_grid_values <- dplyr::bind_cols(
+    final_grid_values,
+    component_grid_values
+  )
+}
+
+final_score_grid_no_data <- final_score_grid |>
+  dplyr::filter(
+    cell_status == "no_data",
+    !is.na(cluster_continuity_score_no_data_only)
+  )
+
+write_gpkg_layer_safe(
+  final_score_grid_no_data,
+  final_gpkg,
+  "final_shuseki_directional_continuity_grid_no_data"
+)
+
+if (nrow(final_score_grid_no_data) > 0) {
+  high_score_threshold <- stats::quantile(
+    final_score_grid_no_data$cluster_continuity_score_no_data_only,
+    0.95,
+    na.rm = TRUE
+  )
+
+  final_score_grid_no_data_high <- final_score_grid_no_data |>
+    dplyr::filter(
+      cluster_continuity_score_no_data_only >= high_score_threshold
+    )
+
+  write_gpkg_layer_safe(
+    final_score_grid_no_data_high,
+    final_gpkg,
+    "final_shuseki_directional_continuity_grid_no_data_top5pct"
+  )
+}
+
+if ("micro_cluster_continuity_score_no_data_only" %in% names(final_score_grid)) {
+  final_micro_score_grid_no_data <- final_score_grid |>
+    dplyr::filter(
+      cell_status == "no_data",
+      !is.na(micro_cluster_continuity_score_no_data_only)
+    )
+
+  write_gpkg_layer_safe(
+    final_micro_score_grid_no_data,
+    final_gpkg,
+    "final_shuseki_micro_continuity_grid_no_data"
+  )
+
+  if (nrow(final_micro_score_grid_no_data) > 0) {
+    micro_high_score_threshold <- stats::quantile(
+      final_micro_score_grid_no_data$micro_cluster_continuity_score_no_data_only,
+      0.95,
+      na.rm = TRUE
+    )
+
+    final_micro_score_grid_no_data_high <- final_micro_score_grid_no_data |>
+      dplyr::filter(
+        micro_cluster_continuity_score_no_data_only >= micro_high_score_threshold
+      )
+
+    write_gpkg_layer_safe(
+      final_micro_score_grid_no_data_high,
+      final_gpkg,
+      "final_shuseki_micro_continuity_grid_no_data_top5pct"
+    )
+  }
+}
+
+if ("shuseki_two_component_score_no_data_only" %in% names(final_score_grid)) {
+  final_two_component_grid_no_data <- final_score_grid |>
+    dplyr::filter(
+      cell_status == "no_data",
+      !is.na(shuseki_two_component_score_no_data_only)
+    )
+
+  write_gpkg_layer_safe(
+    final_two_component_grid_no_data,
+    final_gpkg,
+    "final_shuseki_two_component_grid_no_data"
+  )
+
+  if (nrow(final_two_component_grid_no_data) > 0) {
+    two_component_high_score_threshold <- stats::quantile(
+      final_two_component_grid_no_data$shuseki_two_component_score_no_data_only,
+      0.95,
+      na.rm = TRUE
+    )
+
+    final_two_component_grid_no_data_high <- final_two_component_grid_no_data |>
+      dplyr::filter(
+        shuseki_two_component_score_no_data_only >= two_component_high_score_threshold
+      )
+
+    write_gpkg_layer_safe(
+      final_two_component_grid_no_data_high,
+      final_gpkg,
+      "final_shuseki_two_component_grid_no_data_top5pct"
+    )
+  }
+}
+
+cat("final gpkg:", final_gpkg, "\n")
+```
+
+# 24. final-summaries
+
+**目的**：final成果の要約CSVを出力する。
+
+```{r c24_final_summaries, eval=TRUE}
+if (!exists("final_score_grid_no_data")) {
+  stop("final_score_grid_no_data が存在しません。export-final-gpkg chunkを確認してください。")
+}
+
+final_no_data_summary <- final_score_grid_no_data |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    n_no_data_cells = dplyr::n(),
+    score_min = min(cluster_continuity_score_no_data_only, na.rm = TRUE),
+    score_q25 = stats::quantile(cluster_continuity_score_no_data_only, 0.25, na.rm = TRUE),
+    score_median = stats::median(cluster_continuity_score_no_data_only, na.rm = TRUE),
+    score_q75 = stats::quantile(cluster_continuity_score_no_data_only, 0.75, na.rm = TRUE),
+    score_q95 = stats::quantile(cluster_continuity_score_no_data_only, 0.95, na.rm = TRUE),
+    score_max = max(cluster_continuity_score_no_data_only, na.rm = TRUE),
+    cost_median = stats::median(directional_normalized_cost, na.rm = TRUE),
+    barrier_median = stats::median(absence_barrier_strength, na.rm = TRUE)
+  )
+
+print(final_no_data_summary)
+readr::write_csv(
+  final_no_data_summary,
+  file.path(final_csv_dir, "final_no_data_score_summary.csv")
+)
+
+final_macro_support_summary <- macro_support_table |>
+  dplyr::summarise(
+    n_macro_clusters = dplyr::n(),
+    cluster_support_min = min(cluster_support, na.rm = TRUE),
+    cluster_support_median = stats::median(cluster_support, na.rm = TRUE),
+    cluster_support_max = max(cluster_support, na.rm = TRUE),
+    isolation_score_median = stats::median(isolation_score, na.rm = TRUE)
+  )
+
+print(final_macro_support_summary)
+readr::write_csv(
+  final_macro_support_summary,
+  file.path(final_csv_dir, "final_macro_support_summary.csv")
+)
+```
+
+# 25. chunk-list
+
+**目的**：Rmd内のchunk一覧を出力する。
+
+```{r c25_chunk_list, eval=TRUE}
+chunk_index <- tibble::tribble(
+  ~no, ~chunk, ~section, ~purpose,
+  1, "c01_setup", "setup", "解析に必要なパッケージと共通関数を準備する。",
+  2, "c02_paths", "paths", "入力データと出力先フォルダを定義する。",
+  3, "c03_analysis_parameters", "analysis-parameters", "directional model用の解析パラメータを定義する。",
+  4, "c04_download_data", "download-data", "必要な入力GPKGがローカルにない場合に取得する。",
+  5, "c05_read_data", "read-data", "GPKGから集石点、調査区、市域ポリゴンを読み込む。",
+  6, "c06_create_analysis_grid", "create-analysis-grid", "市域内に10mグリッドとラスタテンプレートを作成する。",
+  7, "c07_assign_grid_response", "assign-grid-response", "各10mセルにpresence、absence、no_dataを付与する。",
+  8, "c08_rasterize_status_layers", "rasterize-status-layers", "presence、absence、no_data、surveyed areaをラスタ化する。",
+  8, "c08b_rasterize_artificial_modified_land", "rasterize_artificial_modified_land", "GSI人工地形分類 code=11001 を、score対象外・通過可能高cost領域としてラスタ化する。",
+  9, "c09_local_context_rasters", "local-context-rasters", "interim確認用のabsence penalty と open no_data scoreを作成する。",
+  10, "c10_shuseki_neighbor_distances", "shuseki-neighbor-distances", "集石間距離を計算し、micro cluster候補パラメータを作る。",
+  11, "c11_parameter_sweep_clustering", "parameter-sweep-clustering", "DBSCAN候補パラメータを評価する。",
+  12, "c12_select_candidate_parameters", "select-candidate-parameters", "候補パラメータからselected_eps_m、selected_min_pts、selected_d_adj_mを定義する。",
+  13, "c13_build_interim_micro_cluster_layers", "build-interim-micro-cluster-layers", "選択パラメータで集石点をmicro clusterに分類する。",
+  14, "c14_build_interim_macro_cluster_groups", "build-interim-macro-cluster-groups", "micro cluster間関係からmacro clusterを作成する。",
+  15, "c15_export_interim_rasters", "export-interim-rasters", "中間確認用ラスタをGeoTIFFとして出力する。",
+  16, "c16_export_interim_gpkg_layers", "export-interim-gpkg-layers", "中間確認用ベクタレイヤをGPKGに出力する。",
+  17, "c17_check_interim_outputs", "check-interim-outputs", "interim出力の過不足を確認する。",
+  18, "c18_compute_macro_isolation_support", "compute-macro-isolation-support", "macro clusterごとに孤立度と集石集中域連続性への寄与度を計算する。",
+  19, "c19_build_directional_source_barrier_rasters", "build-directional-source-barrier-rasters", "開口source、source strength、absence barrier strengthを作成する。",
+  20, "c20_build_directional_propagation_score", "build-directional-propagation-score","累積コスト型のdirectional propagationにより最終スコアを作成する。",
+  20, "c20b_build_micro_continuity_diagnostic", "build-micro-continuity-diagnostic", "累積コスト型のdirectional propagationにより最終スコアを作成する。",
+  21, "c21_directional_score_diagnostics", "directional-score-diagnostics", "directional modelの構成ラスタと最終スコアを数値診断する。",
+  22, "c22_export_final_rasters", "export-final-rasters", "final成果ラスタをGeoTIFFとして出力する。",
+  23, "c23_export_final_gpkg", "export-final-gpkg", "interimとfinal成果をGeoPackageにまとめる。",
+  24, "c24_final_summaries", "final-summaries", "final成果の要約CSVを出力する。",
+  25, "c25_chunk_list", "chunk-list", "Rmd内のchunk一覧を出力する。"
+)
+
+print(chunk_index)
+
+if (exists("final_csv_dir")) {
+  readr::write_csv(
+    chunk_index,
+    file.path(final_csv_dir, "rmd_chunk_list.csv")
+  )
+}
+```
+

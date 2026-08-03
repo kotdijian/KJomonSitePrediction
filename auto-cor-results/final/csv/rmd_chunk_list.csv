@@ -7,6 +7,7 @@ no,chunk,section,purpose
 6,c06_create_analysis_grid,create-analysis-grid,市域内に10mグリッドとラスタテンプレートを作成する。
 7,c07_assign_grid_response,assign-grid-response,各10mセルにpresence、absence、no_dataを付与する。
 8,c08_rasterize_status_layers,rasterize-status-layers,presence、absence、no_data、surveyed areaをラスタ化する。
+8,c08b_rasterize_artificial_modified_land,rasterize_artificial_modified_land,GSI人工地形分類 code=11001 を、score対象外・通過可能高cost領域としてラスタ化する。
 9,c09_local_context_rasters,local-context-rasters,interim確認用のabsence penalty と open no_data scoreを作成する。
 10,c10_dwelling_neighbor_distances,dwelling-neighbor-distances,住居間距離を計算し、micro cluster候補パラメータを作る。
 11,c11_parameter_sweep_clustering,parameter-sweep-clustering,DBSCAN候補パラメータを評価する。

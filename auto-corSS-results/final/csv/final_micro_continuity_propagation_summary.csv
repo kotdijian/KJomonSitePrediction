@@ -1,0 +1,2 @@
+source_cells,processed_cells,micro_base_range_m,micro_base_range_multiplier,micro_dense_group_weight,micro_intermediate_group_weight,micro_small_group_weight,micro_n_weight,micro_neighbor_weight,max_normalized_cost,decay_power
+866,2216,60.110730622713504,0.75,1,0.65,0.25,0.7,0.3,1,2

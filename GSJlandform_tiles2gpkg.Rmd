@@ -163,6 +163,11 @@ request_sleep_sec <- 0.03
 # 対象範囲でクリップするか。
 clip_to_target_area <- TRUE
 
+use_bbox_as_target_area <- TRUE # TRUEにすると、指定ベクタレイヤの実形状ではなく、その外接矩形 bbox を対象範囲として使用する。
+#   TRUE  : bbox範囲でタイル取得し、bbox範囲でclipして保存
+#   FALSE : bbox範囲でタイル取得し、元のベクタ形状でclipして保存
+
+
 # 出力サマリCSV。
 summary_csv_path <- file.path(
   dirname(output_gpkg_path),
@@ -280,20 +285,43 @@ if (is.na(sf::st_crs(target_area))) {
 target_area <- target_area |>
   safe_st_make_valid()
 
-target_area_union <- sf::st_sf(
+target_area_union_original <- sf::st_sf(
   target_id = 1L,
   geometry = sf::st_union(sf::st_geometry(target_area))
 ) |>
   safe_st_make_valid()
+
+target_crs <- sf::st_crs(target_area)
+
+# 指定ベクタレイヤのbboxを作成する。
+target_bbox_sfc <- target_area_union_original |>
+  sf::st_transform(4326) |>
+  sf::st_bbox() |>
+  sf::st_as_sfc()
+
+target_bbox_area_4326 <- sf::st_sf(
+  target_id = 1L,
+  geometry = target_bbox_sfc
+)
+
+# use_bbox_as_target_area = TRUE の場合、
+# 以後の取得範囲・clip範囲をbboxポリゴンに置き換える。
+if (isTRUE(use_bbox_as_target_area)) {
+  target_area_union <- target_bbox_area_4326 |>
+    sf::st_transform(target_crs) |>
+    safe_st_make_valid()
+} else {
+  target_area_union <- target_area_union_original |>
+    safe_st_make_valid()
+}
 
 target_area_4326 <- target_area_union |>
   sf::st_transform(4326)
 
 target_bbox_4326 <- sf::st_bbox(target_area_4326)
 
-target_crs <- sf::st_crs(target_area)
-
 cat("target CRS:", target_crs$input, "\n")
+cat("use_bbox_as_target_area:", use_bbox_as_target_area, "\n")
 print(target_bbox_4326)
 ```
 
@@ -474,8 +502,13 @@ fetch_one_landform_source <- function(source_key, layer_name, url_template) {
       safe_st_make_valid()
   }
 
+  # dplyr::filter() 内ではパイプの . が使えない場合があるため、
+  # 空ジオメトリの除外は sf オブジェクトに対する通常の行サブセットで行う。
+  empty_geometry <- sf::st_is_empty(sf::st_geometry(landform_sf))
+
+  landform_sf <- landform_sf[!empty_geometry, , drop = FALSE]
+
   landform_sf <- landform_sf |>
-    dplyr::filter(!sf::st_is_empty(sf::st_geometry(.))) |>
     dplyr::mutate(
       gpkg_layer = layer_name
     )
@@ -707,12 +740,218 @@ print(layer_check)
 print(summary_table)
 ```
 
-# c08_chunk-list
+# c08_add-landform-legend-fields
+
+**目的**：取得済みの国土地理院地形分類レイヤに、code対応の凡例名を追加する。
+**達成指標**：output_gpkg_path に以下の新規レイヤが作成される。
+    - gsi_landform_natural_labeled
+    - gsi_landform_artificial_labeled
+**注意**：QGIS等で対象GPKGを開いたままだと書き込みに失敗することがあるため、実行前にQGIS側でGPKGを閉じる。
+
+```{r c08_add-landform-legend-fields, eval=TRUE}
+
+if (!exists("output_gpkg_path")) {
+  output_gpkg_path <- "data_raw/Kokubunji_Jomon.gpkg"
+}
+
+input_layer_natural <- "gsi_landform_natural"
+input_layer_artificial <- "gsi_landform_artificial"
+
+output_layer_natural_labeled <- "gsi_landform_natural_labeled"
+output_layer_artificial_labeled <- "gsi_landform_artificial_labeled"
+
+# FALSE：元レイヤを残し、*_labeled レイヤを新規作成する。
+# TRUE ：元レイヤ名に上書きする。
+replace_original_layers <- FALSE
+
+# 国土地理院「ベクトルタイル 地形分類」の凡例対応表に基づく対応表。
+# landform_class は、地理院地図でまとめて表示される凡例区分。
+landform_code_lookup_grouped <- tibble::tribble(
+  ~landform_class, ~landform_group_for_model, ~code_list,
+  "山地斜面等", "slope_mountain", "10101,11201,11202,11203,11204,1010101",
+  "崖･段丘崖", "scarp_terrace_edge", "10202,10204,2010201",
+  "地すべり地形", "landslide", "10205,10206",
+  "台地・段丘", "upland_terrace", "10301,10302,10303,10304,10305,10306,10307,10308,10310,10312,10314,10508,2010101",
+  "山麓堆積地形", "footslope_deposit", "10401,10402,10403,10404,10406,10407,3010101",
+  "扇状地", "fan", "10501,10502,3020101",
+  "自然堤防", "natural_levee", "10503,3040101",
+  "天井川等", "raised_river", "10506,10507,10801",
+  "砂州・砂丘", "sand_bar_dune", "10504,10505,10512,3050101",
+  "凹地・浅い谷", "shallow_valley_depression", "10601,2010301",
+  "氾濫平野・海岸平野", "floodplain_coastal_plain", "10701,10702,10705,3030101",
+  "後背低地・湿地", "backmarsh_wetland", "10703,10804,3030201",
+  "旧河道", "abandoned_channel", "10704,3040201,3040202",
+  "落堀", "crevasse_splay_scour", "3040301",
+  "河川敷・浜", "riverbed_beach", "10802,10803,10807,10808",
+  "水部", "water", "10805,10806,10901,10903,5010201",
+  "旧水部", "former_water", "10904,5010301",
+  "切土地", "cut_land", "11001,11003,11009,11011,4010301",
+  "農耕平坦化地", "agricultural_leveling", "11002",
+  "干拓地", "reclaimed_land", "11008,4010101",
+  "盛土地・埋立地", "fill_reclaimed_land", "11004,11005,11006,11007,11014,4010201",
+  "改変工事中", "under_modification", "11010"
+)
+
+landform_code_lookup <- landform_code_lookup_grouped |>
+  tidyr::separate_rows(code_list, sep = "\\s*,\\s*") |>
+  dplyr::transmute(
+    code_chr = as.character(code_list),
+    landform_class = landform_class,
+    landform_group_for_model = landform_group_for_model
+  )
+
+safe_delete_gpkg_layer <- function(gpkg_path, layer_name) {
+  if (!file.exists(gpkg_path)) {
+    return(invisible(FALSE))
+  }
+
+  existing_layers <- tryCatch(
+    sf::st_layers(gpkg_path)$name,
+    error = function(e) character()
+  )
+
+  if (layer_name %in% existing_layers) {
+    sf::st_delete(
+      dsn = gpkg_path,
+      layer = layer_name,
+      quiet = TRUE
+    )
+    return(invisible(TRUE))
+  }
+
+  invisible(FALSE)
+}
+
+add_landform_legend_fields <- function(gpkg_path, input_layer, output_layer) {
+  if (!file.exists(gpkg_path)) {
+    stop("GPKGが見つかりません: ", gpkg_path)
+  }
+
+  existing_layers <- sf::st_layers(gpkg_path)$name
+
+  if (!input_layer %in% existing_layers) {
+    stop(
+      "入力レイヤが見つかりません: ", input_layer,
+      "\n利用可能レイヤ: ", paste(existing_layers, collapse = ", ")
+    )
+  }
+
+  x <- sf::st_read(
+    gpkg_path,
+    layer = input_layer,
+    quiet = TRUE,
+    stringsAsFactors = FALSE
+  )
+
+  code_col <- names(x)[tolower(names(x)) == "code"][1]
+
+  if (is.na(code_col)) {
+    stop("code列が見つかりません: ", input_layer)
+  }
+
+  x_attr <- x |>
+    dplyr::mutate(
+      code_chr = as.character(.data[[code_col]])
+    ) |>
+    dplyr::left_join(
+      landform_code_lookup,
+      by = "code_chr"
+    ) |>
+    dplyr::mutate(
+      landform_class = dplyr::if_else(
+        is.na(landform_class),
+        paste0("未対応コード_", code_chr),
+        landform_class
+      ),
+      landform_group_for_model = dplyr::if_else(
+        is.na(landform_group_for_model),
+        "unknown",
+        landform_group_for_model
+      )
+    )
+
+  unmatched_codes <- x_attr |>
+    sf::st_drop_geometry() |>
+    dplyr::filter(grepl("^未対応コード_", landform_class)) |>
+    dplyr::distinct(code_chr) |>
+    dplyr::arrange(code_chr)
+
+  if (nrow(unmatched_codes) > 0) {
+    warning(
+      "凡例対応表にないcodeがあります: ",
+      paste(unmatched_codes$code_chr, collapse = ", ")
+    )
+  }
+
+  if (replace_original_layers) {
+    output_layer <- input_layer
+  }
+
+  safe_delete_gpkg_layer(gpkg_path, output_layer)
+
+  sf::st_write(
+    x_attr,
+    dsn = gpkg_path,
+    layer = output_layer,
+    quiet = TRUE
+  )
+
+  summary_tbl <- x_attr |>
+    sf::st_drop_geometry() |>
+    dplyr::count(
+      landform_class,
+      landform_group_for_model,
+      name = "feature_count"
+    ) |>
+    dplyr::arrange(
+      dplyr::desc(feature_count),
+      landform_class
+    )
+
+  message("出力: ", output_layer, " / ", gpkg_path)
+  print(summary_tbl)
+
+  invisible(summary_tbl)
+}
+
+summary_natural_labeled <- add_landform_legend_fields(
+  gpkg_path = output_gpkg_path,
+  input_layer = input_layer_natural,
+  output_layer = output_layer_natural_labeled
+)
+
+summary_artificial_labeled <- add_landform_legend_fields(
+  gpkg_path = output_gpkg_path,
+  input_layer = input_layer_artificial,
+  output_layer = output_layer_artificial_labeled
+)
+
+landform_legend_summary <- dplyr::bind_rows(
+  summary_natural_labeled |>
+    dplyr::mutate(source_layer = input_layer_natural),
+  summary_artificial_labeled |>
+    dplyr::mutate(source_layer = input_layer_artificial)
+)
+
+legend_summary_csv <- file.path(
+  dirname(output_gpkg_path),
+  "gsi_landform_legend_summary.csv"
+)
+
+readr::write_csv(
+  landform_legend_summary,
+  legend_summary_csv
+)
+
+cat("legend summary CSV:", legend_summary_csv, "\n")
+```
+
+# c09_chunk-list
 
 **目的**：このRmdに含まれるchunkを一覧化する。  
 **達成指標**：処理順と各chunkの役割が確認できる。
 
-```{r c08_chunk-list, eval=TRUE}
+```{r c09_chunk-list, eval=TRUE}
 chunk_list <- tibble::tribble(
   ~chunk, ~purpose,
   "c01_setup", "必要パッケージと共通関数を準備する。",
@@ -722,7 +961,8 @@ chunk_list <- tibble::tribble(
   "c05_fetch-landform-tiles", "国土地理院GeoJSONタイルを取得し、対象範囲に統合する。",
   "c06_write-gpkg-layers", "取得した地形分類をGPKGレイヤとして保存する。",
   "c07_write-summary", "取得・保存結果のCSVとGPKGレイヤ確認表を作成する。",
-  "c08_chunk-list", "chunk一覧を表示する。"
+  "c08_add-landform-legend-fields", "取得済みの国土地理院地形分類レイヤに、code対応の凡例名を追加する。",
+  "c09_chunk-list", "chunk一覧を表示する。"
 )
 
 print(chunk_list)
@@ -739,4 +979,5 @@ print(chunk_list)
 | 05 | `c05_fetch-landform-tiles` | 国土地理院GeoJSONタイルを取得し、対象範囲に統合する。 |
 | 06 | `c06_write-gpkg-layers` | 取得した地形分類をGPKGレイヤとして保存する。 |
 | 07 | `c07_write-summary` | 取得・保存結果のCSVとGPKGレイヤ確認表を作成する。 |
-| 08 | `c08_chunk-list` | chunk一覧を表示する。 |
+| 08 | `c08_chunk-list` | 取得済みの国土地理院地形分類レイヤに、code対応の凡例名を追加する。 |
+| 09 | `c09_chunk-list` | chunk一覧を表示する。 |
