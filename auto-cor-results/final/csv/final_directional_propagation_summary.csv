@@ -1,0 +1,2 @@
+source_cells,processed_cells,base_range_m,max_normalized_cost,decay_power,barrier_cost_multiplier,absence_cell_extra_cost
+424,3115,80,1,2,3,5

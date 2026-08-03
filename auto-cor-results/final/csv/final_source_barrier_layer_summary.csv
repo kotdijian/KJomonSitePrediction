@@ -1,0 +1,8 @@
+layer,min,mean,max
+source_seed_strength,0,0.002367009632224168,1
+open_source_strength,0,0.0019337419731465266,1
+supported_density_score,0,0.003445984617170731,1
+absence_evidence,0,0.06558635982957092,1
+absence_continuity_score,0,0.01930892106791616,1
+absence_barrier_strength,0,0.05218495129607397,1
+directional_allowed,0,0.5285226941039113,1

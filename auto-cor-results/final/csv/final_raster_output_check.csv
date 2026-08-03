@@ -1,0 +1,15 @@
+file,path,exists
+final_source_seed_strength.tif,auto-cor-results/final/raster/final_source_seed_strength.tif,TRUE
+final_open_source_strength.tif,auto-cor-results/final/raster/final_open_source_strength.tif,TRUE
+final_no_data_contact.tif,auto-cor-results/final/raster/final_no_data_contact.tif,TRUE
+final_supported_density_score.tif,auto-cor-results/final/raster/final_supported_density_score.tif,TRUE
+final_isolated_dwelling_signal.tif,auto-cor-results/final/raster/final_isolated_dwelling_signal.tif,TRUE
+final_absence_evidence.tif,auto-cor-results/final/raster/final_absence_evidence.tif,TRUE
+final_absence_continuity_score.tif,auto-cor-results/final/raster/final_absence_continuity_score.tif,TRUE
+final_absence_barrier_strength.tif,auto-cor-results/final/raster/final_absence_barrier_strength.tif,TRUE
+final_directional_allowed.tif,auto-cor-results/final/raster/final_directional_allowed.tif,TRUE
+final_directional_normalized_cost.tif,auto-cor-results/final/raster/final_directional_normalized_cost.tif,TRUE
+final_directional_source_strength.tif,auto-cor-results/final/raster/final_directional_source_strength.tif,TRUE
+final_directional_source_range_m.tif,auto-cor-results/final/raster/final_directional_source_range_m.tif,TRUE
+final_cluster_continuity_score_all_cells.tif,auto-cor-results/final/raster/final_cluster_continuity_score_all_cells.tif,TRUE
+final_cluster_continuity_score_no_data_only.tif,auto-cor-results/final/raster/final_cluster_continuity_score_no_data_only.tif,TRUE

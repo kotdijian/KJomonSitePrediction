@@ -1,5 +1,5 @@
 ---
-title: "Structure Autocorrelation Model with Micro/Macro Cluster Validation"
+title: "Structure Autocorrelation Model: Directional Presence-Absence-NoData Propagation"
 author: "Atsushi NOGUCHI / ChatGPT"
 date: "`r Sys.Date()`"
 output:
@@ -11,23 +11,22 @@ output:
 
 # 目的と基本方針
 
-このRmdは、縄文住居跡の既知分布から、未調査範囲へ構造的に連続する可能性を評価する自己相関モデルである。  
-DEM等の地形情報は使用せず、住居点、調査区、調査済み非検出範囲、未調査範囲のみを用いる。
+このRmdは、縄文住居跡の既知分布から、未調査範囲へ構造的に連続する可能性を評価する自己相関モデルである。DEM等の地形情報は使用せず、住居点、調査区、調査済み非検出範囲、未調査範囲のみを用いる。
 
-本Rmdでは、以下の3段階を明確に分ける。
+本版では、手動ゲートを設けず、`interim` と `final` を一括して再生成する。最終モデルは、presenceの自己相関強度、no_dataへの開口方向、absenceの広さ・連続性による遮断を、累積コスト型の距離減衰に統合する。
 
-1. **micro cluster**：住居点の局所的な密集単位を抽出する。
-2. **macro cluster**：複数のmicro clusterが、広場・内部空白域を挟みつつ、環状・馬蹄形・弧状の集落構造を形成している可能性を評価する。
-3. **final continuous score**：検証ゲートを通過した場合のみ、macro clusterを基準として連続量の自己相関スコアを作成する。
+中心的な設計原理は以下である。
 
-初回実行時は `proceed_to_final_model <- FALSE` とし、`interim` の検証結果をQGISで確認してから final モデルへ進む。
+1. presence / macro cluster が no_data に接する方向だけを positive source とする。
+2. absence は局所的な掛け算減衰ではなく、source から no_data へ向かう累積コストとして扱う。
+3. absence の効果は、absence領域の広さ・連続性と source strength の比較で決まる。
+4. 累積コストを用いるため、一度低下した positive score が外周で再上昇する双峰的ピークを避ける。
 
-# setup
+# 01. setup
 
-**目的**：解析に必要なパッケージと共通関数を準備する。  
-**達成指標**：必要パッケージが読み込まれ、共通関数が利用可能になる。
+**目的**：解析に必要なパッケージと共通関数を準備する。
 
-```{r setup, message=FALSE, warning=FALSE}
+```{r c01_setup, eval=TRUE, message=FALSE, warning=FALSE}
 required_pkgs <- c(
   "sf", "terra", "dplyr", "tidyr", "purrr", "tibble",
   "readr", "ggplot2", "dbscan"
@@ -150,14 +149,30 @@ write_gpkg_layer_safe <- function(x, dsn, layer) {
   message("出力: ", layer, " / ", dsn)
   invisible(NULL)
 }
+
+focal_max_circle <- function(r, radius_m) {
+  w <- make_circle_window(r, radius_m)
+  terra::focal(
+    r,
+    w = w,
+    fun = "max",
+    na.policy = "all",
+    fillvalue = 0,
+    na.rm = TRUE
+  )
+}
+
+raster_has_positive <- function(r) {
+  x <- terra::global(r, "max", na.rm = TRUE)[1, 1]
+  is.finite(x) && x > 0
+}
 ```
 
-# paths
+# 02. paths
 
-**目的**：入力データと出力先フォルダを定義する。  
-**達成指標**：`auto-cor-results/interim` と `auto-cor-results/final` 以下に必要なサブフォルダが作成される。
+**目的**：入力データと出力先フォルダを定義する。
 
-```{r paths}
+```{r c02_paths, eval=TRUE}
 raw_dir <- "data_raw"
 
 results_dir <- "auto-cor-results"
@@ -194,39 +209,83 @@ cat("final_dir:", final_dir, "\n")
 cat("final_gpkg:", final_gpkg, "\n")
 ```
 
-# analysis-parameters
+# 03. analysis-parameters
 
-**目的**：解析パラメータと検証ゲートを設定する。  
-**達成指標**：孤立候補、密集候補、グリッドサイズ、final実行可否が明示される。
+**目的**：directional model用の解析パラメータを定義する。
 
-```{r analysis-parameters}
+```{r c03_analysis_parameters, eval=TRUE}
 grid_cell_size_m <- 10
 surveyed_ratio_min_for_absence <- 0.25
 
 small_cluster_max_n <- 2
 dense_cluster_min_n <- 5
 
-# 初回はFALSEとし、中間検証後にTRUEへ変更する。
-proceed_to_final_model <- TRUE
+# source強度：presence自己相関・密集度・macro supportをpositive sourceの強さに反映する。
+source_density_radius_m <- 50
+source_strength_power <- 1.25
+source_range_bonus <- 0.75
+source_min_strength <- 0.05
 
-# final scoreの重み。final実行時のみ使用する。
-weight_supported_cluster_proximity <- 0.35
-weight_supported_density <- 0.30
-weight_effective_open_no_data <- 0.20
-weight_absence_penalty <- 0.35
+# 開口方向：macro/presence sourceがno_dataへ接する境界だけを伝播開始点にする。
+opening_neighbor_radius_m <- 15
 
-cat("grid_cell_size_m:", grid_cell_size_m, "\n")
-cat("small_cluster_max_n:", small_cluster_max_n, "\n")
-cat("dense_cluster_min_n:", dense_cluster_min_n, "\n")
-cat("proceed_to_final_model:", proceed_to_final_model, "\n")
+# 距離減衰：selected_d_adj_mから実行時にbase_range_mを計算する。
+base_range_min_m <- 80
+base_range_adj_multiplier <- 3
+decay_power <- 2
+
+# absence遮断：absenceの広さ・連続性を累積コストに変換する。
+absence_evidence_radius_m <- 50
+absence_continuity_radius_m <- 80
+absence_evidence_weight <- 0.70
+absence_continuity_weight <- 0.30
+barrier_strength_power <- 1.50
+barrier_cost_multiplier <- 8
+absence_cell_extra_cost <- 4
+
+# sourceとbarrierの比較：sourceが強い場合は遮断を相対的に弱める。
+barrier_vs_source_scale <- 0.35
+min_range_modifier <- 0.15
+max_normalized_cost <- 1.0
+directional_neighbor_mode <- "queen_8"
+monotonic_decay_enforce <- TRUE
+
+analysis_parameter_table <- tibble::tribble(
+  ~group, ~parameter, ~value, ~meaning,
+  "basic", "grid_cell_size_m", grid_cell_size_m, "解析グリッド解像度",
+  "basic", "surveyed_ratio_min_for_absence", surveyed_ratio_min_for_absence, "absenceセル判定に必要な最小調査済み面積比",
+  "cluster", "small_cluster_max_n", small_cluster_max_n, "小規模・孤立候補とする最大住居数",
+  "cluster", "dense_cluster_min_n", dense_cluster_min_n, "密集cluster候補とする最小住居数",
+  "source_strength", "source_density_radius_m", source_density_radius_m, "presence自己相関・局所密度の評価半径",
+  "source_strength", "source_strength_power", source_strength_power, "source strengthの非線形強調",
+  "source_strength", "source_range_bonus", source_range_bonus, "source strengthによる到達距離の増分",
+  "source_strength", "source_min_strength", source_min_strength, "伝播source strengthの下限",
+  "opening", "opening_neighbor_radius_m", opening_neighbor_radius_m, "no_dataに接するsource境界の判定半径",
+  "distance_decay", "base_range_min_m", base_range_min_m, "positive値の最小基本到達距離",
+  "distance_decay", "base_range_adj_multiplier", base_range_adj_multiplier, "selected_d_adj_mに対する到達距離倍率",
+  "distance_decay", "decay_power", decay_power, "距離減衰曲線の指数",
+  "absence_barrier", "absence_evidence_radius_m", absence_evidence_radius_m, "absence evidenceの局所評価半径",
+  "absence_barrier", "absence_continuity_radius_m", absence_continuity_radius_m, "absence領域の広さ・連続性評価半径",
+  "absence_barrier", "absence_evidence_weight", absence_evidence_weight, "barrier strengthにおけるabsence evidence重み",
+  "absence_barrier", "absence_continuity_weight", absence_continuity_weight, "barrier strengthにおけるabsence連続性重み",
+  "absence_barrier", "barrier_strength_power", barrier_strength_power, "absence遮断の非線形強調",
+  "absence_barrier", "barrier_cost_multiplier", barrier_cost_multiplier, "barrier strengthを累積コストへ変換する倍率",
+  "absence_barrier", "absence_cell_extra_cost", absence_cell_extra_cost, "absenceセル通過時の追加コスト",
+  "source_barrier_comparison", "barrier_vs_source_scale", barrier_vs_source_scale, "source strengthとbarrier strengthの比較尺度",
+  "source_barrier_comparison", "min_range_modifier", min_range_modifier, "source strengthが低い場合の最小到達距離比",
+  "propagation", "max_normalized_cost", max_normalized_cost, "この値を超える伝播を停止する正規化コスト",
+  "propagation", "directional_neighbor_mode", directional_neighbor_mode, "伝播近傍設定",
+  "propagation", "monotonic_decay_enforce", monotonic_decay_enforce, "累積コストにより外周再上昇を防ぐ"
+)
+
+print(analysis_parameter_table)
 ```
 
-# download-data
+# 04. download-data
 
-**目的**：必要な入力GPKGがローカルにない場合に取得する。  
-**達成指標**：`Kokubunji_Jomon.gpkg` が `data_raw` に存在する。
+**目的**：必要な入力GPKGがローカルにない場合に取得する。
 
-```{r download-data}
+```{r c04_download_data, eval=TRUE}
 if (!file.exists(gpkg_path)) {
   cat("GPKGをダウンロードします。\n")
   utils::download.file(
@@ -244,12 +303,11 @@ if (!file.exists(gpkg_path)) {
 file.info(gpkg_path)
 ```
 
-# read-data
+# 05. read-data
 
-**目的**：GPKGから住居点、調査区、市域ポリゴンを読み込む。  
-**達成指標**：`dwelling_points`、`trench_polygon`、`city_boundary` が同一CRSで作成される。
+**目的**：GPKGから住居点、調査区、市域ポリゴンを読み込む。
 
-```{r read-data}
+```{r c05_read_data, eval=TRUE}
 gpkg_layers <- sf::st_layers(gpkg_path)$name
 print(gpkg_layers)
 
@@ -298,12 +356,11 @@ cat("trench polygons:", nrow(trench_polygon), "\n")
 cat("city boundary features:", nrow(city_boundary), "\n")
 ```
 
-# create-analysis-grid
+# 06. create-analysis-grid
 
-**目的**：市域内に10mグリッドとラスタテンプレートを作成する。  
-**達成指標**：`grid10` と `template_r` が作成され、市域外セルが除外される。
+**目的**：市域内に10mグリッドとラスタテンプレートを作成する。
 
-```{r create-analysis-grid}
+```{r c06_create_analysis_grid, eval=TRUE}
 city_bbox <- sf::st_bbox(city_boundary)
 
 template_r <- terra::rast(
@@ -349,12 +406,11 @@ cat("grid cells:", nrow(grid10), "\n")
 summary(grid10$cell_area_m2)
 ```
 
-# assign-grid-response
+# 07. assign-grid-response
 
-**目的**：各10mセルに、住居検出、調査済み非検出、未調査の状態を付与する。  
-**達成指標**：`response` と `cell_status` が付与され、presence/absence/no_dataの件数が集計される。
+**目的**：各10mセルにpresence、absence、no_dataを付与する。
 
-```{r assign-grid-response}
+```{r c07_assign_grid_response, eval=TRUE}
 surveyed_union <- sf::st_sf(
   surveyed_dummy = 1L,
   geometry = sf::st_union(sf::st_geometry(trench_polygon)),
@@ -436,12 +492,11 @@ readr::write_csv(
 )
 ```
 
-# rasterize-status-layers
+# 08. rasterize-status-layers
 
-**目的**：presence、absence、no_data、surveyed areaをラスタ化する。  
-**達成指標**：状態別の面積ラスタとフラグラスタが作成される。
+**目的**：presence、absence、no_data、surveyed areaをラスタ化する。
 
-```{r rasterize-status-layers}
+```{r c08_rasterize_status_layers, eval=TRUE}
 grid10_status <- grid10 |>
   dplyr::mutate(
     presence_flag = dplyr::if_else(cell_status == "presence", 1, 0),
@@ -485,12 +540,11 @@ cat("absence cells:", sum(grid10_status$absence_flag), "\n")
 cat("no_data cells:", sum(grid10_status$no_data_flag), "\n")
 ```
 
-# local-context-rasters
+# 09. local-context-rasters
 
-**目的**：absence penalty と open no_data score を計算する。  
-**達成指標**：中間検証用ラスタ `absence_penalty_50m_r` と `open_no_data_score_100m_r` が作成される。
+**目的**：interim確認用のabsence penalty と open no_data scoreを作成する。
 
-```{r local-context-rasters}
+```{r c09_local_context_rasters, eval=TRUE}
 local_absence_50m <- focal_sum_circle(absence_area_r, 50)
 local_surveyed_50m <- focal_sum_circle(surveyed_area_r, 50)
 local_surveyed_50m_safe <- terra::ifel(
@@ -532,12 +586,11 @@ cat("open no_data score range:\n")
 print(terra::global(open_no_data_score_100m_r, c("min", "mean", "max"), na.rm = TRUE))
 ```
 
-# dwelling-neighbor-distances
+# 10. dwelling-neighbor-distances
 
-**目的**：住居間距離を計算し、micro clusterの候補パラメータを作る。  
-**達成指標**：最近傍距離・第2近傍距離の要約とeps候補が作成される。
+**目的**：住居間距離を計算し、micro cluster候補パラメータを作る。
 
-```{r dwelling-neighbor-distances}
+```{r c10_dwelling_neighbor_distances, eval=TRUE}
 coords <- sf::st_coordinates(dwelling_points)
 
 if (nrow(coords) < 2) {
@@ -596,12 +649,11 @@ min_pts_candidates <- c(3, 4, 5)
 cat("eps candidates:", paste(eps_candidates, collapse = ", "), "\n")
 ```
 
-# parameter-sweep-clustering
+# 11. parameter-sweep-clustering
 
-**目的**：DBSCANの候補パラメータを評価し、密集範囲と孤立候補を識別できるか検討する。  
-**達成指標**：`interim_parameter_sweep.csv` に候補ごとの評価指標が出力される。
+**目的**：DBSCAN候補パラメータを評価する。
 
-```{r parameter-sweep-clustering}
+```{r c11_parameter_sweep_clustering, eval=TRUE}
 run_dbscan_summary <- function(eps_value, min_pts_value, coords_matrix) {
   db <- dbscan::dbscan(coords_matrix, eps = eps_value, minPts = min_pts_value)
 
@@ -682,12 +734,11 @@ readr::write_csv(
 )
 ```
 
-# select-candidate-parameters
+# 12. select-candidate-parameters
 
-**目的**：自動選択された候補パラメータを提示し、検証ゲートで確認すべき基準を出力する。  
-**達成指標**：`selected_eps_m`、`selected_min_pts`、`selected_d_adj_m` が定義される。
+**目的**：候補パラメータからselected_eps_m、selected_min_pts、selected_d_adj_mを定義する。
 
-```{r select-candidate-parameters}
+```{r c12_select_candidate_parameters, eval=TRUE}
 selected_parameter <- parameter_sweep |>
   dplyr::filter(interpretation == "候補として検討可能") |>
   dplyr::slice_max(parameter_score, n = 1, with_ties = FALSE)
@@ -729,12 +780,11 @@ readr::write_csv(
 )
 ```
 
-# build-interim-micro-cluster-layers
+# 13. build-interim-micro-cluster-layers
 
-**目的**：選択パラメータで住居点をmicro clusterに分類し、QGIS確認用の点・ポリゴンレイヤを作成する。  
-**達成指標**：`dwelling_points_grouped` と `group_geometries_interim` が作成される。
+**目的**：選択パラメータで住居点をmicro clusterに分類する。
 
-```{r build-interim-micro-cluster-layers}
+```{r c13_build_interim_micro_cluster_layers, eval=TRUE}
 selected_dbscan <- dbscan::dbscan(
   coords,
   eps = selected_eps_m,
@@ -876,12 +926,11 @@ readr::write_csv(
 )
 ```
 
-# build-interim-macro-cluster-groups
+# 14. build-interim-macro-cluster-groups
 
-**目的**：micro clusterを保持したまま、クラスタ間関係を評価して上位のmacro clusterを作成する。  
-**達成指標**：macro cluster、link edge、内部空白域候補、関連CSVが作成される。
+**目的**：micro cluster間関係からmacro clusterを作成する。
 
-```{r build-interim-macro-cluster-groups}
+```{r c14_build_interim_macro_cluster_groups, eval=TRUE}
 required_objects <- c(
   "group_geometries_interim",
   "dwelling_points_grouped",
@@ -1878,12 +1927,11 @@ macro_group_geometries_interim |>
   dplyr::count(macro_group_type, name = "n_macro_clusters")
 ```
 
-# export-interim-rasters
+# 15. export-interim-rasters
 
-**目的**：中間検証用ラスタをQGIS表示用GeoTIFFとして出力する。  
-**達成指標**：absence penalty と open no_data score のGeoTIFFが `interim/raster` に出力される。
+**目的**：中間確認用ラスタをGeoTIFFとして出力する。
 
-```{r export-interim-rasters}
+```{r c15_export_interim_rasters, eval=TRUE}
 interim_raster_outputs <- list(
   interim_absence_penalty_50m = absence_penalty_50m_r,
   interim_open_no_data_score_100m = open_no_data_score_100m_r
@@ -1900,12 +1948,11 @@ for (nm in names(interim_raster_outputs)) {
 }
 ```
 
-# export-interim-gpkg-layers
+# 16. export-interim-gpkg-layers
 
-**目的**：中間検証に必要なベクタレイヤをfinal側GPKGに `interim_` レイヤとして集約出力する。  
-**達成指標**：micro cluster、macro cluster、link edge、内部空白域、grid statusが同一GPKGに格納される。
+**目的**：中間確認用ベクタレイヤをGPKGに出力する。
 
-```{r export-interim-gpkg-layers}
+```{r c16_export_interim_gpkg_layers, eval=TRUE}
 if (file.exists(final_gpkg)) {
   unlink(final_gpkg)
 }
@@ -1958,12 +2005,11 @@ write_gpkg_layer_safe(
 cat("interim gpkg:", final_gpkg, "\n")
 ```
 
-# check-interim-outputs
+# 17. check-interim-outputs
 
-**目的**：中間検証に必要なCSV、ラスタ、GPKGレイヤの過不足を確認する。  
-**達成指標**：`interim_output_check.csv` に出力確認表が保存され、不足があれば警告される。
+**目的**：interim出力の過不足を確認する。
 
-```{r check-interim-outputs}
+```{r c17_check_interim_outputs, eval=TRUE}
 expected_interim_csv <- c(
   "interim_grid_response_summary.csv",
   "interim_neighbor_distance_summary.csv",
@@ -2073,69 +2119,11 @@ if (nrow(missing_required) > 0) {
 }
 ```
 
-# interim-validation-notes
+# 18. compute-macro-isolation-support
 
-**目的**：QGISでの中間検証方法を明文化する。  
-**達成指標**：確認すべきレイヤ、属性、ラスタ、判断基準がRmd上で確認できる。
+**目的**：macro clusterごとに孤立度と集落連続性への寄与度を計算する。
 
-## 中間検証結果の確認方法
-
-このRmdでは、GeoPackageは `final` 側に集約して出力する。  
-ただし、中間検証用レイヤはレイヤ名に `interim_` を付け、最終成果レイヤと区別する。
-
-GPKGの出力先：
-
-```text
-auto-cor-results/final/gpkg/supported_autocorrelation_outputs.gpkg
-```
-
-主に確認するレイヤは以下である。
-
-| レイヤ名 | 意味 | 検証すべき事項 |
-|---|---|---|
-| `interim_dwelling_points_grouped` | 住居点ごとのmicro cluster分類とmacro cluster割当 | `interim_group_type`、`group_id`、`group_size`、`macro_cluster_id` を確認する。 |
-| `interim_group_geometries` | micro clusterの範囲 | 局所的な密集単位が過大・過小でないか確認する。 |
-| `interim_macro_cluster_geometries` | 統合後のmacro cluster範囲 | C1・C2・C8・C30など、考古学的に一つの集落構造とみなすべき範囲が同一macro clusterに入るか確認する。 |
-| `interim_macro_cluster_link_edges` | macro統合の根拠となるクラスタ間リンク | どのmicro cluster同士が統合されたか、リンクが過剰・不足していないか確認する。 |
-| `interim_internal_void_candidates` | macro cluster内の内部空白域・広場候補 | 内部空白域が単純な非検出域ではなく、環状・馬蹄形集落の中央空間として解釈できるか確認する。 |
-| `interim_grid_status` | 10mグリッドのpresence/absence/no_data | 調査済み非検出域と未調査域の分布確認に用いる。 |
-
-中間検証用ラスタの出力先：
-
-```text
-auto-cor-results/interim/raster/
-```
-
-| ラスタ名 | 意味 | 検証すべき事項 |
-|---|---|---|
-| `interim_absence_penalty_50m.tif` | 周辺50mに調査済み非検出域がどれだけ存在するか | 小規模住居群の周囲で高い場合、孤立的住居として評価しやすい。macro cluster内部の高値は広場・内部空白域の可能性も検討する。 |
-| `interim_open_no_data_score_100m.tif` | 周辺100mに未調査域がどれだけ開いているか | 密集範囲がno_data側へ連続する可能性を確認する。 |
-
-検証で問題がなければ、`analysis-parameters` chunk の `proceed_to_final_model <- TRUE` に変更して、finalモデル構築へ進む。
-
-# final-validation-gate
-
-**目的**：中間検証後にfinalモデルへ進むかを明示的に制御する。  
-**達成指標**：`proceed_to_final_model` がFALSEの場合、finalモデル構築はスキップされる。
-
-```{r final-validation-gate}
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、finalモデル構築はここで停止します。")
-  message("QGISでinterim出力を確認後、analysis-parameters chunkでTRUEに変更してください。")
-} else {
-  message("proceed_to_final_model = TRUE のため、finalモデル構築へ進みます。")
-}
-```
-
-# compute-macro-isolation-support
-
-**目的**：macro clusterごとに孤立度と集落連続性への寄与度を計算する。  
-**達成指標**：`macro_group_geometries_final` と `macro_support_table` が作成される。
-
-```{r compute-macro-isolation-support}
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、このchunkをスキップします。")
-} else {
+```{r c18_compute_macro_isolation_support, eval=TRUE}
   compute_ring_stats_one <- function(group_sf, grid_sf, inner_m, outer_m) {
     outer <- sf::st_buffer(sf::st_geometry(group_sf), outer_m)
     inner <- sf::st_buffer(sf::st_geometry(group_sf), inner_m)
@@ -2259,1227 +2247,933 @@ if (!proceed_to_final_model) {
     macro_support_table |>
       dplyr::arrange(dplyr::desc(cluster_support))
   )
-}
 ```
 
-# build-supported-rasters
+# 19. build-directional-source-barrier-rasters
 
-**目的**：macro cluster supportを用いて、支持付き近接・密度・open no_data成分をラスタ化する。  
-**達成指標**：final scoreの構成成分ラスタが作成される。
+**目的**：開口source、source strength、absence barrier strengthを作成する。
 
-```{r build-supported-rasters}
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、このchunkをスキップします。")
-} else {
-  dwelling_points_for_weight <- dwelling_points_final |>
-    dplyr::mutate(
-      point_cluster_support = tidyr::replace_na(cluster_support, 0),
-      point_isolated_weight = tidyr::replace_na(isolated_dwelling_weight, 0)
-    )
+```{r c19_build_directional_source_barrier_rasters, eval=TRUE}
+required_objects <- c(
+  "macro_group_geometries_final",
+  "macro_support_table",
+  "dwelling_points_final",
+  "template_r",
+  "grid10_status",
+  "presence_binary_r",
+  "absence_binary_r",
+  "no_data_binary_r",
+  "absence_area_r",
+  "surveyed_area_r",
+  "city_area_r",
+  "selected_d_adj_safe_m"
+)
 
-  supported_dwelling_count_r <- terra::rasterize(
-    terra::vect(dwelling_points_for_weight),
-    template_r,
-    field = "point_cluster_support",
-    fun = "sum",
-    background = 0
-  )
-  names(supported_dwelling_count_r) <- "supported_dwelling_count"
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
 
-  isolated_dwelling_count_r <- terra::rasterize(
-    terra::vect(dwelling_points_for_weight),
-    template_r,
-    field = "point_isolated_weight",
-    fun = "sum",
-    background = 0
-  )
-  names(isolated_dwelling_count_r) <- "isolated_dwelling_count"
-
-  supported_density_raw_50m_r <- focal_sum_circle(supported_dwelling_count_r, 50)
-  supported_density_score_50m_r <- scale01_raster(log1p(supported_density_raw_50m_r))
-  names(supported_density_score_50m_r) <- "supported_density_score_50m"
-
-  proximity_decay_m <- max(2 * selected_d_adj_safe_m, 50)
-  macro_sources <- macro_group_geometries_final |>
-    dplyr::filter(cluster_support > 0.01) |>
-    dplyr::arrange(dplyr::desc(cluster_support))
-
-  macro_max_proximity_sources <- 200
-  if (nrow(macro_sources) > macro_max_proximity_sources) {
-    macro_sources <- macro_sources |>
-      dplyr::slice_head(n = macro_max_proximity_sources)
-  }
-
-  if (nrow(macro_sources) == 0) {
-    supported_cluster_proximity_score_r <- template_r * 0
-  } else {
-    prox_rasters <- vector("list", nrow(macro_sources))
-
-    for (i in seq_len(nrow(macro_sources))) {
-      one_macro <- macro_sources[i, ]
-      one_support <- one_macro$cluster_support[1]
-
-      one_r <- terra::rasterize(
-        terra::vect(one_macro),
-        template_r,
-        field = 1,
-        background = NA
-      )
-
-      dist_r <- terra::distance(one_r)
-      prox_rasters[[i]] <- one_support * exp(-dist_r / proximity_decay_m)
-    }
-
-    supported_cluster_proximity_score_r <- terra::app(
-      do.call(c, prox_rasters),
-      fun = max,
-      na.rm = TRUE
-    )
-  }
-
-  supported_cluster_proximity_score_r <- terra::clamp(
-    na0_raster(supported_cluster_proximity_score_r),
-    lower = 0,
-    upper = 1,
-    values = TRUE
-  )
-  names(supported_cluster_proximity_score_r) <- "supported_cluster_proximity_score"
-
-  effective_open_no_data_score_100m_r <-
-    open_no_data_score_100m_r *
-    supported_cluster_proximity_score_r *
-    no_data_binary_r
-
-  effective_open_no_data_score_100m_r <- terra::clamp(
-    effective_open_no_data_score_100m_r,
-    lower = 0,
-    upper = 1,
-    values = TRUE
-  )
-  names(effective_open_no_data_score_100m_r) <- "effective_open_no_data_score_100m"
-
-  isolated_dwelling_signal_r <- scale01_raster(
-    focal_sum_circle(isolated_dwelling_count_r, 50)
-  )
-  names(isolated_dwelling_signal_r) <- "isolated_dwelling_signal"
-
-  print(terra::global(supported_cluster_proximity_score_r, c("min", "mean", "max"), na.rm = TRUE))
-  print(terra::global(supported_density_score_50m_r, c("min", "mean", "max"), na.rm = TRUE))
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
 }
+
+base_range_m <- max(
+  base_range_adj_multiplier * selected_d_adj_safe_m,
+  base_range_min_m,
+  na.rm = TRUE
+)
+
+cat("base_range_m:", base_range_m, "\n")
+
+# source strength：macro cluster supportを基本とする。
+macro_sources_final <- macro_group_geometries_final |>
+  dplyr::filter(
+    !is.na(cluster_support),
+    cluster_support > 0.01
+  ) |>
+  dplyr::mutate(
+    source_strength = clamp01_numeric(cluster_support ^ source_strength_power),
+    source_seed_value = pmax(source_strength, source_min_strength)
+  )
+
+if (nrow(macro_sources_final) == 0) {
+  stop("sourceとして使えるmacro clusterがありません。macro_support_tableを確認してください。")
+}
+
+source_seed_strength_r <- terra::rasterize(
+  terra::vect(macro_sources_final),
+  template_r,
+  field = "source_seed_value",
+  fun = "max",
+  background = 0,
+  touches = TRUE
+)
+names(source_seed_strength_r) <- "source_seed_strength"
+
+# supported density：source strengthの診断用。最終スコアには直接加算しない。
+dwelling_points_for_strength <- dwelling_points_final |>
+  dplyr::mutate(
+    point_cluster_support = pmax(
+      tidyr::replace_na(cluster_support, 0),
+      source_min_strength * tidyr::replace_na(as.numeric(cluster_support > 0), 0)
+    ),
+    point_isolated_weight = tidyr::replace_na(isolated_dwelling_weight, 0)
+  )
+
+supported_dwelling_count_r <- terra::rasterize(
+  terra::vect(dwelling_points_for_strength),
+  template_r,
+  field = "point_cluster_support",
+  fun = "sum",
+  background = 0
+)
+names(supported_dwelling_count_r) <- "supported_dwelling_count"
+
+supported_density_raw_r <- focal_sum_circle(
+  supported_dwelling_count_r,
+  source_density_radius_m
+)
+supported_density_score_r <- scale01_raster(log1p(supported_density_raw_r))
+names(supported_density_score_r) <- "supported_density_score"
+
+isolated_dwelling_count_r <- terra::rasterize(
+  terra::vect(dwelling_points_for_strength),
+  template_r,
+  field = "point_isolated_weight",
+  fun = "sum",
+  background = 0
+)
+names(isolated_dwelling_count_r) <- "isolated_dwelling_count"
+
+isolated_dwelling_signal_r <- scale01_raster(
+  focal_sum_circle(isolated_dwelling_count_r, source_density_radius_m)
+)
+names(isolated_dwelling_signal_r) <- "isolated_dwelling_signal"
+
+# no_dataに接するsourceセルをopening sourceにする。
+no_data_contact_r <- terra::ifel(
+  focal_max_circle(no_data_binary_r, opening_neighbor_radius_m) > 0,
+  1,
+  0
+)
+names(no_data_contact_r) <- "no_data_contact"
+
+open_source_strength_r <- source_seed_strength_r * no_data_contact_r
+names(open_source_strength_r) <- "open_source_strength"
+
+if (!raster_has_positive(open_source_strength_r)) {
+  warning("no_dataに接するsourceセルがありません。source_seed_strength_rをfallbackとして使います。")
+  open_source_strength_r <- source_seed_strength_r
+  names(open_source_strength_r) <- "open_source_strength"
+}
+
+# absence evidence：調査済み範囲に占めるabsenceの割合。
+local_absence_evidence <- focal_sum_circle(absence_area_r, absence_evidence_radius_m)
+local_surveyed_evidence <- focal_sum_circle(surveyed_area_r, absence_evidence_radius_m)
+local_surveyed_evidence_safe <- terra::ifel(
+  is.na(local_surveyed_evidence) | local_surveyed_evidence < 1,
+  1,
+  local_surveyed_evidence
+)
+
+absence_evidence_r <- terra::clamp(
+  local_absence_evidence / local_surveyed_evidence_safe,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(absence_evidence_r) <- "absence_evidence"
+
+# absence continuity：周辺内にabsenceセルがどの程度連続するか。
+absence_continuity_count_r <- focal_sum_circle(absence_binary_r, absence_continuity_radius_m)
+absence_continuity_window_cells <- sum(
+  make_circle_window(template_r, absence_continuity_radius_m),
+  na.rm = TRUE
+)
+
+absence_continuity_score_r <- terra::clamp(
+  absence_continuity_count_r / max(absence_continuity_window_cells, 1),
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(absence_continuity_score_r) <- "absence_continuity_score"
+
+absence_barrier_strength_r <- terra::clamp(
+  absence_evidence_weight * absence_evidence_r +
+    absence_continuity_weight * absence_continuity_score_r,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+
+# absenceセル自体は必ず強いbarrierとする。
+absence_barrier_strength_r <- terra::ifel(
+  absence_binary_r == 1,
+  1,
+  absence_barrier_strength_r
+)
+absence_barrier_strength_r <- terra::clamp(
+  absence_barrier_strength_r,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(absence_barrier_strength_r) <- "absence_barrier_strength"
+
+# 伝播可能域。
+# source、no_data、absenceを伝播対象とする。presenceがsourceでない場合は発信源にしない。
+directional_allowed_r <- terra::ifel(
+  city_area_r > 0 &
+    (
+      no_data_binary_r == 1 |
+        absence_binary_r == 1 |
+        source_seed_strength_r > 0
+    ),
+  1,
+  0
+)
+names(directional_allowed_r) <- "directional_allowed"
+
+source_barrier_summary <- tibble::tibble(
+  layer = c(
+    "source_seed_strength",
+    "open_source_strength",
+    "supported_density_score",
+    "absence_evidence",
+    "absence_continuity_score",
+    "absence_barrier_strength",
+    "directional_allowed"
+  ),
+  min = c(
+    terra::global(source_seed_strength_r, "min", na.rm = TRUE)[1, 1],
+    terra::global(open_source_strength_r, "min", na.rm = TRUE)[1, 1],
+    terra::global(supported_density_score_r, "min", na.rm = TRUE)[1, 1],
+    terra::global(absence_evidence_r, "min", na.rm = TRUE)[1, 1],
+    terra::global(absence_continuity_score_r, "min", na.rm = TRUE)[1, 1],
+    terra::global(absence_barrier_strength_r, "min", na.rm = TRUE)[1, 1],
+    terra::global(directional_allowed_r, "min", na.rm = TRUE)[1, 1]
+  ),
+  mean = c(
+    terra::global(source_seed_strength_r, "mean", na.rm = TRUE)[1, 1],
+    terra::global(open_source_strength_r, "mean", na.rm = TRUE)[1, 1],
+    terra::global(supported_density_score_r, "mean", na.rm = TRUE)[1, 1],
+    terra::global(absence_evidence_r, "mean", na.rm = TRUE)[1, 1],
+    terra::global(absence_continuity_score_r, "mean", na.rm = TRUE)[1, 1],
+    terra::global(absence_barrier_strength_r, "mean", na.rm = TRUE)[1, 1],
+    terra::global(directional_allowed_r, "mean", na.rm = TRUE)[1, 1]
+  ),
+  max = c(
+    terra::global(source_seed_strength_r, "max", na.rm = TRUE)[1, 1],
+    terra::global(open_source_strength_r, "max", na.rm = TRUE)[1, 1],
+    terra::global(supported_density_score_r, "max", na.rm = TRUE)[1, 1],
+    terra::global(absence_evidence_r, "max", na.rm = TRUE)[1, 1],
+    terra::global(absence_continuity_score_r, "max", na.rm = TRUE)[1, 1],
+    terra::global(absence_barrier_strength_r, "max", na.rm = TRUE)[1, 1],
+    terra::global(directional_allowed_r, "max", na.rm = TRUE)[1, 1]
+  )
+)
+
+print(source_barrier_summary)
+readr::write_csv(
+  source_barrier_summary,
+  file.path(final_csv_dir, "final_source_barrier_layer_summary.csv")
+)
 ```
 
-# build-final-continuity-score
+# 20. build-directional-propagation-score
 
-**目的**：macro cluster supportに基づく連続量の自己相関スコアを作成する。  
-**達成指標**：`cluster_continuity_score_all_cells_r` と `cluster_continuity_score_no_data_only_r` が作成される。
+**目的**：累積コスト型のdirectional propagationにより最終スコアを作成する。
 
-```{r build-final-continuity-score}
-# 目的：
-# ユークリッド距離＋有限距離減衰を基準スコアとし、
-# local absence evidence によって抑制した検証用スコアを作成する。
-#
-# 達成指標：
-# 1. euclidean_compact_score_no_data_r が作成される。
-# 2. absence_evidence_50m_r / absence_evidence_100m_r / absence_evidence_combined_r が作成される。
-# 3. absence suppression の強度違いを比較できる複数ラスタが作成される。
-# 4. cluster_continuity_score_no_data_only_r には soft_p4 版を入れる。
+```{r c20_build_directional_propagation_score, eval=TRUE}
+required_objects <- c(
+  "template_r",
+  "open_source_strength_r",
+  "absence_barrier_strength_r",
+  "directional_allowed_r",
+  "no_data_binary_r",
+  "absence_binary_r",
+  "base_range_m"
+)
 
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、final score の作成をスキップします。")
-} else {
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
 
-  if (!exists("template_r")) {
-    stop("template_r が存在しません。create-analysis-grid chunkを確認してください。")
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
+}
+
+run_directional_cost_propagation <- function(
+  template_r,
+  source_strength_r,
+  barrier_strength_r,
+  allowed_r,
+  no_data_r,
+  absence_r,
+  base_range_m,
+  grid_cell_size_m,
+  source_range_bonus,
+  source_strength_power,
+  source_min_strength,
+  barrier_cost_multiplier,
+  barrier_strength_power,
+  barrier_vs_source_scale,
+  absence_cell_extra_cost,
+  decay_power,
+  max_normalized_cost,
+  min_range_modifier,
+  neighbor_mode = "queen_8"
+) {
+  n_cells <- terra::ncell(template_r)
+  n_rows <- terra::nrow(template_r)
+  n_cols <- terra::ncol(template_r)
+
+  source_vals <- terra::values(source_strength_r, mat = FALSE)
+  barrier_vals <- terra::values(barrier_strength_r, mat = FALSE)
+  allowed_vals <- terra::values(allowed_r, mat = FALSE)
+  no_data_vals <- terra::values(no_data_r, mat = FALSE)
+  absence_vals <- terra::values(absence_r, mat = FALSE)
+
+  source_vals[!is.finite(source_vals)] <- 0
+  barrier_vals[!is.finite(barrier_vals)] <- 0
+  allowed_vals[!is.finite(allowed_vals)] <- 0
+  no_data_vals[!is.finite(no_data_vals)] <- 0
+  absence_vals[!is.finite(absence_vals)] <- 0
+
+  allowed_logical <- allowed_vals > 0
+  source_idx <- which(source_vals > 0 & allowed_logical)
+
+  if (length(source_idx) == 0) {
+    stop("伝播開始sourceセルがありません。open_source_strength_rを確認してください。")
   }
 
-  if (!exists("grid10_status")) {
-    stop("grid10_status が存在しません。rasterize-status-layers chunkを確認してください。")
+  best_cost <- rep(Inf, n_cells)
+  best_source_strength <- rep(NA_real_, n_cells)
+  best_source_range <- rep(NA_real_, n_cells)
+  visited <- rep(FALSE, n_cells)
+
+  heap_idx <- integer(0)
+  heap_cost <- numeric(0)
+  heap_strength <- numeric(0)
+  heap_range <- numeric(0)
+
+  heap_swap <- function(i, j) {
+    tmp <- heap_idx[i]
+    heap_idx[i] <<- heap_idx[j]
+    heap_idx[j] <<- tmp
+
+    tmp <- heap_cost[i]
+    heap_cost[i] <<- heap_cost[j]
+    heap_cost[j] <<- tmp
+
+    tmp <- heap_strength[i]
+    heap_strength[i] <<- heap_strength[j]
+    heap_strength[j] <<- tmp
+
+    tmp <- heap_range[i]
+    heap_range[i] <<- heap_range[j]
+    heap_range[j] <<- tmp
   }
 
-  if (!exists("rasterize_grid_field")) {
-    stop("rasterize_grid_field が存在しません。setup chunkを確認してください。")
-  }
+  heap_push <- function(idx, cost, strength, source_range) {
+    heap_idx <<- c(heap_idx, idx)
+    heap_cost <<- c(heap_cost, cost)
+    heap_strength <<- c(heap_strength, strength)
+    heap_range <<- c(heap_range, source_range)
 
-  if (!exists("clamp01_raster")) {
-    clamp01_raster <- function(r) {
-      terra::ifel(r < 0, 0, terra::ifel(r > 1, 1, r))
+    k <- length(heap_idx)
+    while (k > 1) {
+      parent <- k %/% 2
+      if (heap_cost[parent] <= heap_cost[k]) {
+        break
+      }
+      heap_swap(parent, k)
+      k <- parent
     }
   }
 
-  raster_na_to_zero <- function(r) {
-    terra::ifel(is.na(r), 0, r)
-  }
-
-  selected_d_adj_safe_m <- 25
-
-  if (
-    exists("selected_d_adj_m") &&
-      length(selected_d_adj_m) == 1 &&
-      is.finite(selected_d_adj_m)
-  ) {
-    selected_d_adj_safe_m <- selected_d_adj_m
-  }
-
-  # 距離減衰パラメータ
-  euclidean_max_distance_m <- max(3 * selected_d_adj_safe_m, 80)
-  euclidean_decay_power <- 2
-
-  # absence evidence 抑制パラメータ
-  absence_soft_power_moderate <- 2
-  absence_soft_power_strong <- 4
-  absence_hard_threshold_low <- 0.25
-  absence_hard_threshold_high <- 0.35
-  absence_100m_weight <- 0.5
-
-  cat("euclidean_max_distance_m:", euclidean_max_distance_m, "\n")
-  cat("euclidean_decay_power:", euclidean_decay_power, "\n")
-  cat("absence_soft_power_moderate:", absence_soft_power_moderate, "\n")
-  cat("absence_soft_power_strong:", absence_soft_power_strong, "\n")
-  cat("absence_hard_threshold_low:", absence_hard_threshold_low, "\n")
-  cat("absence_hard_threshold_high:", absence_hard_threshold_high, "\n")
-  cat("absence_100m_weight:", absence_100m_weight, "\n")
-
-  # no_data flag
-  if (!exists("no_data_flag_r")) {
-    no_data_flag_r <- rasterize_grid_field(
-      grid10_status,
-      "no_data_flag",
-      template_r,
-      background = 0,
-      touches = TRUE
-    )
-    names(no_data_flag_r) <- "no_data_flag"
-  }
-
-  # city mask
-  if (exists("city_mask_r")) {
-    city_allowed_r <- terra::ifel(is.na(city_mask_r), 0, 1)
-  } else {
-    city_allowed_r <- template_r
-    city_allowed_r[] <- 1
-  }
-  names(city_allowed_r) <- "city_allowed"
-
-  # 伝播発信源。
-  # macro clusterがあれば優先し、なければgroup_geometries_final、さらに無ければgroup_geometries_interimを使う。
-  if (
-    exists("macro_group_geometries_interim") &&
-      nrow(macro_group_geometries_interim) > 0 &&
-      "macro_group_type" %in% names(macro_group_geometries_interim)
-  ) {
-    source_geoms <- macro_group_geometries_interim |>
-      dplyr::filter(
-        macro_group_type %in% c(
-          "macro_settlement_complex_candidate",
-          "single_dense_micro_cluster"
-        )
-      ) |>
-      dplyr::mutate(
-        source_seed = 1L,
-        source_type = macro_group_type
-      )
-
-    source_object_used <- "macro_group_geometries_interim"
-
-  } else if (
-    exists("group_geometries_final") &&
-      nrow(group_geometries_final) > 0 &&
-      "cluster_support" %in% names(group_geometries_final)
-  ) {
-    source_geoms <- group_geometries_final |>
-      dplyr::filter(
-        cluster_support > 0,
-        n_dwellings >= dense_cluster_min_n
-      ) |>
-      dplyr::mutate(
-        source_seed = 1L,
-        source_type = "supported_group"
-      )
-
-    source_object_used <- "group_geometries_final"
-
-  } else if (
-    exists("group_geometries_interim") &&
-      nrow(group_geometries_interim) > 0 &&
-      "interim_group_type" %in% names(group_geometries_interim)
-  ) {
-    source_geoms <- group_geometries_interim |>
-      dplyr::filter(
-        interim_group_type == "dense_candidate"
-      ) |>
-      dplyr::mutate(
-        source_seed = 1L,
-        source_type = "dense_candidate"
-      )
-
-    source_object_used <- "group_geometries_interim"
-
-  } else {
-    stop("伝播発信源に使えるcluster geometryが存在しません。")
-  }
-
-  cat("source_object_used:", source_object_used, "\n")
-  cat("source cluster count:", nrow(source_geoms), "\n")
-
-  propagation_source_seed_r <- template_r
-  propagation_source_seed_r[] <- 0
-  names(propagation_source_seed_r) <- "propagation_source_seed"
-
-  if (nrow(source_geoms) > 0) {
-    propagation_source_seed_r <- terra::rasterize(
-      terra::vect(source_geoms),
-      template_r,
-      field = "source_seed",
-      background = 0,
-      touches = TRUE
-    )
-    names(propagation_source_seed_r) <- "propagation_source_seed"
-  } else {
-    warning("伝播発信源が0件です。以後のスコアは0になります。")
-  }
-
-  # ユークリッド距離
-  source_seed_na_r <- terra::ifel(
-    propagation_source_seed_r == 1,
-    1,
-    NA_real_
-  )
-  names(source_seed_na_r) <- "source_seed_for_distance"
-
-  euclidean_distance_from_source_r <- terra::distance(source_seed_na_r)
-  names(euclidean_distance_from_source_r) <- "euclidean_distance_from_source_m"
-
-  # 有限距離減衰
-  euclidean_compact_distance_score_r <- terra::ifel(
-    is.na(euclidean_distance_from_source_r),
-    0,
-    terra::ifel(
-      euclidean_distance_from_source_r > euclidean_max_distance_m,
-      0,
-      (1 - euclidean_distance_from_source_r / euclidean_max_distance_m) ^
-        euclidean_decay_power
-    )
-  )
-
-  euclidean_compact_distance_score_r <- clamp01_raster(
-    euclidean_compact_distance_score_r
-  )
-  names(euclidean_compact_distance_score_r) <- "euclidean_compact_distance_score"
-
-  # 基準スコア：ユークリッド距離＋有限距離減衰＋no_data限定
-  euclidean_compact_score_no_data_r <-
-    euclidean_compact_distance_score_r *
-    no_data_flag_r *
-    city_allowed_r
-
-  euclidean_compact_score_no_data_r <- clamp01_raster(
-    euclidean_compact_score_no_data_r
-  )
-  names(euclidean_compact_score_no_data_r) <- "euclidean_compact_score_no_data"
-
-  # absence evidence 50m
-  if (exists("absence_penalty_50m_r")) {
-    absence_evidence_50m_r <- absence_penalty_50m_r
-  } else if (
-    exists("local_absence_ratio_rasters") &&
-      "50" %in% names(local_absence_ratio_rasters)
-  ) {
-    absence_evidence_50m_r <- local_absence_ratio_rasters[["50"]]
-  } else {
-    stop("absence_evidence_50m_r の材料がありません。absence_penalty_50m_r または local_absence_ratio_rasters[['50']] を確認してください。")
-  }
-
-  absence_evidence_50m_r <- raster_na_to_zero(absence_evidence_50m_r)
-  absence_evidence_50m_r <- clamp01_raster(absence_evidence_50m_r)
-  names(absence_evidence_50m_r) <- "absence_evidence_50m"
-
-  # absence evidence 100m
-  if (
-    exists("local_absence_ratio_rasters") &&
-      "100" %in% names(local_absence_ratio_rasters)
-  ) {
-    absence_evidence_100m_r <- local_absence_ratio_rasters[["100"]]
-    absence_evidence_100m_r <- raster_na_to_zero(absence_evidence_100m_r)
-    absence_evidence_100m_r <- clamp01_raster(absence_evidence_100m_r)
-  } else {
-    absence_evidence_100m_r <- absence_evidence_50m_r
-  }
-
-  names(absence_evidence_100m_r) <- "absence_evidence_100m"
-
-  # 50mを主、100mを補助として使う。
-  # 100mは広すぎる抑制を避けるため 0.5倍してから最大値を取る。
-  absence_evidence_100m_weighted_r <-
-    absence_evidence_100m_r * absence_100m_weight
-
-  absence_evidence_combined_r <- terra::ifel(
-    absence_evidence_50m_r >= absence_evidence_100m_weighted_r,
-    absence_evidence_50m_r,
-    absence_evidence_100m_weighted_r
-  )
-
-  absence_evidence_combined_r <- clamp01_raster(absence_evidence_combined_r)
-  names(absence_evidence_combined_r) <- "absence_evidence_combined"
-
-  make_absence_suppressed_score <- function(
-    base_score_r,
-    absence_evidence_r,
-    soft_power = 2,
-    hard_threshold = NULL
-  ) {
-    evidence_r <- raster_na_to_zero(absence_evidence_r)
-    evidence_r <- clamp01_raster(evidence_r)
-
-    suppression_multiplier_r <- (1 - evidence_r) ^ soft_power
-    suppression_multiplier_r <- clamp01_raster(suppression_multiplier_r)
-
-    if (!is.null(hard_threshold)) {
-      suppression_multiplier_r <- terra::ifel(
-        evidence_r >= hard_threshold,
-        0,
-        suppression_multiplier_r
-      )
+  heap_pop <- function() {
+    if (length(heap_idx) == 0) {
+      return(NULL)
     }
 
-    out_r <- base_score_r * suppression_multiplier_r
-    out_r <- clamp01_raster(out_r)
+    out <- list(
+      idx = heap_idx[1],
+      cost = heap_cost[1],
+      strength = heap_strength[1],
+      source_range = heap_range[1]
+    )
 
-    out_r
+    last <- length(heap_idx)
+
+    if (last == 1) {
+      heap_idx <<- integer(0)
+      heap_cost <<- numeric(0)
+      heap_strength <<- numeric(0)
+      heap_range <<- numeric(0)
+      return(out)
+    }
+
+    heap_idx[1] <<- heap_idx[last]
+    heap_cost[1] <<- heap_cost[last]
+    heap_strength[1] <<- heap_strength[last]
+    heap_range[1] <<- heap_range[last]
+
+    heap_idx <<- heap_idx[-last]
+    heap_cost <<- heap_cost[-last]
+    heap_strength <<- heap_strength[-last]
+    heap_range <<- heap_range[-last]
+
+    k <- 1
+    repeat {
+      left <- 2 * k
+      right <- left + 1
+      smallest <- k
+
+      if (left <= length(heap_idx) && heap_cost[left] < heap_cost[smallest]) {
+        smallest <- left
+      }
+
+      if (right <= length(heap_idx) && heap_cost[right] < heap_cost[smallest]) {
+        smallest <- right
+      }
+
+      if (smallest == k) {
+        break
+      }
+
+      heap_swap(k, smallest)
+      k <- smallest
+    }
+
+    out
   }
 
-  # soft suppression：緩やか
-  euclidean_absence_soft_p2_score_no_data_r <-
-    make_absence_suppressed_score(
-      base_score_r = euclidean_compact_score_no_data_r,
-      absence_evidence_r = absence_evidence_combined_r,
-      soft_power = absence_soft_power_moderate,
-      hard_threshold = NULL
-    )
-
-  names(euclidean_absence_soft_p2_score_no_data_r) <-
-    "euclidean_absence_soft_p2_score_no_data"
-
-  # soft suppression：強め。今回の主検証候補。
-  euclidean_absence_soft_p4_score_no_data_r <-
-    make_absence_suppressed_score(
-      base_score_r = euclidean_compact_score_no_data_r,
-      absence_evidence_r = absence_evidence_combined_r,
-      soft_power = absence_soft_power_strong,
-      hard_threshold = NULL
-    )
-
-  names(euclidean_absence_soft_p4_score_no_data_r) <-
-    "euclidean_absence_soft_p4_score_no_data"
-
-  # hybrid suppression：threshold 0.25
-  euclidean_absence_hybrid_t25_score_no_data_r <-
-    make_absence_suppressed_score(
-      base_score_r = euclidean_compact_score_no_data_r,
-      absence_evidence_r = absence_evidence_combined_r,
-      soft_power = absence_soft_power_moderate,
-      hard_threshold = absence_hard_threshold_low
-    )
-
-  names(euclidean_absence_hybrid_t25_score_no_data_r) <-
-    "euclidean_absence_hybrid_t25_score_no_data"
-
-  # hybrid suppression：threshold 0.35
-  euclidean_absence_hybrid_t35_score_no_data_r <-
-    make_absence_suppressed_score(
-      base_score_r = euclidean_compact_score_no_data_r,
-      absence_evidence_r = absence_evidence_combined_r,
-      soft_power = absence_soft_power_moderate,
-      hard_threshold = absence_hard_threshold_high
-    )
-
-  names(euclidean_absence_hybrid_t35_score_no_data_r) <-
-    "euclidean_absence_hybrid_t35_score_no_data"
-
-  # 今回の検証用final scoreには、急な断絶を作らない soft_p4 を入れる。
-  cluster_continuity_score_all_cells_r <-
-    euclidean_absence_soft_p4_score_no_data_r
-
-  names(cluster_continuity_score_all_cells_r) <-
-    "cluster_continuity_score_all_cells"
-
-  cluster_continuity_score_no_data_only_r <- terra::ifel(
-    no_data_flag_r == 1,
-    cluster_continuity_score_all_cells_r,
-    NA_real_
+  source_strength_clean <- pmax(source_vals[source_idx], source_min_strength)
+  source_range_vals <- base_range_m * (
+    min_range_modifier +
+      (1 - min_range_modifier) * (source_strength_clean ^ source_strength_power)
+  ) * (
+    1 + source_range_bonus * (source_strength_clean ^ source_strength_power)
   )
 
-  names(cluster_continuity_score_no_data_only_r) <-
-    "cluster_continuity_score_no_data_only"
+  for (i in seq_along(source_idx)) {
+    idx <- source_idx[i]
+    strength <- source_strength_clean[i]
+    source_range <- source_range_vals[i]
+    best_cost[idx] <- 0
+    best_source_strength[idx] <- strength
+    best_source_range[idx] <- source_range
+    heap_push(idx, 0, strength, source_range)
+  }
 
-  final_score_formula <- tibble::tibble(
-    output = c(
-      "euclidean_compact_score_no_data",
-      "absence_evidence_50m",
-      "absence_evidence_100m",
-      "absence_evidence_combined",
-      "euclidean_absence_soft_p2_score_no_data",
-      "euclidean_absence_soft_p4_score_no_data",
-      "euclidean_absence_hybrid_t25_score_no_data",
-      "euclidean_absence_hybrid_t35_score_no_data",
-      "cluster_continuity_score_no_data_only"
-    ),
-    meaning = c(
-      "ユークリッド距離＋有限距離減衰の基準スコア",
-      "50m局所absence evidence",
-      "100m局所absence evidence",
-      "50mを主、100mを補助にしたabsence evidence",
-      "absence evidenceによる緩やかな連続抑制",
-      "absence evidenceによる強めの連続抑制。今回の主検証候補",
-      "absence evidence 0.25以上を0にする強いhybrid抑制",
-      "absence evidence 0.35以上を0にする中程度hybrid抑制",
-      "今回検証用の最終スコア。soft_p4版と同一"
+  if (neighbor_mode == "rook_4") {
+    neighbor_steps <- tibble::tibble(
+      dr = c(-1L, 1L, 0L, 0L),
+      dc = c(0L, 0L, -1L, 1L),
+      step_m = rep(grid_cell_size_m, 4)
     )
-  )
+  } else {
+    neighbor_steps <- tibble::tibble(
+      dr = c(-1L, -1L, -1L, 0L, 0L, 1L, 1L, 1L),
+      dc = c(-1L, 0L, 1L, -1L, 1L, -1L, 0L, 1L),
+      step_m = c(
+        sqrt(2), 1, sqrt(2), 1, 1, sqrt(2), 1, sqrt(2)
+      ) * grid_cell_size_m
+    )
+  }
 
-  print(final_score_formula)
+  processed_n <- 0L
 
-  final_components_stack <- c(
-    propagation_source_seed_r,
-    euclidean_distance_from_source_r,
-    euclidean_compact_distance_score_r,
-    euclidean_compact_score_no_data_r,
-    absence_evidence_50m_r,
-    absence_evidence_100m_r,
-    absence_evidence_combined_r,
-    euclidean_absence_soft_p2_score_no_data_r,
-    euclidean_absence_soft_p4_score_no_data_r,
-    euclidean_absence_hybrid_t25_score_no_data_r,
-    euclidean_absence_hybrid_t35_score_no_data_r,
-    cluster_continuity_score_no_data_only_r
-  )
+  repeat {
+    item <- heap_pop()
+    if (is.null(item)) {
+      break
+    }
 
-  names(final_components_stack) <- c(
-    "propagation_source_seed",
-    "euclidean_distance_from_source_m",
-    "euclidean_compact_distance_score",
-    "euclidean_compact_score_no_data",
-    "absence_evidence_50m",
-    "absence_evidence_100m",
-    "absence_evidence_combined",
-    "euclidean_absence_soft_p2_score_no_data",
-    "euclidean_absence_soft_p4_score_no_data",
-    "euclidean_absence_hybrid_t25_score_no_data",
-    "euclidean_absence_hybrid_t35_score_no_data",
-    "cluster_continuity_score_no_data_only"
+    idx <- item$idx
+
+    if (visited[idx]) {
+      next
+    }
+
+    if (item$cost > best_cost[idx] + 1e-12) {
+      next
+    }
+
+    visited[idx] <- TRUE
+    processed_n <- processed_n + 1L
+
+    if (item$cost >= max_normalized_cost) {
+      next
+    }
+
+    row_i <- ((idx - 1L) %/% n_cols) + 1L
+    col_i <- ((idx - 1L) %% n_cols) + 1L
+
+    for (s in seq_len(nrow(neighbor_steps))) {
+      row_j <- row_i + neighbor_steps$dr[s]
+      col_j <- col_i + neighbor_steps$dc[s]
+
+      if (row_j < 1L || row_j > n_rows || col_j < 1L || col_j > n_cols) {
+        next
+      }
+
+      idx_j <- (row_j - 1L) * n_cols + col_j
+
+      if (!allowed_logical[idx_j] || visited[idx_j]) {
+        next
+      }
+
+      barrier_j <- clamp01_numeric(barrier_vals[idx_j])
+      barrier_cost <- 1 + barrier_cost_multiplier *
+        ((barrier_j ^ barrier_strength_power) /
+           (barrier_vs_source_scale + item$strength))
+
+      if (absence_vals[idx_j] > 0) {
+        barrier_cost <- barrier_cost + absence_cell_extra_cost *
+          (1 + barrier_j) /
+          (barrier_vs_source_scale + item$strength)
+      }
+
+      step_cost <- neighbor_steps$step_m[s] * barrier_cost
+      new_cost <- item$cost + step_cost / item$source_range
+
+      if (new_cost < best_cost[idx_j] && new_cost <= max_normalized_cost) {
+        best_cost[idx_j] <- new_cost
+        best_source_strength[idx_j] <- item$strength
+        best_source_range[idx_j] <- item$source_range
+        heap_push(idx_j, new_cost, item$strength, item$source_range)
+      }
+    }
+  }
+
+  normalized_cost_r <- template_r
+  normalized_cost_vals <- best_cost
+  normalized_cost_vals[!is.finite(normalized_cost_vals)] <- NA_real_
+  terra::values(normalized_cost_r) <- normalized_cost_vals
+  names(normalized_cost_r) <- "directional_normalized_cost"
+
+  propagated_source_strength_r <- template_r
+  terra::values(propagated_source_strength_r) <- best_source_strength
+  names(propagated_source_strength_r) <- "directional_source_strength"
+
+  propagated_source_range_r <- template_r
+  terra::values(propagated_source_range_r) <- best_source_range
+  names(propagated_source_range_r) <- "directional_source_range_m"
+
+  score_vals <- best_source_strength *
+    ((1 - pmin(best_cost, max_normalized_cost)) ^ decay_power)
+  score_vals[!is.finite(best_cost)] <- NA_real_
+  score_vals[best_cost > max_normalized_cost] <- NA_real_
+  score_vals <- clamp01_numeric(score_vals)
+
+  score_r <- template_r
+  terra::values(score_r) <- score_vals
+  names(score_r) <- "directional_cluster_continuity_score"
+
+  list(
+    normalized_cost_r = normalized_cost_r,
+    propagated_source_strength_r = propagated_source_strength_r,
+    propagated_source_range_r = propagated_source_range_r,
+    score_r = score_r,
+    processed_n = processed_n,
+    source_n = length(source_idx)
   )
 }
+
+propagation_result <- run_directional_cost_propagation(
+  template_r = template_r,
+  source_strength_r = open_source_strength_r,
+  barrier_strength_r = absence_barrier_strength_r,
+  allowed_r = directional_allowed_r,
+  no_data_r = no_data_binary_r,
+  absence_r = absence_binary_r,
+  base_range_m = base_range_m,
+  grid_cell_size_m = grid_cell_size_m,
+  source_range_bonus = source_range_bonus,
+  source_strength_power = source_strength_power,
+  source_min_strength = source_min_strength,
+  barrier_cost_multiplier = barrier_cost_multiplier,
+  barrier_strength_power = barrier_strength_power,
+  barrier_vs_source_scale = barrier_vs_source_scale,
+  absence_cell_extra_cost = absence_cell_extra_cost,
+  decay_power = decay_power,
+  max_normalized_cost = max_normalized_cost,
+  min_range_modifier = min_range_modifier,
+  neighbor_mode = directional_neighbor_mode
+)
+
+directional_normalized_cost_r <- propagation_result$normalized_cost_r
+directional_source_strength_r <- propagation_result$propagated_source_strength_r
+directional_source_range_m_r <- propagation_result$propagated_source_range_r
+directional_cluster_continuity_score_all_cells_r <- propagation_result$score_r
+names(directional_cluster_continuity_score_all_cells_r) <- "directional_cluster_continuity_score_all_cells"
+
+cluster_continuity_score_all_cells_r <- directional_cluster_continuity_score_all_cells_r
+names(cluster_continuity_score_all_cells_r) <- "cluster_continuity_score_all_cells"
+
+cluster_continuity_score_no_data_only_r <- terra::ifel(
+  no_data_binary_r == 1,
+  cluster_continuity_score_all_cells_r,
+  NA_real_
+)
+names(cluster_continuity_score_no_data_only_r) <- "cluster_continuity_score_no_data_only"
+
+propagation_summary <- tibble::tibble(
+  source_cells = propagation_result$source_n,
+  processed_cells = propagation_result$processed_n,
+  base_range_m = base_range_m,
+  max_normalized_cost = max_normalized_cost,
+  decay_power = decay_power,
+  barrier_cost_multiplier = barrier_cost_multiplier,
+  absence_cell_extra_cost = absence_cell_extra_cost
+)
+
+print(propagation_summary)
+readr::write_csv(
+  propagation_summary,
+  file.path(final_csv_dir, "final_directional_propagation_summary.csv")
+)
+
+print(terra::global(cluster_continuity_score_no_data_only_r, c("min", "mean", "max"), na.rm = TRUE))
 ```
 
-```{r absence-evidence-score-diagnostics}
-# 目的：
-# 距離減衰 + absence evidence 抑制の効果を数値診断する。
-#
-# 達成指標：
-# 基準スコア、soft抑制、hybrid抑制の正値セル数・弱シグナル比率・分位がCSV出力される。
+# 21. directional-score-diagnostics
 
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、absence evidence diagnostics をスキップします。")
-} else {
+**目的**：directional modelの構成ラスタと最終スコアを数値診断する。
 
-  required_rasters <- c(
-    "euclidean_compact_score_no_data_r",
-    "absence_evidence_50m_r",
-    "absence_evidence_100m_r",
-    "absence_evidence_combined_r",
-    "euclidean_absence_soft_p2_score_no_data_r",
-    "euclidean_absence_soft_p4_score_no_data_r",
-    "euclidean_absence_hybrid_t25_score_no_data_r",
-    "euclidean_absence_hybrid_t35_score_no_data_r",
-    "cluster_continuity_score_no_data_only_r"
-  )
+```{r c21_directional_score_diagnostics, eval=TRUE}
+score_layers <- list(
+  source_seed_strength = source_seed_strength_r,
+  open_source_strength = open_source_strength_r,
+  supported_density_score = supported_density_score_r,
+  absence_evidence = absence_evidence_r,
+  absence_continuity_score = absence_continuity_score_r,
+  absence_barrier_strength = absence_barrier_strength_r,
+  directional_normalized_cost = directional_normalized_cost_r,
+  directional_source_strength = directional_source_strength_r,
+  directional_source_range_m = directional_source_range_m_r,
+  cluster_continuity_score_no_data_only = cluster_continuity_score_no_data_only_r,
+  isolated_dwelling_signal = isolated_dwelling_signal_r
+)
 
-  missing_rasters <- required_rasters[
-    !vapply(required_rasters, exists, logical(1))
-  ]
+summarise_raster_values <- function(r, layer_name) {
+  vals <- terra::values(r, mat = FALSE)
+  vals <- vals[is.finite(vals)]
 
-  if (length(missing_rasters) > 0) {
-    stop(
-      "必要なラスタが存在しません: ",
-      paste(missing_rasters, collapse = ", ")
-    )
+  if (length(vals) == 0) {
+    return(tibble::tibble(
+      layer = layer_name,
+      n = 0,
+      n_positive = 0,
+      min = NA_real_,
+      q25 = NA_real_,
+      median = NA_real_,
+      q75 = NA_real_,
+      q95 = NA_real_,
+      max = NA_real_
+    ))
   }
 
-  summarise_score_values <- function(r, label) {
-    vals <- terra::values(r, mat = FALSE)
-    vals <- vals[is.finite(vals)]
-
-    if (length(vals) == 0) {
-      return(tibble::tibble(
-        score_layer = label,
-        n_values = 0,
-        n_positive = 0,
-        n_low_positive_0_to_0_1 = 0,
-        low_positive_ratio = NA_real_,
-        min = NA_real_,
-        q25 = NA_real_,
-        median = NA_real_,
-        q75 = NA_real_,
-        max = NA_real_
-      ))
-    }
-
-    n_positive <- sum(vals > 0, na.rm = TRUE)
-    n_low_positive <- sum(vals > 0 & vals < 0.1, na.rm = TRUE)
-
-    tibble::tibble(
-      score_layer = label,
-      n_values = length(vals),
-      n_positive = n_positive,
-      n_low_positive_0_to_0_1 = n_low_positive,
-      low_positive_ratio = ifelse(
-        n_positive > 0,
-        n_low_positive / n_positive,
-        NA_real_
-      ),
-      min = min(vals, na.rm = TRUE),
-      q25 = as.numeric(stats::quantile(vals, 0.25, na.rm = TRUE)),
-      median = stats::median(vals, na.rm = TRUE),
-      q75 = as.numeric(stats::quantile(vals, 0.75, na.rm = TRUE)),
-      max = max(vals, na.rm = TRUE)
-    )
-  }
-
-  absence_score_summary <- dplyr::bind_rows(
-    summarise_score_values(
-      euclidean_compact_score_no_data_r,
-      "euclidean_compact_score_no_data"
-    ),
-    summarise_score_values(
-      absence_evidence_50m_r,
-      "absence_evidence_50m"
-    ),
-    summarise_score_values(
-      absence_evidence_100m_r,
-      "absence_evidence_100m"
-    ),
-    summarise_score_values(
-      absence_evidence_combined_r,
-      "absence_evidence_combined"
-    ),
-    summarise_score_values(
-      euclidean_absence_soft_p2_score_no_data_r,
-      "euclidean_absence_soft_p2_score_no_data"
-    ),
-    summarise_score_values(
-      euclidean_absence_soft_p4_score_no_data_r,
-      "euclidean_absence_soft_p4_score_no_data"
-    ),
-    summarise_score_values(
-      euclidean_absence_hybrid_t25_score_no_data_r,
-      "euclidean_absence_hybrid_t25_score_no_data"
-    ),
-    summarise_score_values(
-      euclidean_absence_hybrid_t35_score_no_data_r,
-      "euclidean_absence_hybrid_t35_score_no_data"
-    ),
-    summarise_score_values(
-      cluster_continuity_score_no_data_only_r,
-      "cluster_continuity_score_no_data_only"
-    )
+  tibble::tibble(
+    layer = layer_name,
+    n = length(vals),
+    n_positive = sum(vals > 0, na.rm = TRUE),
+    min = min(vals, na.rm = TRUE),
+    q25 = as.numeric(stats::quantile(vals, 0.25, na.rm = TRUE)),
+    median = stats::median(vals, na.rm = TRUE),
+    q75 = as.numeric(stats::quantile(vals, 0.75, na.rm = TRUE)),
+    q95 = as.numeric(stats::quantile(vals, 0.95, na.rm = TRUE)),
+    max = max(vals, na.rm = TRUE)
   )
-
-  print(absence_score_summary)
-
-  absence_parameter_summary <- tibble::tibble(
-    parameter = c(
-      "selected_d_adj_safe_m",
-      "euclidean_max_distance_m",
-      "euclidean_decay_power",
-      "absence_soft_power_moderate",
-      "absence_soft_power_strong",
-      "absence_hard_threshold_low",
-      "absence_hard_threshold_high",
-      "absence_100m_weight",
-      "final_score_selected"
-    ),
-    value = c(
-      as.character(selected_d_adj_safe_m),
-      as.character(euclidean_max_distance_m),
-      as.character(euclidean_decay_power),
-      as.character(absence_soft_power_moderate),
-      as.character(absence_soft_power_strong),
-      as.character(absence_hard_threshold_low),
-      as.character(absence_hard_threshold_high),
-      as.character(absence_100m_weight),
-      "euclidean_absence_soft_p4_score_no_data"
-    )
-  )
-
-  print(absence_parameter_summary)
-
-  if (exists("final_csv_dir")) {
-    dir.create(final_csv_dir, recursive = TRUE, showWarnings = FALSE)
-
-    readr::write_csv(
-      absence_score_summary,
-      file.path(final_csv_dir, "final_absence_evidence_score_diagnostics.csv")
-    )
-
-    readr::write_csv(
-      absence_parameter_summary,
-      file.path(final_csv_dir, "final_absence_evidence_score_parameters.csv")
-    )
-  }
 }
+
+final_directional_score_diagnostics <- purrr::imap_dfr(
+  score_layers,
+  summarise_raster_values
+)
+
+print(final_directional_score_diagnostics)
+readr::write_csv(
+  final_directional_score_diagnostics,
+  file.path(final_csv_dir, "final_directional_score_diagnostics.csv")
+)
+
+final_directional_parameters <- dplyr::bind_rows(
+  analysis_parameter_table |>
+    dplyr::transmute(
+      group,
+      parameter,
+      value = as.character(value),
+      meaning
+    ),
+  tibble::tibble(
+    group = "runtime",
+    parameter = "selected_d_adj_safe_m",
+    value = as.character(selected_d_adj_safe_m),
+    meaning = "DBSCAN候補から求めた代表的隣接距離"
+  ),
+  tibble::tibble(
+    group = "runtime",
+    parameter = "base_range_m",
+    value = as.character(base_range_m),
+    meaning = "selected_d_adj_safe_mとbase_range_min_mから計算した基本到達距離"
+  )
+)
+
+readr::write_csv(
+  final_directional_parameters,
+  file.path(final_csv_dir, "final_directional_parameters.csv")
+)
 ```
 
-```{r euclidean-distance-score-diagnostics, eval=FALSE}
-# 目的：
-# ユークリッド距離＋有限距離減衰、およびユークリッド距離＋absence barrierの効果を数値診断する。
-#
-# 達成指標：
-# barrierなし版とbarrierあり版の正値セル数、弱シグナル比率、スコア分位がCSV出力される。
+# 22. export-final-rasters
 
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、euclidean diagnostics をスキップします。")
-} else {
+**目的**：final成果ラスタをGeoTIFFとして出力する。
 
-  required_rasters <- c(
-    "euclidean_compact_score_no_data_r",
-    "euclidean_barrier_connected_no_data_r",
-    "euclidean_absence_barrier_score_no_data_r",
-    "cluster_continuity_score_no_data_only_r"
+```{r c22_export_final_rasters, eval=TRUE}
+dir.create(final_raster_dir, recursive = TRUE, showWarnings = FALSE)
+
+raster_outputs <- list(
+  source_seed_strength = source_seed_strength_r,
+  open_source_strength = open_source_strength_r,
+  no_data_contact = no_data_contact_r,
+  supported_density_score = supported_density_score_r,
+  isolated_dwelling_signal = isolated_dwelling_signal_r,
+  absence_evidence = absence_evidence_r,
+  absence_continuity_score = absence_continuity_score_r,
+  absence_barrier_strength = absence_barrier_strength_r,
+  directional_allowed = directional_allowed_r,
+  directional_normalized_cost = directional_normalized_cost_r,
+  directional_source_strength = directional_source_strength_r,
+  directional_source_range_m = directional_source_range_m_r,
+  cluster_continuity_score_all_cells = cluster_continuity_score_all_cells_r,
+  cluster_continuity_score_no_data_only = cluster_continuity_score_no_data_only_r
+)
+
+for (nm in names(raster_outputs)) {
+  out_path <- file.path(
+    final_raster_dir,
+    paste0("final_", nm, ".tif")
   )
 
-  missing_rasters <- required_rasters[
-    !vapply(required_rasters, exists, logical(1))
-  ]
-
-  if (length(missing_rasters) > 0) {
-    stop(
-      "必要なラスタが存在しません: ",
-      paste(missing_rasters, collapse = ", ")
-    )
-  }
-
-  summarise_score_values <- function(r, label) {
-    vals <- terra::values(r, mat = FALSE)
-    vals <- vals[is.finite(vals)]
-
-    if (length(vals) == 0) {
-      return(tibble::tibble(
-        score_layer = label,
-        n_values = 0,
-        n_positive = 0,
-        n_low_positive_0_to_0_1 = 0,
-        low_positive_ratio = NA_real_,
-        min = NA_real_,
-        q25 = NA_real_,
-        median = NA_real_,
-        q75 = NA_real_,
-        max = NA_real_
-      ))
-    }
-
-    n_positive <- sum(vals > 0, na.rm = TRUE)
-    n_low_positive <- sum(vals > 0 & vals < 0.1, na.rm = TRUE)
-
-    tibble::tibble(
-      score_layer = label,
-      n_values = length(vals),
-      n_positive = n_positive,
-      n_low_positive_0_to_0_1 = n_low_positive,
-      low_positive_ratio = ifelse(
-        n_positive > 0,
-        n_low_positive / n_positive,
-        NA_real_
-      ),
-      min = min(vals, na.rm = TRUE),
-      q25 = as.numeric(stats::quantile(vals, 0.25, na.rm = TRUE)),
-      median = stats::median(vals, na.rm = TRUE),
-      q75 = as.numeric(stats::quantile(vals, 0.75, na.rm = TRUE)),
-      max = max(vals, na.rm = TRUE)
-    )
-  }
-
-  euclidean_score_summary <- dplyr::bind_rows(
-    summarise_score_values(
-      euclidean_compact_score_no_data_r,
-      "euclidean_compact_score_no_data"
-    ),
-    summarise_score_values(
-      euclidean_barrier_connected_no_data_r,
-      "euclidean_barrier_connected_no_data"
-    ),
-    summarise_score_values(
-      euclidean_absence_barrier_score_no_data_r,
-      "euclidean_absence_barrier_score_no_data"
-    ),
-    summarise_score_values(
-      cluster_continuity_score_no_data_only_r,
-      "cluster_continuity_score_no_data_only"
-    )
+  terra::writeRaster(
+    raster_outputs[[nm]],
+    out_path,
+    overwrite = TRUE
   )
 
-  print(euclidean_score_summary)
-
-  euclidean_parameter_summary <- tibble::tibble(
-    parameter = c(
-      "selected_d_adj_safe_m",
-      "euclidean_max_distance_m",
-      "euclidean_decay_power",
-      "euclidean_barrier_directions"
-    ),
-    value = c(
-      selected_d_adj_safe_m,
-      euclidean_max_distance_m,
-      euclidean_decay_power,
-      euclidean_barrier_directions
-    )
-  )
-
-  print(euclidean_parameter_summary)
-
-  if (exists("final_csv_dir")) {
-    dir.create(final_csv_dir, recursive = TRUE, showWarnings = FALSE)
-
-    readr::write_csv(
-      euclidean_score_summary,
-      file.path(final_csv_dir, "final_euclidean_score_diagnostics.csv")
-    )
-
-    readr::write_csv(
-      euclidean_parameter_summary,
-      file.path(final_csv_dir, "final_euclidean_score_parameters.csv")
-    )
-  }
+  cat("raster written:", out_path, "\n")
 }
+
+expected_final_rasters <- paste0("final_", names(raster_outputs), ".tif")
+final_raster_check <- tibble::tibble(
+  file = expected_final_rasters,
+  path = file.path(final_raster_dir, expected_final_rasters),
+  exists = file.exists(file.path(final_raster_dir, expected_final_rasters))
+)
+
+print(final_raster_check)
+readr::write_csv(
+  final_raster_check,
+  file.path(final_csv_dir, "final_raster_output_check.csv")
+)
 ```
 
-```{r propagation-score-diagnostics, eval=FALSE}
-# 目的：
-# barrier + compact propagation 型スコアの分布を診断する。
-#
-# 達成指標：
-# 到達可能no_dataセル数、距離範囲、スコア分位がCSVに出力される。
+# 23. export-final-gpkg
 
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、propagation diagnostics をスキップします。")
-} else {
+**目的**：interimとfinal成果をGeoPackageにまとめる。
 
-  required_rasters <- c(
-    "barrier_connected_no_data_r",
-    "propagation_distance_from_source_r",
-    "compact_distance_score_r",
-    "barrier_compact_propagation_score_r",
-    "cluster_continuity_score_no_data_only_r"
+```{r c23_export_final_gpkg, eval=TRUE}
+if (file.exists(final_gpkg)) {
+  unlink(final_gpkg)
+}
+
+# interimレイヤも同じGPKGに再出力する。
+write_gpkg_layer_safe(dwelling_points_grouped_macro, final_gpkg, "interim_dwelling_points_grouped")
+write_gpkg_layer_safe(group_geometries_interim, final_gpkg, "interim_group_geometries")
+write_gpkg_layer_safe(macro_group_geometries_interim, final_gpkg, "interim_macro_cluster_geometries")
+write_gpkg_layer_safe(macro_cluster_link_edges, final_gpkg, "interim_macro_cluster_link_edges")
+write_gpkg_layer_safe(internal_void_candidates, final_gpkg, "interim_internal_void_candidates")
+write_gpkg_layer_safe(
+  grid10_status |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      dwelling_count,
+      surveyed_ratio,
+      surveyed_area_m2,
+      cell_area_m2
+    ),
+  final_gpkg,
+  "interim_grid_status"
+)
+
+# finalレイヤ。
+write_gpkg_layer_safe(dwelling_points_final, final_gpkg, "final_dwelling_points_with_support")
+write_gpkg_layer_safe(macro_group_geometries_final, final_gpkg, "final_macro_cluster_isolation_support")
+
+final_grid_extract_points <- suppressWarnings(sf::st_point_on_surface(grid10))
+
+extract_one_final_raster <- function(r, value_name) {
+  r_tmp <- r
+  names(r_tmp) <- value_name
+  values_tmp <- terra::extract(
+    r_tmp,
+    terra::vect(final_grid_extract_points),
+    ID = FALSE
+  ) |>
+    tibble::as_tibble()
+
+  values_tmp <- values_tmp[, 1, drop = FALSE]
+  names(values_tmp) <- value_name
+  values_tmp
+}
+
+final_grid_values <- dplyr::bind_cols(
+  extract_one_final_raster(cluster_continuity_score_no_data_only_r, "cluster_continuity_score_no_data_only"),
+  extract_one_final_raster(cluster_continuity_score_all_cells_r, "cluster_continuity_score_all_cells"),
+  extract_one_final_raster(directional_normalized_cost_r, "directional_normalized_cost"),
+  extract_one_final_raster(directional_source_strength_r, "directional_source_strength"),
+  extract_one_final_raster(absence_barrier_strength_r, "absence_barrier_strength"),
+  extract_one_final_raster(isolated_dwelling_signal_r, "isolated_dwelling_signal")
+)
+
+final_score_grid <- dplyr::bind_cols(
+  grid10 |>
+    dplyr::select(
+      grid_id,
+      response,
+      cell_status,
+      dwelling_count,
+      surveyed_ratio
+    ),
+  final_grid_values
+)
+
+final_score_grid_no_data <- final_score_grid |>
+  dplyr::filter(
+    cell_status == "no_data",
+    !is.na(cluster_continuity_score_no_data_only)
   )
 
-  missing_rasters <- required_rasters[
-    !vapply(required_rasters, exists, logical(1))
-  ]
+write_gpkg_layer_safe(
+  final_score_grid_no_data,
+  final_gpkg,
+  "final_directional_continuity_grid_no_data"
+)
 
-  if (length(missing_rasters) > 0) {
-    stop(
-      "必要なラスタが存在しません: ",
-      paste(missing_rasters, collapse = ", ")
-    )
-  }
-
-  connected_vals <- terra::values(
-    barrier_connected_no_data_r,
-    mat = FALSE
-  )
-
-  dist_vals <- terra::values(
-    propagation_distance_from_source_r,
-    mat = FALSE
-  )
-
-  score_vals <- terra::values(
-    cluster_continuity_score_no_data_only_r,
-    mat = FALSE
-  )
-
-  connected_no_data_count <- sum(
-    connected_vals == 1,
+if (nrow(final_score_grid_no_data) > 0) {
+  high_score_threshold <- stats::quantile(
+    final_score_grid_no_data$cluster_continuity_score_no_data_only,
+    0.95,
     na.rm = TRUE
   )
 
-  score_positive_count <- sum(
-    score_vals > 0,
-    na.rm = TRUE
-  )
-
-  score_positive_low_count <- sum(
-    score_vals > 0 & score_vals < 0.1,
-    na.rm = TRUE
-  )
-
-  score_summary <- tibble::tibble(
-    metric = c(
-      "connected_no_data_count",
-      "score_positive_count",
-      "score_positive_low_count_0_to_0_1",
-      "positive_low_ratio",
-      "distance_min_m",
-      "distance_q25_m",
-      "distance_median_m",
-      "distance_q75_m",
-      "distance_max_m",
-      "score_min",
-      "score_q25",
-      "score_median",
-      "score_q75",
-      "score_max"
-    ),
-    value = c(
-      connected_no_data_count,
-      score_positive_count,
-      score_positive_low_count,
-      ifelse(score_positive_count > 0, score_positive_low_count / score_positive_count, NA_real_),
-      suppressWarnings(min(dist_vals, na.rm = TRUE)),
-      suppressWarnings(as.numeric(stats::quantile(dist_vals, 0.25, na.rm = TRUE))),
-      suppressWarnings(stats::median(dist_vals, na.rm = TRUE)),
-      suppressWarnings(as.numeric(stats::quantile(dist_vals, 0.75, na.rm = TRUE))),
-      suppressWarnings(max(dist_vals, na.rm = TRUE)),
-      suppressWarnings(min(score_vals, na.rm = TRUE)),
-      suppressWarnings(as.numeric(stats::quantile(score_vals, 0.25, na.rm = TRUE))),
-      suppressWarnings(stats::median(score_vals, na.rm = TRUE)),
-      suppressWarnings(as.numeric(stats::quantile(score_vals, 0.75, na.rm = TRUE))),
-      suppressWarnings(max(score_vals, na.rm = TRUE))
-    )
-  )
-
-  print(score_summary)
-
-  if (exists("final_csv_dir")) {
-    dir.create(final_csv_dir, recursive = TRUE, showWarnings = FALSE)
-
-    readr::write_csv(
-      score_summary,
-      file.path(final_csv_dir, "final_barrier_compact_propagation_score_summary.csv")
-    )
-  }
-}
-```
-
-# export-final-rasters
-
-**目的**：QGIS表示用の最終ラスタと構成要素ラスタをGeoTIFFで出力する。  
-**達成指標**：連続値スコアと診断用成分ラスタが `final/raster` に作成される。
-
-```{r export-final-rasters}
-# 目的：
-# QGIS表示用の最終ラスタと診断ラスタをGeoTIFFで出力する。
-#
-# 達成指標：
-# 距離減衰 + absence evidence 抑制版、その比較用成分が final/raster に出力される。
-# 旧検証用のBFS伝播ラスタ・単純barrierラスタは削除される。
-
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、final raster 出力をスキップします。")
-} else {
-
-  if (!exists("final_raster_dir")) {
-    stop("final_raster_dir が存在しません。paths chunkを確認してください。")
-  }
-
-  dir.create(final_raster_dir, recursive = TRUE, showWarnings = FALSE)
-
-  # 不採用になった旧検証ラスタを削除する。
-  obsolete_final_rasters <- c(
-    "final_barrier_connected_no_data.tif",
-    "final_propagation_distance_from_source_m.tif",
-    "final_compact_distance_score.tif",
-    "final_barrier_compact_propagation_score.tif",
-    "final_euclidean_barrier_connected_no_data.tif",
-    "final_euclidean_absence_barrier_allowed.tif",
-    "final_euclidean_absence_barrier_patch.tif",
-    "final_euclidean_absence_barrier_score_no_data.tif"
-  )
-
-  obsolete_paths <- file.path(final_raster_dir, obsolete_final_rasters)
-
-  if (any(file.exists(obsolete_paths))) {
-    unlink(obsolete_paths[file.exists(obsolete_paths)])
-    cat("obsolete validation rasters removed:\n")
-    print(obsolete_paths[file.exists(obsolete_paths)])
-  }
-
-  raster_outputs <- list()
-
-  # 従来成分：比較・診断用として残す
-  if (exists("supported_cluster_proximity_score_r")) {
-    raster_outputs$supported_cluster_proximity_score <- supported_cluster_proximity_score_r
-  }
-
-  if (exists("supported_density_score_50m_r")) {
-    raster_outputs$supported_density_score_50m <- supported_density_score_50m_r
-  }
-
-  if (exists("effective_open_no_data_score_100m_r")) {
-    raster_outputs$effective_open_no_data_score_100m <- effective_open_no_data_score_100m_r
-  }
-
-  if (exists("absence_penalty_50m_r")) {
-    raster_outputs$absence_penalty_50m <- absence_penalty_50m_r
-  }
-
-  if (exists("isolated_dwelling_signal_r")) {
-    raster_outputs$isolated_dwelling_signal <- isolated_dwelling_signal_r
-  }
-
-  # 今回の距離減衰 + absence evidence 検証用成分
-  if (exists("propagation_source_seed_r")) {
-    raster_outputs$propagation_source_seed <- propagation_source_seed_r
-  }
-
-  if (exists("euclidean_distance_from_source_r")) {
-    raster_outputs$euclidean_distance_from_source_m <- euclidean_distance_from_source_r
-  }
-
-  if (exists("euclidean_compact_distance_score_r")) {
-    raster_outputs$euclidean_compact_distance_score <- euclidean_compact_distance_score_r
-  }
-
-  if (exists("euclidean_compact_score_no_data_r")) {
-    raster_outputs$euclidean_compact_score_no_data <- euclidean_compact_score_no_data_r
-  }
-
-  if (exists("absence_evidence_50m_r")) {
-    raster_outputs$absence_evidence_50m <- absence_evidence_50m_r
-  }
-
-  if (exists("absence_evidence_100m_r")) {
-    raster_outputs$absence_evidence_100m <- absence_evidence_100m_r
-  }
-
-  if (exists("absence_evidence_combined_r")) {
-    raster_outputs$absence_evidence_combined <- absence_evidence_combined_r
-  }
-
-  if (exists("euclidean_absence_soft_p2_score_no_data_r")) {
-    raster_outputs$euclidean_absence_soft_p2_score_no_data <-
-      euclidean_absence_soft_p2_score_no_data_r
-  }
-
-  if (exists("euclidean_absence_soft_p4_score_no_data_r")) {
-    raster_outputs$euclidean_absence_soft_p4_score_no_data <-
-      euclidean_absence_soft_p4_score_no_data_r
-  }
-
-  if (exists("euclidean_absence_hybrid_t25_score_no_data_r")) {
-    raster_outputs$euclidean_absence_hybrid_t25_score_no_data <-
-      euclidean_absence_hybrid_t25_score_no_data_r
-  }
-
-  if (exists("euclidean_absence_hybrid_t35_score_no_data_r")) {
-    raster_outputs$euclidean_absence_hybrid_t35_score_no_data <-
-      euclidean_absence_hybrid_t35_score_no_data_r
-  }
-
-  # 最終スコア
-  if (exists("cluster_continuity_score_all_cells_r")) {
-    raster_outputs$cluster_continuity_score_all_cells <-
-      cluster_continuity_score_all_cells_r
-  }
-
-  if (exists("cluster_continuity_score_no_data_only_r")) {
-    raster_outputs$cluster_continuity_score_no_data_only <-
-      cluster_continuity_score_no_data_only_r
-  }
-
-  if (length(raster_outputs) == 0) {
-    stop("出力対象ラスタがありません。build-final-continuity-score chunkを確認してください。")
-  }
-
-  for (nm in names(raster_outputs)) {
-    out_path <- file.path(
-      final_raster_dir,
-      paste0("final_", nm, ".tif")
-    )
-
-    terra::writeRaster(
-      raster_outputs[[nm]],
-      out_path,
-      overwrite = TRUE
-    )
-
-    cat("raster written:", out_path, "\n")
-  }
-
-  expected_final_rasters <- c(
-    "final_euclidean_compact_score_no_data.tif",
-    "final_absence_evidence_50m.tif",
-    "final_absence_evidence_100m.tif",
-    "final_absence_evidence_combined.tif",
-    "final_euclidean_absence_soft_p2_score_no_data.tif",
-    "final_euclidean_absence_soft_p4_score_no_data.tif",
-    "final_euclidean_absence_hybrid_t25_score_no_data.tif",
-    "final_euclidean_absence_hybrid_t35_score_no_data.tif",
-    "final_cluster_continuity_score_no_data_only.tif"
-  )
-
-  raster_check <- tibble::tibble(
-    file = expected_final_rasters,
-    path = file.path(final_raster_dir, expected_final_rasters),
-    exists = file.exists(file.path(final_raster_dir, expected_final_rasters))
-  )
-
-  print(raster_check)
-
-  if (any(!raster_check$exists)) {
-    warning(
-      "不足しているfinal rasterがあります: ",
-      paste(raster_check$file[!raster_check$exists], collapse = ", ")
-    )
-  }
-}
-```
-
-# export-final-gpkg
-
-**目的**：最終成果と中間検証レイヤをGeoPackageにまとめる。  
-**達成指標**：final GPKGに `interim_` と `final_` レイヤが格納される。
-
-```{r export-final-gpkg}
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、final gpkg 出力をスキップします。")
-  message("中間検証レイヤは export-interim-gpkg-layers で出力済みです。")
-} else {
-  if (file.exists(final_gpkg)) {
-    unlink(final_gpkg)
-  }
-
-  # final出力時にもinterimレイヤを再書き出しし、GPKG再作成による消失を防ぐ。
-  write_gpkg_layer_safe(dwelling_points_grouped_macro, final_gpkg, "interim_dwelling_points_grouped")
-  write_gpkg_layer_safe(group_geometries_interim, final_gpkg, "interim_group_geometries")
-  write_gpkg_layer_safe(macro_group_geometries_interim, final_gpkg, "interim_macro_cluster_geometries")
-  write_gpkg_layer_safe(macro_cluster_link_edges, final_gpkg, "interim_macro_cluster_link_edges")
-  write_gpkg_layer_safe(internal_void_candidates, final_gpkg, "interim_internal_void_candidates")
-  write_gpkg_layer_safe(
-    grid10_status |>
-      dplyr::select(grid_id, response, cell_status, dwelling_count, surveyed_ratio, surveyed_area_m2, cell_area_m2),
-    final_gpkg,
-    "interim_grid_status"
-  )
-
-  write_gpkg_layer_safe(dwelling_points_final, final_gpkg, "final_dwelling_points_with_support")
-  write_gpkg_layer_safe(macro_group_geometries_final, final_gpkg, "final_macro_cluster_isolation_support")
-
-  final_grid_extract_points <- suppressWarnings(sf::st_point_on_surface(grid10))
-
-  extract_one_final_raster <- function(r, value_name) {
-    r_tmp <- r
-    names(r_tmp) <- value_name
-    values_tmp <- terra::extract(r_tmp, terra::vect(final_grid_extract_points), ID = FALSE) |>
-      tibble::as_tibble()
-    values_tmp <- values_tmp[, 1, drop = FALSE]
-    names(values_tmp) <- value_name
-    values_tmp
-  }
-
-  final_grid_values <- dplyr::bind_cols(
-    extract_one_final_raster(cluster_continuity_score_no_data_only_r, "cluster_continuity_score_no_data_only"),
-    extract_one_final_raster(cluster_continuity_score_all_cells_r, "cluster_continuity_score_all_cells"),
-    extract_one_final_raster(isolated_dwelling_signal_r, "isolated_dwelling_signal")
-  )
-
-  final_score_grid <- dplyr::bind_cols(
-    grid10 |>
-      dplyr::select(grid_id, response, cell_status, dwelling_count, surveyed_ratio),
-    final_grid_values
-  )
-
-  final_score_grid_no_data <- final_score_grid |>
+  final_score_grid_no_data_high <- final_score_grid_no_data |>
     dplyr::filter(
-      cell_status == "no_data",
-      !is.na(cluster_continuity_score_no_data_only)
+      cluster_continuity_score_no_data_only >= high_score_threshold
     )
 
   write_gpkg_layer_safe(
-    final_score_grid_no_data,
+    final_score_grid_no_data_high,
     final_gpkg,
-    "final_cluster_continuity_grid_no_data"
+    "final_directional_continuity_grid_no_data_top5pct"
   )
-
-  if (nrow(final_score_grid_no_data) > 0) {
-    high_score_threshold <- stats::quantile(
-      final_score_grid_no_data$cluster_continuity_score_no_data_only,
-      0.95,
-      na.rm = TRUE
-    )
-
-    final_score_grid_no_data_high <- final_score_grid_no_data |>
-      dplyr::filter(
-        cluster_continuity_score_no_data_only >= high_score_threshold
-      )
-
-    write_gpkg_layer_safe(
-      final_score_grid_no_data_high,
-      final_gpkg,
-      "final_cluster_continuity_grid_no_data_top5pct"
-    )
-  }
-
-  cat("final gpkg:", final_gpkg, "\n")
 }
+
+cat("final gpkg:", final_gpkg, "\n")
 ```
 
-# final-summaries
+# 24. final-summaries
 
-**目的**：最終成果のCSV要約を出力する。  
-**達成指標**：finalモデル実行時に、final scoreとmacro supportの要約CSVが作成される。
+**目的**：final成果の要約CSVを出力する。
 
-```{r final-summaries}
-if (!proceed_to_final_model) {
-  message("proceed_to_final_model = FALSE のため、final summary 出力をスキップします。")
-} else {
-  final_no_data_summary <- final_score_grid_no_data |>
-    sf::st_drop_geometry() |>
-    dplyr::summarise(
-      n_no_data_cells = dplyr::n(),
-      score_min = min(cluster_continuity_score_no_data_only, na.rm = TRUE),
-      score_q25 = stats::quantile(cluster_continuity_score_no_data_only, 0.25, na.rm = TRUE),
-      score_median = stats::median(cluster_continuity_score_no_data_only, na.rm = TRUE),
-      score_q75 = stats::quantile(cluster_continuity_score_no_data_only, 0.75, na.rm = TRUE),
-      score_q95 = stats::quantile(cluster_continuity_score_no_data_only, 0.95, na.rm = TRUE),
-      score_max = max(cluster_continuity_score_no_data_only, na.rm = TRUE)
-    )
+```{r c24_final_summaries, eval=TRUE}
+if (!exists("final_score_grid_no_data")) {
+  stop("final_score_grid_no_data が存在しません。export-final-gpkg chunkを確認してください。")
+}
 
-  print(final_no_data_summary)
+final_no_data_summary <- final_score_grid_no_data |>
+  sf::st_drop_geometry() |>
+  dplyr::summarise(
+    n_no_data_cells = dplyr::n(),
+    score_min = min(cluster_continuity_score_no_data_only, na.rm = TRUE),
+    score_q25 = stats::quantile(cluster_continuity_score_no_data_only, 0.25, na.rm = TRUE),
+    score_median = stats::median(cluster_continuity_score_no_data_only, na.rm = TRUE),
+    score_q75 = stats::quantile(cluster_continuity_score_no_data_only, 0.75, na.rm = TRUE),
+    score_q95 = stats::quantile(cluster_continuity_score_no_data_only, 0.95, na.rm = TRUE),
+    score_max = max(cluster_continuity_score_no_data_only, na.rm = TRUE),
+    cost_median = stats::median(directional_normalized_cost, na.rm = TRUE),
+    barrier_median = stats::median(absence_barrier_strength, na.rm = TRUE)
+  )
 
+print(final_no_data_summary)
+readr::write_csv(
+  final_no_data_summary,
+  file.path(final_csv_dir, "final_no_data_score_summary.csv")
+)
+
+final_macro_support_summary <- macro_support_table |>
+  dplyr::summarise(
+    n_macro_clusters = dplyr::n(),
+    cluster_support_min = min(cluster_support, na.rm = TRUE),
+    cluster_support_median = stats::median(cluster_support, na.rm = TRUE),
+    cluster_support_max = max(cluster_support, na.rm = TRUE),
+    isolation_score_median = stats::median(isolation_score, na.rm = TRUE)
+  )
+
+print(final_macro_support_summary)
+readr::write_csv(
+  final_macro_support_summary,
+  file.path(final_csv_dir, "final_macro_support_summary.csv")
+)
+```
+
+# 25. chunk-list
+
+**目的**：Rmd内のchunk一覧を出力する。
+
+```{r c25_chunk_list, eval=TRUE}
+chunk_index <- tibble::tribble(
+  ~no, ~chunk, ~section, ~purpose,
+  1, "c01_setup", "setup", "解析に必要なパッケージと共通関数を準備する。",
+  2, "c02_paths", "paths", "入力データと出力先フォルダを定義する。",
+  3, "c03_analysis_parameters", "analysis-parameters", "directional model用の解析パラメータを定義する。",
+  4, "c04_download_data", "download-data", "必要な入力GPKGがローカルにない場合に取得する。",
+  5, "c05_read_data", "read-data", "GPKGから住居点、調査区、市域ポリゴンを読み込む。",
+  6, "c06_create_analysis_grid", "create-analysis-grid", "市域内に10mグリッドとラスタテンプレートを作成する。",
+  7, "c07_assign_grid_response", "assign-grid-response", "各10mセルにpresence、absence、no_dataを付与する。",
+  8, "c08_rasterize_status_layers", "rasterize-status-layers", "presence、absence、no_data、surveyed areaをラスタ化する。",
+  9, "c09_local_context_rasters", "local-context-rasters", "interim確認用のabsence penalty と open no_data scoreを作成する。",
+  10, "c10_dwelling_neighbor_distances", "dwelling-neighbor-distances", "住居間距離を計算し、micro cluster候補パラメータを作る。",
+  11, "c11_parameter_sweep_clustering", "parameter-sweep-clustering", "DBSCAN候補パラメータを評価する。",
+  12, "c12_select_candidate_parameters", "select-candidate-parameters", "候補パラメータからselected_eps_m、selected_min_pts、selected_d_adj_mを定義する。",
+  13, "c13_build_interim_micro_cluster_layers", "build-interim-micro-cluster-layers", "選択パラメータで住居点をmicro clusterに分類する。",
+  14, "c14_build_interim_macro_cluster_groups", "build-interim-macro-cluster-groups", "micro cluster間関係からmacro clusterを作成する。",
+  15, "c15_export_interim_rasters", "export-interim-rasters", "中間確認用ラスタをGeoTIFFとして出力する。",
+  16, "c16_export_interim_gpkg_layers", "export-interim-gpkg-layers", "中間確認用ベクタレイヤをGPKGに出力する。",
+  17, "c17_check_interim_outputs", "check-interim-outputs", "interim出力の過不足を確認する。",
+  18, "c18_compute_macro_isolation_support", "compute-macro-isolation-support", "macro clusterごとに孤立度と集落連続性への寄与度を計算する。",
+  19, "c19_build_directional_source_barrier_rasters", "build-directional-source-barrier-rasters", "開口source、source strength、absence barrier strengthを作成する。",
+  20, "c20_build_directional_propagation_score", "build-directional-propagation-score", "累積コスト型のdirectional propagationにより最終スコアを作成する。",
+  21, "c21_directional_score_diagnostics", "directional-score-diagnostics", "directional modelの構成ラスタと最終スコアを数値診断する。",
+  22, "c22_export_final_rasters", "export-final-rasters", "final成果ラスタをGeoTIFFとして出力する。",
+  23, "c23_export_final_gpkg", "export-final-gpkg", "interimとfinal成果をGeoPackageにまとめる。",
+  24, "c24_final_summaries", "final-summaries", "final成果の要約CSVを出力する。",
+  25, "c25_chunk_list", "chunk-list", "Rmd内のchunk一覧を出力する。"
+)
+
+print(chunk_index)
+
+if (exists("final_csv_dir")) {
   readr::write_csv(
-    final_no_data_summary,
-    file.path(final_csv_dir, "final_no_data_score_summary.csv")
+    chunk_index,
+    file.path(final_csv_dir, "rmd_chunk_list.csv")
   )
 }
 ```
 
-# chunk-list
-
-**目的**：Rmd全体のchunk構成を確認するため、chunk名と概要を一覧化する。  
-**達成指標**：各chunkの役割が1文で把握できる。
-
-| chunk名 | 概要 |
-|---|---|
-| `setup` | 解析に必要なパッケージと共通関数を準備する。 |
-| `paths` | 入力ファイルと出力フォルダ構成を定義する。 |
-| `analysis-parameters` | グリッドサイズ、孤立・密集判定、final実行可否を設定する。 |
-| `download-data` | 入力GPKGが存在しない場合に取得する。 |
-| `read-data` | 住居点、調査区、市域ポリゴンを読み込む。 |
-| `create-analysis-grid` | 市域から10mグリッドとラスタテンプレートを作成する。 |
-| `assign-grid-response` | 各グリッドセルにpresence/absence/no_dataを付与する。 |
-| `rasterize-status-layers` | 状態別の面積・フラグをラスタ化する。 |
-| `local-context-rasters` | absence penalty と open no_data score を作成する。 |
-| `dwelling-neighbor-distances` | 住居間距離を算出し、DBSCAN候補パラメータを準備する。 |
-| `parameter-sweep-clustering` | DBSCAN候補パラメータを評価する。 |
-| `select-candidate-parameters` | 検証用の初期パラメータと通常隣接距離を選択する。 |
-| `build-interim-micro-cluster-layers` | 住居点をmicro clusterへ分類し、中間確認用レイヤを作成する。 |
-| `build-interim-macro-cluster-groups` | micro cluster間関係からmacro clusterと内部空白域候補を作成する。 |
-| `export-interim-rasters` | 中間検証用ラスタをGeoTIFFとして出力する。 |
-| `export-interim-gpkg-layers` | 中間検証用ベクタレイヤをGPKGに出力する。 |
-| `check-interim-outputs` | 中間検証出力のCSV・ラスタ・GPKGレイヤの過不足を確認する。 |
-| `final-validation-gate` | finalモデルへ進むかどうかを明示的に制御する。 |
-| `compute-macro-isolation-support` | macro cluster単位で孤立度と集落連続性支持度を計算する。 |
-| `build-supported-rasters` | macro cluster supportに基づく近接・密度・open no_data成分を作る。 |
-| `build-final-continuity-score` | 連続量の自己相関スコアを作成する。 |
-| `export-final-rasters` | final成果ラスタをGeoTIFFで出力する。 |
-| `export-final-gpkg` | final成果とinterimレイヤをGPKGにまとめる。 |
-| `final-summaries` | final成果の要約CSVを作成する。 |
