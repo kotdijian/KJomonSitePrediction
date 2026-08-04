@@ -289,6 +289,35 @@ artificial_modified_min_cell_ratio <- 0.05
 # 1なら通常no_dataと同じ、2〜5で通過しにくくなる。
 artificial_modified_cost_multiplier <- 3
 
+# ------------------------------------------------------------
+# 集石 dense / dispersed interim diagnostic
+# ------------------------------------------------------------
+# dense:
+#   10mセル内に複数基ある、またはmicro clusterとして密集する領域。
+# dispersed:
+#   1セルあたり基数は少ないが、2〜4セル程度の間隔で反復する領域。
+
+dense_cell_count_min <- 2
+dense_mean_cell_count_min <- 1.5
+
+dispersed_cell_count_max <- 1
+dispersed_node_min_distance_m <- 20
+dispersed_node_max_distance_m <- 45
+dispersed_node_preferred_distance_m <- 30
+
+dispersed_node_min_degree <- 1
+dispersed_node_direction_bin_deg <- 22.5
+
+dense_validation_radius_m <- 30
+dispersed_validation_radius_m <- 60
+
+dense_absence_radius_m <- 30
+dispersed_absence_radius_m <- 60
+dispersed_absence_weight <- 0.35
+
+dense_validation_score_cap <- 1.00
+dispersed_validation_score_cap <- 0.45
+
 format_param_value <- function(x) {
   if (is.null(x) || length(x) == 0) {
     return(NA_character_)
@@ -343,6 +372,22 @@ analysis_parameter_table <- tibble::tribble(
   "modern_disturbance", "artificial_landform_code", format_param_value(artificial_landform_code), "人工改変地として扱うGSI人工地形分類code",
   "modern_disturbance", "artificial_modified_min_cell_ratio", format_param_value(artificial_modified_min_cell_ratio), "人工改変地セル判定の最小面積比",
   "modern_disturbance", "artificial_modified_cost_multiplier", format_param_value(artificial_modified_cost_multiplier), "人工改変地通過時の追加cost倍率",
+  
+    "shuseki_component_diagnostic", "dense_cell_count_min", format_param_value(dense_cell_count_min), "dense判定に使う10mセル内最小集石数",
+  "shuseki_component_diagnostic", "dense_mean_cell_count_min", format_param_value(dense_mean_cell_count_min), "dense判定に使うgroup内平均セル内集石数",
+  "shuseki_component_diagnostic", "dispersed_cell_count_max", format_param_value(dispersed_cell_count_max), "dispersed候補とする10mセル内最大集石数",
+  "shuseki_component_diagnostic", "dispersed_node_min_distance_m", format_param_value(dispersed_node_min_distance_m), "dispersedノード連鎖の最小距離",
+  "shuseki_component_diagnostic", "dispersed_node_max_distance_m", format_param_value(dispersed_node_max_distance_m), "dispersedノード連鎖の最大距離",
+  "shuseki_component_diagnostic", "dispersed_node_preferred_distance_m", format_param_value(dispersed_node_preferred_distance_m), "dispersedノード連鎖の期待距離",
+  "shuseki_component_diagnostic", "dispersed_node_min_degree", format_param_value(dispersed_node_min_degree), "dispersed候補ノードの最小連結数",
+  "shuseki_component_diagnostic", "dispersed_node_direction_bin_deg", format_param_value(dispersed_node_direction_bin_deg), "dispersed方向性評価の方位bin幅",
+  "shuseki_component_diagnostic", "dense_validation_radius_m", format_param_value(dense_validation_radius_m), "dense検証スコアの局所評価半径",
+  "shuseki_component_diagnostic", "dispersed_validation_radius_m", format_param_value(dispersed_validation_radius_m), "dispersed検証スコアの広域評価半径",
+  "shuseki_component_diagnostic", "dense_absence_radius_m", format_param_value(dense_absence_radius_m), "dense absence検証半径",
+  "shuseki_component_diagnostic", "dispersed_absence_radius_m", format_param_value(dispersed_absence_radius_m), "dispersed absence検証半径",
+  "shuseki_component_diagnostic", "dispersed_absence_weight", format_param_value(dispersed_absence_weight), "dispersed検証スコアに対するabsence抑制係数",
+  "shuseki_component_diagnostic", "dense_validation_score_cap", format_param_value(dense_validation_score_cap), "dense検証スコア上限",
+  "shuseki_component_diagnostic", "dispersed_validation_score_cap", format_param_value(dispersed_validation_score_cap), "dispersed検証スコア上限",
   
   "propagation", "max_normalized_cost", format_param_value(max_normalized_cost), "この値を超える伝播を停止する正規化コスト",
   "propagation", "directional_neighbor_mode", format_param_value(directional_neighbor_mode), "伝播近傍設定",
@@ -1243,6 +1288,688 @@ print(interim_cluster_summary)
 readr::write_csv(
   interim_cluster_summary,
   file.path(interim_csv_dir, "interim_selected_group_summary.csv")
+)
+```
+
+# 13b. build-interim-shuseki-component-diagnostics
+
+**目的**：集石のdense型とdispersed型を、10mセル内基数・ノード間隔・方向性から検証するためのinterimデータを作成する。
+
+```{r c13b_build_interim_shuseki_component_diagnostics, eval=TRUE}
+required_objects <- c(
+  "shuseki_points_grouped",
+  "group_geometries_interim",
+  "grid10_status",
+  "template_r",
+  "presence_binary_r",
+  "absence_area_r",
+  "surveyed_area_r"
+)
+
+missing_objects <- required_objects[
+  !vapply(required_objects, exists, logical(1))
+]
+
+if (length(missing_objects) > 0) {
+  stop("必要なオブジェクトが存在しません: ", paste(missing_objects, collapse = ", "))
+}
+
+# パラメータ未定義時のfallback。
+if (!exists("dense_cell_count_min")) dense_cell_count_min <- 2
+if (!exists("dense_mean_cell_count_min")) dense_mean_cell_count_min <- 1.5
+if (!exists("dispersed_cell_count_max")) dispersed_cell_count_max <- 1
+if (!exists("dispersed_node_min_distance_m")) dispersed_node_min_distance_m <- 20
+if (!exists("dispersed_node_max_distance_m")) dispersed_node_max_distance_m <- 45
+if (!exists("dispersed_node_preferred_distance_m")) dispersed_node_preferred_distance_m <- 30
+if (!exists("dispersed_node_min_degree")) dispersed_node_min_degree <- 1
+if (!exists("dispersed_node_direction_bin_deg")) dispersed_node_direction_bin_deg <- 22.5
+if (!exists("dense_validation_radius_m")) dense_validation_radius_m <- 30
+if (!exists("dispersed_validation_radius_m")) dispersed_validation_radius_m <- 60
+if (!exists("dense_absence_radius_m")) dense_absence_radius_m <- 30
+if (!exists("dispersed_absence_radius_m")) dispersed_absence_radius_m <- 60
+if (!exists("dispersed_absence_weight")) dispersed_absence_weight <- 0.35
+if (!exists("dense_validation_score_cap")) dense_validation_score_cap <- 1.00
+if (!exists("dispersed_validation_score_cap")) dispersed_validation_score_cap <- 0.45
+
+# ------------------------------------------------------------
+# 集石点を10mセルに結合し、セル内基数を明示的に扱う。
+# ------------------------------------------------------------
+
+shuseki_points_with_grid <- sf::st_join(
+  shuseki_points_grouped |>
+    dplyr::select(
+      shuseki_id,
+      group_id,
+      dbscan_cluster_id,
+      is_core,
+      neighbor_count,
+      group_size,
+      interim_group_type
+    ),
+  grid10_status |>
+    dplyr::select(
+      grid_id,
+      shuseki_count,
+      cell_status,
+      surveyed_ratio
+    ),
+  join = sf::st_within,
+  left = TRUE
+)
+
+shuseki_cell_table <- shuseki_points_with_grid |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(grid_id)) |>
+  dplyr::group_by(grid_id, group_id) |>
+  dplyr::summarise(
+    n_shuseki_in_grid_group = dplyr::n(),
+    .groups = "drop"
+  )
+
+occupied_shuseki_cells <- grid10_status |>
+  dplyr::filter(shuseki_count > 0) |>
+  dplyr::mutate(
+    shuseki_occupied_cell = 1L,
+    dense_cell_flag = as.integer(shuseki_count >= dense_cell_count_min)
+  )
+
+group_cell_stats <- shuseki_points_with_grid |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(grid_id)) |>
+  dplyr::group_by(group_id) |>
+  dplyr::summarise(
+    occupied_cell_count = dplyr::n_distinct(grid_id),
+    max_cell_shuseki_count = max(shuseki_count, na.rm = TRUE),
+    mean_cell_shuseki_count = mean(shuseki_count, na.rm = TRUE),
+    shuseki_per_occupied_cell = dplyr::n() / max(dplyr::n_distinct(grid_id), 1),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 集石出土セルをnode化し、2〜4セル程度の間隔でedgeを張る。
+# ------------------------------------------------------------
+
+shuseki_nodes <- occupied_shuseki_cells |>
+  dplyr::select(
+    grid_id,
+    shuseki_count,
+    cell_status,
+    surveyed_ratio
+  ) |>
+  suppressWarnings(sf::st_point_on_surface()) |>
+  dplyr::mutate(
+    node_id = paste0("G", grid_id)
+  )
+
+if (nrow(shuseki_nodes) >= 2) {
+  node_xy <- sf::st_coordinates(shuseki_nodes)
+  node_dist <- as.matrix(stats::dist(node_xy[, 1:2, drop = FALSE]))
+
+  edge_rows <- list()
+  edge_geoms <- list()
+  edge_counter <- 0L
+
+  for (i in seq_len(nrow(shuseki_nodes) - 1L)) {
+    for (j in seq.int(i + 1L, nrow(shuseki_nodes))) {
+      dij <- node_dist[i, j]
+
+      if (
+        is.finite(dij) &&
+          dij >= dispersed_node_min_distance_m &&
+          dij <= dispersed_node_max_distance_m
+      ) {
+        edge_counter <- edge_counter + 1L
+
+        dx <- node_xy[j, 1] - node_xy[i, 1]
+        dy <- node_xy[j, 2] - node_xy[i, 2]
+
+        azimuth_deg <- atan2(dy, dx) * 180 / pi
+        if (azimuth_deg < 0) {
+          azimuth_deg <- azimuth_deg + 360
+        }
+
+        orientation_deg <- azimuth_deg %% 180
+        direction_bin <- floor(orientation_deg / dispersed_node_direction_bin_deg) *
+          dispersed_node_direction_bin_deg
+
+        interval_fit <- 1 - abs(dij - dispersed_node_preferred_distance_m) /
+          max(
+            dispersed_node_max_distance_m - dispersed_node_min_distance_m,
+            1
+          )
+        interval_fit <- clamp01_numeric(interval_fit)
+
+        edge_rows[[edge_counter]] <- tibble::tibble(
+          edge_id = paste0("E", edge_counter),
+          from_node_id = shuseki_nodes$node_id[i],
+          to_node_id = shuseki_nodes$node_id[j],
+          from_grid_id = shuseki_nodes$grid_id[i],
+          to_grid_id = shuseki_nodes$grid_id[j],
+          distance_m = dij,
+          azimuth_deg = azimuth_deg,
+          orientation_deg = orientation_deg,
+          direction_bin = direction_bin,
+          interval_fit = interval_fit,
+          from_shuseki_count = shuseki_nodes$shuseki_count[i],
+          to_shuseki_count = shuseki_nodes$shuseki_count[j]
+        )
+
+        edge_geoms[[edge_counter]] <- sf::st_linestring(
+          rbind(
+            node_xy[i, 1:2],
+            node_xy[j, 1:2]
+          )
+        )
+      }
+    }
+  }
+
+  if (edge_counter > 0) {
+    shuseki_dispersed_node_edges <- sf::st_sf(
+      dplyr::bind_rows(edge_rows),
+      geometry = sf::st_sfc(
+        edge_geoms,
+        crs = sf::st_crs(shuseki_nodes)
+      )
+    ) |>
+      sf::st_make_valid()
+  } else {
+    shuseki_dispersed_node_edges <- sf::st_sf(
+      tibble::tibble(
+        edge_id = character(0),
+        from_node_id = character(0),
+        to_node_id = character(0),
+        from_grid_id = integer(0),
+        to_grid_id = integer(0),
+        distance_m = numeric(0),
+        azimuth_deg = numeric(0),
+        orientation_deg = numeric(0),
+        direction_bin = numeric(0),
+        interval_fit = numeric(0),
+        from_shuseki_count = integer(0),
+        to_shuseki_count = integer(0)
+      ),
+      geometry = sf::st_sfc(crs = sf::st_crs(shuseki_nodes))
+    )
+  }
+} else {
+  shuseki_dispersed_node_edges <- sf::st_sf(
+    tibble::tibble(
+      edge_id = character(0),
+      from_node_id = character(0),
+      to_node_id = character(0),
+      from_grid_id = integer(0),
+      to_grid_id = integer(0),
+      distance_m = numeric(0),
+      azimuth_deg = numeric(0),
+      orientation_deg = numeric(0),
+      direction_bin = numeric(0),
+      interval_fit = numeric(0),
+      from_shuseki_count = integer(0),
+      to_shuseki_count = integer(0)
+    ),
+    geometry = sf::st_sfc(crs = sf::st_crs(shuseki_nodes))
+  )
+}
+
+# ------------------------------------------------------------
+# nodeごとのdispersed supportを計算する。
+# ------------------------------------------------------------
+
+if (nrow(shuseki_dispersed_node_edges) > 0) {
+  edge_node_long <- dplyr::bind_rows(
+    shuseki_dispersed_node_edges |>
+      sf::st_drop_geometry() |>
+      dplyr::transmute(
+        node_id = from_node_id,
+        connected_node_id = to_node_id,
+        distance_m,
+        direction_bin,
+        interval_fit
+      ),
+    shuseki_dispersed_node_edges |>
+      sf::st_drop_geometry() |>
+      dplyr::transmute(
+        node_id = to_node_id,
+        connected_node_id = from_node_id,
+        distance_m,
+        direction_bin,
+        interval_fit
+      )
+  )
+
+  node_edge_stats <- edge_node_long |>
+    dplyr::group_by(node_id) |>
+    dplyr::summarise(
+      dispersed_node_degree = dplyr::n(),
+      mean_edge_distance_m = mean(distance_m, na.rm = TRUE),
+      mean_interval_fit = mean(interval_fit, na.rm = TRUE),
+      dominant_direction_bin = {
+        tab <- table(direction_bin)
+        as.numeric(names(tab)[which.max(tab)])
+      },
+      dominant_direction_share = {
+        tab <- table(direction_bin)
+        max(as.numeric(tab), na.rm = TRUE) / sum(as.numeric(tab), na.rm = TRUE)
+      },
+      .groups = "drop"
+    )
+} else {
+  node_edge_stats <- tibble::tibble(
+    node_id = character(0),
+    dispersed_node_degree = integer(0),
+    mean_edge_distance_m = numeric(0),
+    mean_interval_fit = numeric(0),
+    dominant_direction_bin = numeric(0),
+    dominant_direction_share = numeric(0)
+  )
+}
+
+shuseki_nodes <- shuseki_nodes |>
+  dplyr::left_join(
+    node_edge_stats,
+    by = "node_id"
+  ) |>
+  dplyr::mutate(
+    dispersed_node_degree = tidyr::replace_na(dispersed_node_degree, 0L),
+    mean_interval_fit = tidyr::replace_na(mean_interval_fit, 0),
+    dominant_direction_share = tidyr::replace_na(dominant_direction_share, 0),
+    node_count_score = clamp01_numeric(
+      1 - (shuseki_count - 1) / max(dense_cell_count_min, 1)
+    ),
+    node_spacing_score = clamp01_numeric(mean_interval_fit),
+    node_direction_score = clamp01_numeric(dominant_direction_share),
+    dispersed_node_support = clamp01_numeric(
+      0.50 * node_spacing_score +
+        0.30 * node_direction_score +
+        0.20 * node_count_score
+    ),
+    dispersed_node_flag = as.integer(
+      shuseki_count <= dispersed_cell_count_max &
+        dispersed_node_degree >= dispersed_node_min_degree
+    ),
+    dense_node_flag = as.integer(
+      shuseki_count >= dense_cell_count_min
+    )
+  )
+
+# ------------------------------------------------------------
+# group単位にdense / dispersed / isolatedを判定する。
+# ------------------------------------------------------------
+
+node_group_lookup <- shuseki_points_with_grid |>
+  sf::st_drop_geometry() |>
+  dplyr::filter(!is.na(grid_id)) |>
+  dplyr::select(group_id, grid_id) |>
+  dplyr::distinct() |>
+  dplyr::mutate(node_id = paste0("G", grid_id))
+
+group_node_stats <- node_group_lookup |>
+  dplyr::left_join(
+    shuseki_nodes |>
+      sf::st_drop_geometry() |>
+      dplyr::select(
+        node_id,
+        dispersed_node_degree,
+        dispersed_node_support,
+        dispersed_node_flag,
+        dense_node_flag
+      ),
+    by = "node_id"
+  ) |>
+  dplyr::group_by(group_id) |>
+  dplyr::summarise(
+    group_dispersed_node_degree_mean = mean(
+      dispersed_node_degree,
+      na.rm = TRUE
+    ),
+    group_dispersed_node_support_max = max(
+      dispersed_node_support,
+      na.rm = TRUE
+    ),
+    group_dispersed_node_count = sum(
+      dispersed_node_flag,
+      na.rm = TRUE
+    ),
+    group_dense_node_count = sum(
+      dense_node_flag,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+group_node_stats$group_dispersed_node_support_max[
+  !is.finite(group_node_stats$group_dispersed_node_support_max)
+] <- 0
+
+shuseki_component_sources_interim <- group_geometries_interim |>
+  dplyr::mutate(group_id = as.character(group_id)) |>
+  dplyr::left_join(
+    group_cell_stats |>
+      dplyr::mutate(group_id = as.character(group_id)),
+    by = "group_id"
+  ) |>
+  dplyr::left_join(
+    group_node_stats |>
+      dplyr::mutate(group_id = as.character(group_id)),
+    by = "group_id"
+  ) |>
+  dplyr::mutate(
+    occupied_cell_count = tidyr::replace_na(occupied_cell_count, 0L),
+    max_cell_shuseki_count = tidyr::replace_na(max_cell_shuseki_count, 0),
+    mean_cell_shuseki_count = tidyr::replace_na(mean_cell_shuseki_count, 0),
+    shuseki_per_occupied_cell = tidyr::replace_na(shuseki_per_occupied_cell, 0),
+    group_dispersed_node_degree_mean = tidyr::replace_na(
+      group_dispersed_node_degree_mean,
+      0
+    ),
+    group_dispersed_node_support_max = tidyr::replace_na(
+      group_dispersed_node_support_max,
+      0
+    ),
+    group_dispersed_node_count = tidyr::replace_na(
+      group_dispersed_node_count,
+      0L
+    ),
+    group_dense_node_count = tidyr::replace_na(
+      group_dense_node_count,
+      0L
+    ),
+    dense_cell_count_score = clamp01_numeric(
+      max_cell_shuseki_count / max(dense_cell_count_min, 1)
+    ),
+    dense_mean_cell_score = clamp01_numeric(
+      mean_cell_shuseki_count / max(dense_mean_cell_count_min, 1)
+    ),
+    dense_group_size_score = clamp01_numeric(
+      n_shuseki / max(dense_cluster_min_n, 1)
+    ),
+    dense_component_strength = clamp01_numeric(
+      0.45 * dense_cell_count_score +
+        0.25 * dense_mean_cell_score +
+        0.30 * dense_group_size_score
+    ),
+    dispersed_component_strength = clamp01_numeric(
+      group_dispersed_node_support_max
+    ),
+    shuseki_component_type = dplyr::case_when(
+      interim_group_type == "dense_candidate" |
+        max_cell_shuseki_count >= dense_cell_count_min |
+        mean_cell_shuseki_count >= dense_mean_cell_count_min ~ "dense",
+      group_dispersed_node_count > 0 |
+        interim_group_type == "intermediate_candidate" ~ "dispersed",
+      TRUE ~ "isolated"
+    )
+  )
+
+# 以後のmacro処理でも参照できるよう、group_geometries_interimへ属性を戻す。
+group_geometries_interim <- shuseki_component_sources_interim
+
+shuseki_points_grouped <- shuseki_points_grouped |>
+  dplyr::left_join(
+    shuseki_component_sources_interim |>
+      sf::st_drop_geometry() |>
+      dplyr::select(
+        group_id,
+        occupied_cell_count,
+        max_cell_shuseki_count,
+        mean_cell_shuseki_count,
+        shuseki_per_occupied_cell,
+        group_dispersed_node_count,
+        group_dispersed_node_support_max,
+        dense_component_strength,
+        dispersed_component_strength,
+        shuseki_component_type
+      ),
+    by = "group_id"
+  )
+
+# ------------------------------------------------------------
+# 検証用ラスタ：presence/absence/no_dataをmaskせず、all cellsで出す。
+# ------------------------------------------------------------
+
+shuseki_count_r <- rasterize_grid_field(
+  grid10_status,
+  "shuseki_count",
+  template_r,
+  background = 0
+)
+names(shuseki_count_r) <- "shuseki_count"
+
+shuseki_occupied_cell_binary_r <- terra::ifel(
+  shuseki_count_r > 0,
+  1,
+  0
+)
+names(shuseki_occupied_cell_binary_r) <- "shuseki_occupied_cell_binary"
+
+dense_cell_binary_r <- terra::ifel(
+  shuseki_count_r >= dense_cell_count_min,
+  1,
+  0
+)
+names(dense_cell_binary_r) <- "dense_cell_binary"
+
+dispersed_node_support_r <- terra::rasterize(
+  terra::vect(shuseki_nodes),
+  template_r,
+  field = "dispersed_node_support",
+  fun = "max",
+  background = 0,
+  touches = TRUE
+)
+names(dispersed_node_support_r) <- "dispersed_node_support"
+
+dispersed_node_degree_r <- terra::rasterize(
+  terra::vect(shuseki_nodes),
+  template_r,
+  field = "dispersed_node_degree",
+  fun = "max",
+  background = 0,
+  touches = TRUE
+)
+names(dispersed_node_degree_r) <- "dispersed_node_degree"
+
+dense_component_seed_strength_r <- terra::rasterize(
+  terra::vect(shuseki_component_sources_interim),
+  template_r,
+  field = "dense_component_strength",
+  fun = "max",
+  background = 0,
+  touches = TRUE
+)
+names(dense_component_seed_strength_r) <- "dense_component_seed_strength"
+
+dispersed_component_seed_strength_r <- terra::rasterize(
+  terra::vect(shuseki_component_sources_interim),
+  template_r,
+  field = "dispersed_component_strength",
+  fun = "max",
+  background = 0,
+  touches = TRUE
+)
+names(dispersed_component_seed_strength_r) <- "dispersed_component_seed_strength"
+
+dense_absence_local_r <- focal_sum_circle(
+  absence_area_r,
+  dense_absence_radius_m
+)
+
+dense_surveyed_local_r <- focal_sum_circle(
+  surveyed_area_r,
+  dense_absence_radius_m
+)
+
+dense_surveyed_local_safe_r <- terra::ifel(
+  is.na(dense_surveyed_local_r) | dense_surveyed_local_r < 1,
+  1,
+  dense_surveyed_local_r
+)
+
+dense_absence_penalty_r <- terra::clamp(
+  dense_absence_local_r / dense_surveyed_local_safe_r,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(dense_absence_penalty_r) <- "dense_absence_penalty"
+
+dispersed_absence_local_r <- focal_sum_circle(
+  absence_area_r,
+  dispersed_absence_radius_m
+)
+
+dispersed_surveyed_local_r <- focal_sum_circle(
+  surveyed_area_r,
+  dispersed_absence_radius_m
+)
+
+dispersed_surveyed_local_safe_r <- terra::ifel(
+  is.na(dispersed_surveyed_local_r) | dispersed_surveyed_local_r < 1,
+  1,
+  dispersed_surveyed_local_r
+)
+
+dispersed_absence_penalty_r <- terra::clamp(
+  dispersed_absence_local_r / dispersed_surveyed_local_safe_r,
+  lower = 0,
+  upper = 1,
+  values = TRUE
+)
+names(dispersed_absence_penalty_r) <- "dispersed_absence_penalty"
+
+dense_validation_raw_r <- focal_sum_circle(
+  dense_component_seed_strength_r,
+  dense_validation_radius_m
+)
+
+dense_validation_score_all_cells_r <- scale01_raster(dense_validation_raw_r)
+dense_validation_score_all_cells_r <- terra::clamp(
+  dense_validation_score_all_cells_r * (1 - dense_absence_penalty_r),
+  lower = 0,
+  upper = dense_validation_score_cap,
+  values = TRUE
+)
+names(dense_validation_score_all_cells_r) <- "dense_validation_score_all_cells"
+
+dispersed_validation_raw_r <- focal_sum_circle(
+  dispersed_node_support_r,
+  dispersed_validation_radius_m
+)
+
+dispersed_validation_score_all_cells_r <- scale01_raster(dispersed_validation_raw_r)
+
+# dispersedではabsenceを弱く効かせる。
+# 1〜2セル程度の空白で消えないよう、penaltyを係数で抑制する。
+dispersed_validation_score_all_cells_r <- terra::clamp(
+  dispersed_validation_score_all_cells_r *
+    (1 - dispersed_absence_weight * dispersed_absence_penalty_r) *
+    dispersed_validation_score_cap,
+  lower = 0,
+  upper = dispersed_validation_score_cap,
+  values = TRUE
+)
+names(dispersed_validation_score_all_cells_r) <- "dispersed_validation_score_all_cells"
+
+two_component_validation_score_all_cells_r <- terra::ifel(
+  dense_validation_score_all_cells_r >= dispersed_validation_score_all_cells_r,
+  dense_validation_score_all_cells_r,
+  dispersed_validation_score_all_cells_r
+)
+names(two_component_validation_score_all_cells_r) <- "two_component_validation_score_all_cells"
+
+two_component_dominant_component_all_cells_r <- terra::ifel(
+  dense_validation_score_all_cells_r >= dispersed_validation_score_all_cells_r,
+  1,
+  2
+)
+two_component_dominant_component_all_cells_r <- terra::ifel(
+  dense_validation_score_all_cells_r > 0 |
+    dispersed_validation_score_all_cells_r > 0,
+  two_component_dominant_component_all_cells_r,
+  NA_real_
+)
+names(two_component_dominant_component_all_cells_r) <- "two_component_dominant_component_all_cells"
+
+# ------------------------------------------------------------
+# CSV summary
+# ------------------------------------------------------------
+
+component_source_summary <- shuseki_component_sources_interim |>
+  sf::st_drop_geometry() |>
+  dplyr::select(
+    group_id,
+    n_shuseki,
+    interim_group_type,
+    shuseki_component_type,
+    occupied_cell_count,
+    max_cell_shuseki_count,
+    mean_cell_shuseki_count,
+    shuseki_per_occupied_cell,
+    group_dispersed_node_count,
+    group_dispersed_node_support_max,
+    dense_component_strength,
+    dispersed_component_strength
+  ) |>
+  dplyr::arrange(
+    shuseki_component_type,
+    dplyr::desc(n_shuseki)
+  )
+
+print(component_source_summary)
+
+readr::write_csv(
+  component_source_summary,
+  file.path(interim_csv_dir, "interim_shuseki_component_source_summary.csv")
+)
+
+node_summary <- shuseki_nodes |>
+  sf::st_drop_geometry() |>
+  dplyr::select(
+    node_id,
+    grid_id,
+    shuseki_count,
+    dispersed_node_degree,
+    mean_edge_distance_m,
+    dominant_direction_bin,
+    dominant_direction_share,
+    dispersed_node_support,
+    dispersed_node_flag,
+    dense_node_flag
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(dispersed_node_support),
+    grid_id
+  )
+
+print(node_summary)
+
+readr::write_csv(
+  node_summary,
+  file.path(interim_csv_dir, "interim_shuseki_node_spacing_summary.csv")
+)
+
+if (nrow(shuseki_dispersed_node_edges) > 0) {
+  readr::write_csv(
+    shuseki_dispersed_node_edges |>
+      sf::st_drop_geometry(),
+    file.path(interim_csv_dir, "interim_shuseki_node_edge_summary.csv")
+  )
+} else {
+  readr::write_csv(
+    tibble::tibble(),
+    file.path(interim_csv_dir, "interim_shuseki_node_edge_summary.csv")
+  )
+}
+
+component_count_summary <- component_source_summary |>
+  dplyr::count(shuseki_component_type, name = "n_groups")
+
+print(component_count_summary)
+
+readr::write_csv(
+  component_count_summary,
+  file.path(interim_csv_dir, "interim_shuseki_component_count_summary.csv")
 )
 ```
 
@@ -2254,16 +2981,36 @@ macro_group_geometries_interim |>
 ```{r c15_export_interim_rasters, eval=TRUE}
 interim_raster_outputs <- list(
   interim_absence_penalty_50m = absence_penalty_50m_r,
-  interim_open_no_data_score_100m = open_no_data_score_100m_r
+  interim_open_no_data_score_100m = open_no_data_score_100m_r,
+
+  interim_shuseki_count = shuseki_count_r,
+  interim_shuseki_occupied_cell_binary = shuseki_occupied_cell_binary_r,
+  interim_dense_cell_binary = dense_cell_binary_r,
+
+  interim_dense_component_seed_strength = dense_component_seed_strength_r,
+  interim_dispersed_component_seed_strength = dispersed_component_seed_strength_r,
+
+  interim_dispersed_node_support = dispersed_node_support_r,
+  interim_dispersed_node_degree = dispersed_node_degree_r,
+
+  interim_dense_absence_penalty = dense_absence_penalty_r,
+  interim_dispersed_absence_penalty = dispersed_absence_penalty_r,
+
+  interim_dense_validation_score_all_cells = dense_validation_score_all_cells_r,
+  interim_dispersed_validation_score_all_cells = dispersed_validation_score_all_cells_r,
+  interim_two_component_validation_score_all_cells = two_component_validation_score_all_cells_r,
+  interim_two_component_dominant_component_all_cells = two_component_dominant_component_all_cells_r
 )
 
 for (nm in names(interim_raster_outputs)) {
   out_path <- file.path(interim_raster_dir, paste0(nm, ".tif"))
+
   terra::writeRaster(
     interim_raster_outputs[[nm]],
     out_path,
     overwrite = TRUE
   )
+
   cat("interim raster:", out_path, "\n")
 }
 ```
@@ -2308,6 +3055,38 @@ write_gpkg_layer_safe(
 )
 
 write_gpkg_layer_safe(
+  shuseki_component_sources_interim,
+  final_gpkg,
+  "interim_shuseki_component_sources"
+)
+
+write_gpkg_layer_safe(
+  shuseki_nodes,
+  final_gpkg,
+  "interim_shuseki_nodes"
+)
+
+write_gpkg_layer_safe(
+  shuseki_dispersed_node_edges,
+  final_gpkg,
+  "interim_shuseki_dispersed_node_edges"
+)
+
+write_gpkg_layer_safe(
+  occupied_shuseki_cells |>
+    dplyr::select(
+      grid_id,
+      shuseki_count,
+      cell_status,
+      surveyed_ratio,
+      shuseki_occupied_cell,
+      dense_cell_flag
+    ),
+  final_gpkg,
+  "interim_shuseki_occupied_cells"
+)
+
+write_gpkg_layer_safe(
   grid10_status |>
     dplyr::select(
       grid_id,
@@ -2332,10 +3111,17 @@ cat("interim gpkg:", final_gpkg, "\n")
 ```{r c17_check_interim_outputs, eval=TRUE}
 expected_interim_csv <- c(
   "interim_grid_response_summary.csv",
+  "interim_artificial_modified_land_summary.csv",
   "interim_neighbor_distance_summary.csv",
   "interim_parameter_sweep.csv",
   "interim_selected_parameter_summary.csv",
   "interim_selected_group_summary.csv",
+
+  "interim_shuseki_component_source_summary.csv",
+  "interim_shuseki_node_spacing_summary.csv",
+  "interim_shuseki_node_edge_summary.csv",
+  "interim_shuseki_component_count_summary.csv",
+
   "interim_cluster_pair_screening_metrics.csv",
   "interim_cluster_pair_metrics.csv",
   "interim_micro_to_macro_cluster_assignment.csv",
@@ -2345,7 +3131,25 @@ expected_interim_csv <- c(
 
 expected_interim_raster <- c(
   "interim_absence_penalty_50m.tif",
-  "interim_open_no_data_score_100m.tif"
+  "interim_open_no_data_score_100m.tif",
+
+  "interim_shuseki_count.tif",
+  "interim_shuseki_occupied_cell_binary.tif",
+  "interim_dense_cell_binary.tif",
+
+  "interim_dense_component_seed_strength.tif",
+  "interim_dispersed_component_seed_strength.tif",
+
+  "interim_dispersed_node_support.tif",
+  "interim_dispersed_node_degree.tif",
+
+  "interim_dense_absence_penalty.tif",
+  "interim_dispersed_absence_penalty.tif",
+
+  "interim_dense_validation_score_all_cells.tif",
+  "interim_dispersed_validation_score_all_cells.tif",
+  "interim_two_component_validation_score_all_cells.tif",
+  "interim_two_component_dominant_component_all_cells.tif"
 )
 
 expected_interim_gpkg_layers <- c(
@@ -2354,6 +3158,10 @@ expected_interim_gpkg_layers <- c(
   "interim_shuseki_macro_cluster_geometries",
   "interim_shuseki_macro_cluster_link_edges",
   "interim_shuseki_internal_void_candidates",
+  "interim_shuseki_component_sources",
+  "interim_shuseki_nodes",
+  "interim_shuseki_dispersed_node_edges",
+  "interim_shuseki_occupied_cells",
   "interim_shuseki_grid_status"
 )
 
@@ -2387,6 +3195,10 @@ layer_object_rows <- tibble::tibble(
     "macro_group_geometries_interim",
     "macro_cluster_link_edges",
     "internal_void_candidates",
+    "shuseki_component_sources_interim",
+    "shuseki_nodes",
+    "shuseki_dispersed_node_edges",
+    "occupied_shuseki_cells",
     "grid10_status"
   )
 ) |>
@@ -2395,7 +3207,11 @@ layer_object_rows <- tibble::tibble(
     object_exists = exists(object_name),
     object_n = if (object_exists) {
       obj <- get(object_name)
-      if (inherits(obj, "sf")) nrow(obj) else NA_integer_
+      if (inherits(obj, "sf")) {
+        nrow(obj)
+      } else {
+        NA_integer_
+      }
     } else {
       NA_integer_
     }
@@ -2413,7 +3229,16 @@ gpkg_layer_check <- layer_object_rows |>
       TRUE ~ "missing"
     )
   ) |>
-  dplyr::select(output_type, output_name, path, exists, note, object_name, object_exists, object_n)
+  dplyr::select(
+    output_type,
+    output_name,
+    path,
+    exists,
+    note,
+    object_name,
+    object_exists,
+    object_n
+  )
 
 interim_output_check <- dplyr::bind_rows(
   csv_check,
