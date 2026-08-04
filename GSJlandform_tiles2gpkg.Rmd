@@ -946,12 +946,320 @@ readr::write_csv(
 cat("legend summary CSV:", legend_summary_csv, "\n")
 ```
 
-# c09_chunk-list
+# c09_dissolve-adjacent-landform-polygons
+
+**目的**：国土地理院ベクトルタイルから取得した地形分類ポリゴンについて、同じcodeで、かつ隣接・接触・重複するポリゴンをマージする。  
+**達成指標**： output_gpkg_path に以下のレイヤを作成する。
+  - gsi_landform_natural_labeled_dissolved
+  - gsi_landform_artificial_labeled_dissolved
+
+**注意**：単純にcodeごとにすべて統合するのではなく、空間的に接続している同一codeポリゴンだけを1地物にまとめる。
+
+```{r c09_dissolve-adjacent-landform-polygons, eval=TRUE}
+if (!exists("output_gpkg_path")) {
+  output_gpkg_path <- "data_raw/Kokubunji_Jomon.gpkg"
+}
+
+input_layer_natural_labeled <- "gsi_landform_natural_labeled"
+input_layer_artificial_labeled <- "gsi_landform_artificial_labeled"
+
+output_layer_natural_dissolved <- "gsi_landform_natural_labeled_dissolved"
+output_layer_artificial_dissolved <- "gsi_landform_artificial_labeled_dissolved"
+
+# TRUEの場合、境界が完全に接するものに加え、
+# 微小な重複を持つものも同一接続成分として扱う。
+use_intersects_for_connection <- TRUE
+
+# 微小な隙間を埋めてから接続判定したい場合に使用する。
+# 通常は0でよい。
+# 例：0.05 にすると5cm以内の隙間を吸収する。
+dissolve_snap_buffer_m <- 0
+
+safe_delete_gpkg_layer <- function(gpkg_path, layer_name) {
+  if (!file.exists(gpkg_path)) {
+    return(invisible(FALSE))
+  }
+
+  existing_layers <- tryCatch(
+    sf::st_layers(gpkg_path)$name,
+    error = function(e) character()
+  )
+
+  if (layer_name %in% existing_layers) {
+    sf::st_delete(
+      dsn = gpkg_path,
+      layer = layer_name,
+      quiet = TRUE
+    )
+    return(invisible(TRUE))
+  }
+
+  invisible(FALSE)
+}
+
+build_connected_components <- function(n, adjacency_list) {
+  visited <- rep(FALSE, n)
+  component <- rep(NA_integer_, n)
+  component_id <- 0L
+
+  for (i in seq_len(n)) {
+    if (visited[i]) {
+      next
+    }
+
+    component_id <- component_id + 1L
+    queue <- i
+    visited[i] <- TRUE
+    component[i] <- component_id
+
+    while (length(queue) > 0) {
+      current <- queue[1]
+      queue <- queue[-1]
+
+      neighbors <- adjacency_list[[current]]
+
+      if (length(neighbors) == 0) {
+        next
+      }
+
+      for (nb in neighbors) {
+        if (!visited[nb]) {
+          visited[nb] <- TRUE
+          component[nb] <- component_id
+          queue <- c(queue, nb)
+        }
+      }
+    }
+  }
+
+  component
+}
+
+dissolve_adjacent_same_code <- function(x) {
+  if (!"code" %in% names(x)) {
+    stop("code列が見つかりません。")
+  }
+
+  x <- x |>
+    sf::st_make_valid() |>
+    dplyr::mutate(
+      code_chr = as.character(code)
+    )
+
+  # 空ジオメトリを除外
+  empty_geometry <- sf::st_is_empty(sf::st_geometry(x))
+  x <- x[!empty_geometry, , drop = FALSE]
+
+  if (nrow(x) == 0) {
+    return(x)
+  }
+
+  # 必要に応じて微小隙間を吸収する。
+  # buffer後に最後で戻す。
+  if (dissolve_snap_buffer_m > 0) {
+    x_geom_original <- sf::st_geometry(x)
+
+    x <- x |>
+      dplyr::mutate(
+        geometry = sf::st_buffer(
+          sf::st_geometry(x),
+          dissolve_snap_buffer_m
+        )
+      ) |>
+      sf::st_as_sf()
+  }
+
+  code_values <- sort(unique(x$code_chr))
+  dissolved_list <- vector("list", length(code_values))
+
+  for (i in seq_along(code_values)) {
+    this_code <- code_values[i]
+
+    x_code <- x |>
+      dplyr::filter(code_chr == this_code) |>
+      dplyr::mutate(
+        original_feature_id = dplyr::row_number()
+      )
+
+    if (nrow(x_code) == 1) {
+      x_code$landform_component_id <- paste0(this_code, "_1")
+      dissolved_list[[i]] <- x_code
+      next
+    }
+
+    adjacency <- if (use_intersects_for_connection) {
+      sf::st_intersects(x_code)
+    } else {
+      sf::st_touches(x_code)
+    }
+
+    # 自分自身を隣接リストから除外
+    adjacency <- lapply(
+      seq_along(adjacency),
+      function(j) {
+        setdiff(adjacency[[j]], j)
+      }
+    )
+
+    component <- build_connected_components(
+      n = nrow(x_code),
+      adjacency_list = adjacency
+    )
+
+    x_code$landform_component_no <- component
+    x_code$landform_component_id <- paste0(
+      this_code,
+      "_",
+      component
+    )
+
+    # 属性はcomponent内の代表値を保持する。
+    # 面積は統合後に再計算する。
+    x_dissolved <- x_code |>
+      dplyr::group_by(
+        code_chr,
+        landform_component_id
+      ) |>
+      dplyr::summarise(
+        code = dplyr::first(code),
+        landform_class = dplyr::first(
+          dplyr::coalesce(
+            landform_class,
+            NA_character_
+          )
+        ),
+        landform_group_for_model = dplyr::first(
+          dplyr::coalesce(
+            landform_group_for_model,
+            NA_character_
+          )
+        ),
+        source_feature_count = dplyr::n(),
+        .groups = "drop"
+      ) |>
+      sf::st_make_valid()
+
+    dissolved_list[[i]] <- x_dissolved
+  }
+
+  dissolved <- dplyr::bind_rows(dissolved_list) |>
+    sf::st_make_valid()
+
+  # bufferで隙間吸収した場合は、元の範囲に近づけるため負bufferする。
+  if (dissolve_snap_buffer_m > 0) {
+    dissolved <- dissolved |>
+      dplyr::mutate(
+        geometry = sf::st_buffer(
+          sf::st_geometry(dissolved),
+          -dissolve_snap_buffer_m
+        )
+      ) |>
+      sf::st_as_sf() |>
+      sf::st_make_valid()
+
+    empty_geometry <- sf::st_is_empty(sf::st_geometry(dissolved))
+    dissolved <- dissolved[!empty_geometry, , drop = FALSE]
+  }
+
+  dissolved <- dissolved |>
+    dplyr::mutate(
+      dissolved_area_m2 = as.numeric(sf::st_area(sf::st_geometry(.)))
+    ) |>
+    dplyr::arrange(
+      code_chr,
+      landform_component_id
+    )
+
+  dissolved
+}
+
+dissolve_landform_layer_to_gpkg <- function(
+  gpkg_path,
+  input_layer,
+  output_layer
+) {
+  existing_layers <- sf::st_layers(gpkg_path)$name
+
+  if (!input_layer %in% existing_layers) {
+    stop(
+      "入力レイヤが見つかりません: ", input_layer,
+      "\n利用可能レイヤ: ", paste(existing_layers, collapse = ", ")
+    )
+  }
+
+  x <- sf::st_read(
+    gpkg_path,
+    layer = input_layer,
+    quiet = TRUE,
+    stringsAsFactors = FALSE
+  )
+
+  cat("input layer:", input_layer, "\n")
+  cat("input features:", nrow(x), "\n")
+
+  x_dissolved <- dissolve_adjacent_same_code(x)
+
+  cat("output layer:", output_layer, "\n")
+  cat("output features:", nrow(x_dissolved), "\n")
+
+  safe_delete_gpkg_layer(gpkg_path, output_layer)
+
+  sf::st_write(
+    x_dissolved,
+    dsn = gpkg_path,
+    layer = output_layer,
+    quiet = TRUE
+  )
+
+  summary_tbl <- tibble::tibble(
+    input_layer = input_layer,
+    output_layer = output_layer,
+    input_features = nrow(x),
+    output_features = nrow(x_dissolved),
+    reduction_features = nrow(x) - nrow(x_dissolved),
+    output_gpkg_path = gpkg_path
+  )
+
+  print(summary_tbl)
+
+  invisible(summary_tbl)
+}
+
+dissolve_summary_natural <- dissolve_landform_layer_to_gpkg(
+  gpkg_path = output_gpkg_path,
+  input_layer = input_layer_natural_labeled,
+  output_layer = output_layer_natural_dissolved
+)
+
+dissolve_summary_artificial <- dissolve_landform_layer_to_gpkg(
+  gpkg_path = output_gpkg_path,
+  input_layer = input_layer_artificial_labeled,
+  output_layer = output_layer_artificial_dissolved
+)
+
+landform_dissolve_summary <- dplyr::bind_rows(
+  dissolve_summary_natural,
+  dissolve_summary_artificial
+)
+
+dissolve_summary_csv <- file.path(
+  dirname(output_gpkg_path),
+  "gsi_landform_dissolve_summary.csv"
+)
+
+readr::write_csv(
+  landform_dissolve_summary,
+  dissolve_summary_csv
+)
+
+cat("dissolve summary CSV:", dissolve_summary_csv, "\n")
+```
+
+# c10_chunk-list
 
 **目的**：このRmdに含まれるchunkを一覧化する。  
-**達成指標**：処理順と各chunkの役割が確認できる。
 
-```{r c09_chunk-list, eval=TRUE}
+```{r c10_chunk-list, eval=TRUE}
 chunk_list <- tibble::tribble(
   ~chunk, ~purpose,
   "c01_setup", "必要パッケージと共通関数を準備する。",
@@ -962,7 +1270,8 @@ chunk_list <- tibble::tribble(
   "c06_write-gpkg-layers", "取得した地形分類をGPKGレイヤとして保存する。",
   "c07_write-summary", "取得・保存結果のCSVとGPKGレイヤ確認表を作成する。",
   "c08_add-landform-legend-fields", "取得済みの国土地理院地形分類レイヤに、code対応の凡例名を追加する。",
-  "c09_chunk-list", "chunk一覧を表示する。"
+  "c09_dissolve-adjacent-landform-polygons","国土地理院ベクトルタイルから取得した地形分類ポリゴンについて、同じcodeで、かつ隣接・接触・重複するポリゴンをマージする。",
+  "c10_chunk-list", "chunk一覧を表示する。"
 )
 
 print(chunk_list)
