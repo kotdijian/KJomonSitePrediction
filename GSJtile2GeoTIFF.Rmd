@@ -1,0 +1,780 @@
+---
+title: "GSJtile2GeoTIFF"
+subtitle: "XYZ tile map downloader and GeoTIFF mosaic tool / 地理院タイル等のXYZタイル地図をGeoTIFF化する単独Rmd"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# 目的
+
+このRmdは、XYZ形式のタイル地図を指定範囲分だけ取得し、位置情報を付与してモザイクし、GeoTIFFとして保存するための単独ツールである。
+
+初期設定では、国土地理院の陰影起伏図 `hillshademap` を取得する。
+
+```text
+https://cyberjapandata.gsi.go.jp/xyz/hillshademap/{z}/{x}/{y}.png
+```
+
+他のXYZタイル地図を取得する場合は、`c02_parameters` chunk の `source_tile_url_template` と `output_geotiff_path` を手動で変更する。
+
+# c01_setup
+
+**目的**：必要パッケージと共通関数を準備する。  
+**達成指標**：`sf`, `terra`, `dplyr`, `tidyr`, `purrr`, `tibble`, `readr` が利用可能になる。
+
+```{r c01_setup, eval=TRUE, message=FALSE, warning=FALSE}
+required_pkgs <- c(
+  "sf",
+  "terra",
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "tibble",
+  "readr"
+)
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+})
+
+options(stringsAsFactors = FALSE)
+sf::sf_use_s2(FALSE)
+
+safe_dir_create <- function(path) {
+  if (!dir.exists(path)) {
+    dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  }
+  invisible(path)
+}
+
+safe_st_make_valid <- function(x) {
+  suppressWarnings(sf::st_make_valid(x))
+}
+
+message("setup completed.")
+```
+
+# c02_parameters
+
+**目的**：対象範囲、取得するタイル地図、保存先、投影・出力条件を指定する。  
+**達成指標**：他地域・他タイルへ転用する際に変更すべき箇所が明示される。
+
+```{r c02_parameters, eval=TRUE}
+# -------------------------------------------------------------------------
+# 1. 対象範囲の指定方法
+# -------------------------------------------------------------------------
+# 選択肢：
+# - "gpkg_layer"  : GPKG内の既存ベクタレイヤを対象範囲にする。
+# - "bbox_lonlat" : 経緯度bboxを手入力する。
+# - "vector_file" : Shapefile / GeoPackage / GeoJSON等の外部ベクタファイルを使う。
+#
+# 既存の地形分類ベクトルタイル取得Rmdと同じ構成にしている。
+target_area_mode <- "gpkg_layer"
+
+# -------------------------------------------------------------------------
+# 2. GPKGレイヤを対象範囲にする場合
+# -------------------------------------------------------------------------
+# 今回のプロジェクト用の既定値。
+# ローカルでファイル名が Kokubunji-Jomon.gpkg の場合は、ここを変更する。
+target_area_gpkg_path <- "data_raw/Kokubunji_Jomon.gpkg"
+
+# 対象範囲レイヤ名。
+# 境界ぎりぎりでタイルが切れるのを避けるため、bufferがある場合はbufferを推奨する。
+# 例："kokubunji_city_buffer" / "kokubunji_city_boundary"
+target_area_layer <- "kokubunji_city_buffer"
+
+# target_area_layer が見つからない場合の代替候補。
+target_area_layer_fallbacks <- c(
+  "kokubunji_city_boundary",
+  "city_boundary",
+  "boundary"
+)
+
+# -------------------------------------------------------------------------
+# 3. bboxを直接指定する場合
+# -------------------------------------------------------------------------
+# target_area_mode <- "bbox_lonlat" にした場合に使用する。
+# EPSG:4326 の xmin, ymin, xmax, ymax。
+# 下記は例示値なので、他地域では必ず変更する。
+target_bbox_lonlat <- c(
+  xmin = 139.42,
+  ymin = 35.66,
+  xmax = 139.52,
+  ymax = 35.73
+)
+
+# -------------------------------------------------------------------------
+# 4. 外部ベクタファイルを対象範囲にする場合
+# -------------------------------------------------------------------------
+# target_area_mode <- "vector_file" にした場合に使用する。
+# GPKGの場合は layer 名を指定する。Shapefile/GeoJSONでは NA のままでよい。
+target_area_vector_path <- "data_raw/target_area.gpkg"
+target_area_vector_layer <- NA_character_
+
+# -------------------------------------------------------------------------
+# 5. 対象範囲のbbox利用とclip設定
+# -------------------------------------------------------------------------
+# TRUEにすると、指定ベクタレイヤの実形状ではなく、
+# その外接矩形 bbox を対象範囲として使用する。
+#
+# TRUE  : bbox範囲でタイル取得し、bbox範囲で保存
+# FALSE : bbox範囲でタイル取得し、元のベクタ形状でmaskして保存
+use_bbox_as_target_area <- FALSE
+
+# TRUEの場合、出力GeoTIFFを対象範囲でmaskする。
+# use_bbox_as_target_area <- TRUE の場合はbbox矩形でmaskされる。
+# use_bbox_as_target_area <- FALSE の場合は指定ベクタレイヤの形状でmaskされる。
+clip_to_target_area <- TRUE
+
+# bbox境界での取りこぼしを避けるため、取得するタイル範囲を外側へ広げる数。
+tile_buffer_n <- 1
+
+# -------------------------------------------------------------------------
+# 6. ソースとなるXYZタイル地図の指定
+# -------------------------------------------------------------------------
+# ここを変更すると、別のXYZタイル地図を取得できる。
+# {z}, {x}, {y} は必ず残す。
+#
+# サンプル：国土地理院 陰影起伏図 hillshademap
+source_tile_name <- "hillshademap"
+source_tile_url_template <- "https://cyberjapandata.gsi.go.jp/xyz/hillshademap/{z}/{x}/{y}.png"
+
+# 取得するズームレベル。
+# hillshademapでは、対象範囲が市域程度なら 15〜16 程度が扱いやすい。
+# 高ズームほど解像度は高くなるが、取得タイル数と出力サイズが増える。
+source_tile_zoom <- 16
+
+# サーバーへの連続アクセスを避けるための待機秒数。
+request_sleep_sec <- 0.03
+
+# -------------------------------------------------------------------------
+# 7. 出力ファイル名の指定
+# -------------------------------------------------------------------------
+# ここを変更すると、出力GeoTIFF名を変更できる。
+# 別のタイル地図を取得する場合は、source_tile_name と合わせて変更する。
+output_dir <- "data_raw"
+output_geotiff_path <- file.path(output_dir, "gsi_hillshademap.tif")
+
+# 取得・出力サマリCSV。
+summary_csv_path <- file.path(output_dir, "gsi_hillshademap_download_summary.csv")
+
+# -------------------------------------------------------------------------
+# 8. 出力GeoTIFFの投影・解像度・リサンプリング設定
+# -------------------------------------------------------------------------
+# 出力先CRS。
+# NAの場合は、対象範囲レイヤのCRSを使用する。
+# 例：output_crs_epsg <- 6677
+output_crs_epsg <- NA_integer_
+
+# 出力ピクセルサイズ。
+# NAの場合は terra::project() の自動設定に任せる。
+# メートル系CRSへ出力する場合、固定解像度にしたいなら 2, 2.5, 5 などを指定する。
+output_pixel_size_m <- NA_real_
+
+# リサンプリング方法。
+# 連続的な表示画像、陰影起伏図、空中写真等："bilinear"
+# 色分け図、カテゴリ画像、分類図等："near"
+resampling_method <- "bilinear"
+
+# PNGがRGBA 4バンドの場合にalphaを落としてRGB 3バンドにする。
+drop_alpha_band <- TRUE
+
+# RGBを1バンドのグレースケールに変換する。
+# hillshadeは表示画像としてRGBのままでもよい。
+convert_rgb_to_grayscale <- FALSE
+
+# PNGタイルは通常0〜255の画像値なので、GeoTIFF出力時にByte型を使う。
+# bilinear投影後も表示用ラスタとして扱う場合はTRUEでよい。
+write_byte_geotiff <- TRUE
+
+# GeoTIFF圧縮設定。
+geotiff_gdal_options <- c("COMPRESS=LZW")
+
+parameter_table <- tibble::tribble(
+  ~group, ~parameter, ~value, ~meaning,
+  "target_area", "target_area_mode", target_area_mode, "対象範囲の指定方法",
+  "target_area", "target_area_gpkg_path", target_area_gpkg_path, "対象範囲GPKG",
+  "target_area", "target_area_layer", target_area_layer, "対象範囲レイヤ",
+  "target_area", "use_bbox_as_target_area", as.character(use_bbox_as_target_area), "指定レイヤのbboxを対象範囲本体にするか",
+  "target_area", "clip_to_target_area", as.character(clip_to_target_area), "対象範囲でmaskするか",
+  "tile_source", "source_tile_name", source_tile_name, "取得するタイル地図名",
+  "tile_source", "source_tile_url_template", source_tile_url_template, "XYZタイルURLテンプレート",
+  "tile_source", "source_tile_zoom", as.character(source_tile_zoom), "取得ズームレベル",
+  "output", "output_geotiff_path", output_geotiff_path, "出力GeoTIFF",
+  "output", "output_crs_epsg", as.character(output_crs_epsg), "出力CRS EPSG。NAなら対象範囲CRS",
+  "output", "output_pixel_size_m", as.character(output_pixel_size_m), "出力ピクセルサイズ。NAなら自動",
+  "output", "resampling_method", resampling_method, "投影変換時のリサンプリング方法",
+  "output", "drop_alpha_band", as.character(drop_alpha_band), "RGBAのalphaを落とすか",
+  "output", "convert_rgb_to_grayscale", as.character(convert_rgb_to_grayscale), "RGBを1バンド化するか"
+)
+
+print(parameter_table)
+```
+
+# c03_read-target-area
+
+**目的**：指定された対象範囲を読み込み、タイル取得用のEPSG:4326 bboxを作成する。  
+**達成指標**：`target_area`, `target_area_union`, `target_area_4326`, `target_bbox_4326`, `target_crs` が作成される。
+
+```{r c03_read-target-area, eval=TRUE}
+read_target_area_from_gpkg <- function(gpkg_path, layer_name, fallback_layers = character()) {
+  if (!file.exists(gpkg_path)) {
+    stop("対象範囲GPKGが見つかりません: ", gpkg_path)
+  }
+
+  available_layers <- sf::st_layers(gpkg_path)$name
+  selected_layer <- layer_name
+
+  if (!selected_layer %in% available_layers) {
+    fallback_hit <- fallback_layers[fallback_layers %in% available_layers]
+
+    if (length(fallback_hit) > 0) {
+      warning(
+        "指定レイヤが見つからないため、代替レイヤを使用します: ",
+        selected_layer,
+        " -> ",
+        fallback_hit[1]
+      )
+      selected_layer <- fallback_hit[1]
+    } else {
+      stop(
+        "対象範囲レイヤが見つかりません: ", selected_layer,
+        "\n利用可能レイヤ: ", paste(available_layers, collapse = ", ")
+      )
+    }
+  }
+
+  sf::st_read(gpkg_path, layer = selected_layer, quiet = TRUE) |>
+    sf::st_zm(drop = TRUE, what = "ZM") |>
+    safe_st_make_valid()
+}
+
+read_target_area_from_bbox <- function(bbox_lonlat) {
+  if (!all(c("xmin", "ymin", "xmax", "ymax") %in% names(bbox_lonlat))) {
+    stop("target_bbox_lonlat には xmin, ymin, xmax, ymax の名前付き値が必要です。")
+  }
+
+  bbox <- sf::st_bbox(
+    bbox_lonlat,
+    crs = sf::st_crs(4326)
+  )
+
+  bbox_sfc <- sf::st_as_sfc(bbox)
+
+  sf::st_sf(
+    target_id = 1L,
+    geometry = bbox_sfc
+  ) |>
+    safe_st_make_valid()
+}
+
+read_target_area_from_vector_file <- function(path, layer = NA_character_) {
+  if (!file.exists(path)) {
+    stop("対象範囲ベクタファイルが見つかりません: ", path)
+  }
+
+  if (is.na(layer) || length(layer) == 0 || layer == "") {
+    sf::st_read(path, quiet = TRUE) |>
+      sf::st_zm(drop = TRUE, what = "ZM") |>
+      safe_st_make_valid()
+  } else {
+    sf::st_read(path, layer = layer, quiet = TRUE) |>
+      sf::st_zm(drop = TRUE, what = "ZM") |>
+      safe_st_make_valid()
+  }
+}
+
+if (target_area_mode == "gpkg_layer") {
+  target_area <- read_target_area_from_gpkg(
+    gpkg_path = target_area_gpkg_path,
+    layer_name = target_area_layer,
+    fallback_layers = target_area_layer_fallbacks
+  )
+} else if (target_area_mode == "bbox_lonlat") {
+  target_area <- read_target_area_from_bbox(target_bbox_lonlat)
+} else if (target_area_mode == "vector_file") {
+  target_area <- read_target_area_from_vector_file(
+    path = target_area_vector_path,
+    layer = target_area_vector_layer
+  )
+} else {
+  stop("target_area_mode が不正です: ", target_area_mode)
+}
+
+if (nrow(target_area) == 0) {
+  stop("対象範囲が0件です。")
+}
+
+if (is.na(sf::st_crs(target_area))) {
+  stop("対象範囲のCRSが未定義です。CRSを定義してから実行してください。")
+}
+
+target_area <- target_area |>
+  safe_st_make_valid()
+
+target_area_union_original <- sf::st_sf(
+  target_id = 1L,
+  geometry = sf::st_union(sf::st_geometry(target_area))
+) |>
+  safe_st_make_valid()
+
+target_crs <- sf::st_crs(target_area_union_original)
+
+# 指定ベクタレイヤのbboxをEPSG:4326で作成する。
+target_bbox_sfc <- target_area_union_original |>
+  sf::st_transform(4326) |>
+  sf::st_bbox() |>
+  sf::st_as_sfc()
+
+target_bbox_area_4326 <- sf::st_sf(
+  target_id = 1L,
+  geometry = target_bbox_sfc
+)
+
+# use_bbox_as_target_area = TRUE の場合、
+# 以後の取得範囲・mask範囲をbboxポリゴンに置き換える。
+if (isTRUE(use_bbox_as_target_area)) {
+  target_area_union <- target_bbox_area_4326 |>
+    sf::st_transform(target_crs) |>
+    safe_st_make_valid()
+} else {
+  target_area_union <- target_area_union_original |>
+    safe_st_make_valid()
+}
+
+target_area_4326 <- target_area_union |>
+  sf::st_transform(4326)
+
+target_bbox_4326 <- sf::st_bbox(target_area_4326)
+
+if (!is.na(output_crs_epsg)) {
+  output_crs <- sf::st_crs(output_crs_epsg)
+} else {
+  output_crs <- target_crs
+}
+
+if (is.na(output_crs)) {
+  stop("output_crs が未定義です。output_crs_epsg または対象範囲CRSを確認してください。")
+}
+
+output_crs_string <- if (!is.na(output_crs$epsg)) {
+  paste0("EPSG:", output_crs$epsg)
+} else if (!is.na(output_crs$wkt)) {
+  output_crs$wkt
+} else {
+  output_crs$input
+}
+
+cat("target CRS:", target_crs$input, "\n")
+cat("output CRS:", output_crs$input, "\n")
+cat("use_bbox_as_target_area:", use_bbox_as_target_area, "\n")
+print(target_bbox_4326)
+```
+
+# c04_build-tile-index
+
+**目的**：対象範囲bboxを含むXYZタイル番号を計算する。  
+**達成指標**：`tile_index` が作成される。
+
+```{r c04_build-tile-index, eval=TRUE}
+webmercator_lat_limit <- 85.05112878
+
+clip_lat_for_xyz <- function(lat) {
+  pmax(pmin(lat, webmercator_lat_limit), -webmercator_lat_limit)
+}
+
+lon_to_tile_x <- function(lon, z) {
+  floor((lon + 180) / 360 * 2^z)
+}
+
+lat_to_tile_y <- function(lat, z) {
+  lat <- clip_lat_for_xyz(lat)
+  lat_rad <- lat * pi / 180
+  floor((1 - log(tan(lat_rad) + 1 / cos(lat_rad)) / pi) / 2 * 2^z)
+}
+
+clamp_tile_index <- function(v, z) {
+  pmax(pmin(v, 2^z - 1), 0)
+}
+
+x_min <- lon_to_tile_x(target_bbox_4326[["xmin"]], source_tile_zoom)
+x_max <- lon_to_tile_x(target_bbox_4326[["xmax"]], source_tile_zoom)
+
+# XYZタイルでは北ほどyが小さい。
+y_min <- lat_to_tile_y(target_bbox_4326[["ymax"]], source_tile_zoom)
+y_max <- lat_to_tile_y(target_bbox_4326[["ymin"]], source_tile_zoom)
+
+x_seq <- seq(
+  clamp_tile_index(x_min - tile_buffer_n, source_tile_zoom),
+  clamp_tile_index(x_max + tile_buffer_n, source_tile_zoom)
+)
+
+y_seq <- seq(
+  clamp_tile_index(y_min - tile_buffer_n, source_tile_zoom),
+  clamp_tile_index(y_max + tile_buffer_n, source_tile_zoom)
+)
+
+tile_index <- tidyr::expand_grid(
+  z = source_tile_zoom,
+  x = x_seq,
+  y = y_seq
+)
+
+cat("source tile:", source_tile_name, "\n")
+cat("zoom:", source_tile_zoom, "\n")
+cat("tile count:", nrow(tile_index), "\n")
+print(utils::head(tile_index))
+```
+
+# c05_fetch-raster-tiles
+
+**目的**：XYZ PNGタイルを取得し、EPSG:3857のタイルラスタとして読み込む。  
+**達成指標**：`raster_tiles_3857` が作成される。
+
+```{r c05_fetch-raster-tiles, eval=TRUE}
+make_tile_url <- function(url_template, z, x, y) {
+  out <- gsub("\\{z\\}", z, url_template)
+  out <- gsub("\\{x\\}", x, out)
+  out <- gsub("\\{y\\}", y, out)
+  out
+}
+
+tile_extent_3857 <- function(z, x, y, tile_size_px = 256) {
+  origin_shift <- pi * 6378137
+  resolution <- 2 * origin_shift / (tile_size_px * 2^z)
+
+  xmin <- -origin_shift + x * tile_size_px * resolution
+  xmax <- -origin_shift + (x + 1) * tile_size_px * resolution
+  ymax <- origin_shift - y * tile_size_px * resolution
+  ymin <- origin_shift - (y + 1) * tile_size_px * resolution
+
+  terra::ext(xmin, xmax, ymin, ymax)
+}
+
+read_one_png_tile_as_raster <- function(url, z, x, y) {
+  tmp_png <- tempfile(fileext = ".png")
+  on.exit(unlink(tmp_png), add = TRUE)
+
+  ok <- tryCatch(
+    {
+      utils::download.file(
+        url = url,
+        destfile = tmp_png,
+        mode = "wb",
+        quiet = TRUE
+      )
+      TRUE
+    },
+    warning = function(w) FALSE,
+    error = function(e) FALSE
+  )
+
+  if (!ok || !file.exists(tmp_png) || file.info(tmp_png)$size == 0) {
+    return(NULL)
+  }
+
+  r <- tryCatch(
+    {
+      terra::rast(tmp_png)
+    },
+    error = function(e) NULL
+  )
+
+  if (is.null(r)) {
+    return(NULL)
+  }
+
+  # RGBAタイルの場合、必要に応じてalpha bandを落とす。
+  if (isTRUE(drop_alpha_band) && terra::nlyr(r) == 4) {
+    r <- r[[1:3]]
+  }
+
+  # RGBをグレースケール1バンドに変換する。
+  if (isTRUE(convert_rgb_to_grayscale) && terra::nlyr(r) >= 3) {
+    r <- r[[1]] * 0.299 + r[[2]] * 0.587 + r[[3]] * 0.114
+    names(r) <- "gray"
+  }
+
+  terra::ext(r) <- tile_extent_3857(z, x, y)
+  terra::crs(r) <- "EPSG:3857"
+
+  names(r) <- paste0(source_tile_name, "_band_", seq_len(terra::nlyr(r)))
+
+  r
+}
+
+raster_tiles_3857 <- vector("list", nrow(tile_index))
+
+download_log <- tibble::tibble(
+  z = integer(),
+  x = integer(),
+  y = integer(),
+  url = character(),
+  downloaded = logical()
+)
+
+for (i in seq_len(nrow(tile_index))) {
+  z <- tile_index$z[i]
+  x <- tile_index$x[i]
+  y <- tile_index$y[i]
+
+  tile_url <- make_tile_url(
+    url_template = source_tile_url_template,
+    z = z,
+    x = x,
+    y = y
+  )
+
+  raster_tiles_3857[[i]] <- read_one_png_tile_as_raster(
+    url = tile_url,
+    z = z,
+    x = x,
+    y = y
+  )
+
+  download_log <- dplyr::bind_rows(
+    download_log,
+    tibble::tibble(
+      z = z,
+      x = x,
+      y = y,
+      url = tile_url,
+      downloaded = !is.null(raster_tiles_3857[[i]])
+    )
+  )
+
+  if (i %% 25 == 0 || i == nrow(tile_index)) {
+    cat("  raster tiles processed:", i, "/", nrow(tile_index), "\n")
+  }
+
+  if (request_sleep_sec > 0) {
+    Sys.sleep(request_sleep_sec)
+  }
+}
+
+raster_tiles_3857 <- purrr::compact(raster_tiles_3857)
+
+if (length(raster_tiles_3857) == 0) {
+  stop("取得できたラスタタイルがありません。URL、zoom、対象範囲を確認してください。")
+}
+
+cat("downloaded raster tile count:", length(raster_tiles_3857), "\n")
+print(download_log |> dplyr::count(downloaded))
+```
+
+# c06_mosaic-crop-project
+
+**目的**：取得したタイルをモザイクし、対象範囲でcrop/maskし、指定CRSへ投影する。  
+**達成指標**：`tile_mosaic_output_crs` が作成される。
+
+```{r c06_mosaic-crop-project, eval=TRUE}
+cat("mosaicking raster tiles...\n")
+
+tile_mosaic_3857 <- do.call(terra::merge, raster_tiles_3857)
+
+cat("mosaic CRS:", terra::crs(tile_mosaic_3857), "\n")
+print(tile_mosaic_3857)
+
+target_area_3857 <- target_area_union |>
+  sf::st_transform(3857)
+
+# まずEPSG:3857側で対象範囲付近にcrop/maskする。
+tile_mosaic_3857 <- terra::crop(
+  tile_mosaic_3857,
+  terra::vect(target_area_3857)
+)
+
+if (isTRUE(clip_to_target_area)) {
+  tile_mosaic_3857 <- terra::mask(
+    tile_mosaic_3857,
+    terra::vect(target_area_3857)
+  )
+}
+
+# 出力CRS側の対象範囲。
+target_area_output_crs <- target_area_union |>
+  sf::st_transform(output_crs)
+
+if (is.finite(output_pixel_size_m) && output_pixel_size_m > 0) {
+  output_template <- terra::rast(
+    terra::ext(terra::vect(target_area_output_crs)),
+    resolution = output_pixel_size_m,
+    crs = output_crs_string
+  )
+
+  tile_mosaic_output_crs <- terra::project(
+    tile_mosaic_3857,
+    output_template,
+    method = resampling_method
+  )
+} else {
+  tile_mosaic_output_crs <- terra::project(
+    tile_mosaic_3857,
+    output_crs_string,
+    method = resampling_method
+  )
+}
+
+# 投影後にも最終crop/maskを行う。
+tile_mosaic_output_crs <- terra::crop(
+  tile_mosaic_output_crs,
+  terra::vect(target_area_output_crs)
+)
+
+if (isTRUE(clip_to_target_area)) {
+  tile_mosaic_output_crs <- terra::mask(
+    tile_mosaic_output_crs,
+    terra::vect(target_area_output_crs)
+  )
+}
+
+names(tile_mosaic_output_crs) <- paste0(
+  source_tile_name,
+  "_band_",
+  seq_len(terra::nlyr(tile_mosaic_output_crs))
+)
+
+print(tile_mosaic_output_crs)
+```
+
+# c07_write-geotiff
+
+**目的**：モザイク済みラスタをGeoTIFFとして保存する。  
+**達成指標**：`output_geotiff_path` にGeoTIFFが作成される。
+
+```{r c07_write-geotiff, eval=TRUE}
+safe_dir_create(dirname(output_geotiff_path))
+
+write_args <- list(
+  x = tile_mosaic_output_crs,
+  filename = output_geotiff_path,
+  overwrite = TRUE,
+  gdal = geotiff_gdal_options
+)
+
+if (isTRUE(write_byte_geotiff)) {
+  write_args$datatype <- "INT1U"
+}
+
+do.call(terra::writeRaster, write_args)
+
+cat("GeoTIFF written:", output_geotiff_path, "\n")
+
+output_file_info <- tibble::tibble(
+  output_geotiff_path = output_geotiff_path,
+  exists = file.exists(output_geotiff_path),
+  size_bytes = ifelse(
+    file.exists(output_geotiff_path),
+    file.info(output_geotiff_path)$size,
+    NA_real_
+  )
+)
+
+print(output_file_info)
+```
+
+# c08_write-summary
+
+**目的**：取得・変換・保存結果をCSVに記録する。  
+**達成指標**：`summary_csv_path` が作成される。
+
+```{r c08_write-summary, eval=TRUE}
+summary_table <- tibble::tibble(
+  source_tile_name = source_tile_name,
+  source_tile_url_template = source_tile_url_template,
+  source_tile_zoom = source_tile_zoom,
+  tile_count_requested = nrow(tile_index),
+  tile_count_downloaded = length(raster_tiles_3857),
+  target_area_mode = target_area_mode,
+  target_area_gpkg_path = ifelse(target_area_mode == "gpkg_layer", target_area_gpkg_path, NA_character_),
+  target_area_layer = ifelse(target_area_mode == "gpkg_layer", target_area_layer, NA_character_),
+  use_bbox_as_target_area = use_bbox_as_target_area,
+  clip_to_target_area = clip_to_target_area,
+  output_geotiff_path = output_geotiff_path,
+  output_crs = terra::crs(tile_mosaic_output_crs),
+  nlyr = terra::nlyr(tile_mosaic_output_crs),
+  nrow = terra::nrow(tile_mosaic_output_crs),
+  ncol = terra::ncol(tile_mosaic_output_crs),
+  res_x = terra::res(tile_mosaic_output_crs)[1],
+  res_y = terra::res(tile_mosaic_output_crs)[2],
+  resampling_method = resampling_method,
+  output_exists = file.exists(output_geotiff_path),
+  output_size_bytes = ifelse(
+    file.exists(output_geotiff_path),
+    file.info(output_geotiff_path)$size,
+    NA_real_
+  )
+)
+
+safe_dir_create(dirname(summary_csv_path))
+
+readr::write_csv(
+  summary_table,
+  summary_csv_path
+)
+
+download_log_csv_path <- file.path(
+  dirname(summary_csv_path),
+  paste0(source_tile_name, "_tile_download_log.csv")
+)
+
+readr::write_csv(
+  download_log,
+  download_log_csv_path
+)
+
+cat("summary CSV:", summary_csv_path, "\n")
+cat("download log CSV:", download_log_csv_path, "\n")
+print(summary_table)
+```
+
+# c09_chunk-list
+
+**目的**：このRmdに含まれるchunkを一覧化する。  
+**達成指標**：処理順と各chunkの役割が確認できる。
+
+```{r c09_chunk-list, eval=TRUE}
+chunk_list <- tibble::tribble(
+  ~chunk, ~purpose,
+  "c01_setup", "必要パッケージと共通関数を準備する。",
+  "c02_parameters", "対象範囲・ソースタイル・保存先・投影条件を指定する。",
+  "c03_read-target-area", "対象範囲を読み込み、EPSG:4326 bboxを作成する。",
+  "c04_build-tile-index", "対象範囲を含むXYZタイル番号を計算する。",
+  "c05_fetch-raster-tiles", "XYZ PNGタイルを取得し、EPSG:3857ラスタとして読み込む。",
+  "c06_mosaic-crop-project", "タイルをモザイクし、crop/maskし、指定CRSへ投影する。",
+  "c07_write-geotiff", "モザイク済みラスタをGeoTIFFとして保存する。",
+  "c08_write-summary", "取得・保存結果のCSVとダウンロードログを作成する。",
+  "c09_chunk-list", "chunk一覧を表示する。"
+)
+
+print(chunk_list)
+```
+
+# chunk一覧
+
+| 番号 | chunk名 | 内容 |
+|---:|---|---|
+| 01 | `c01_setup` | 必要パッケージと共通関数を準備する。 |
+| 02 | `c02_parameters` | 対象範囲・ソースタイル・保存先・投影条件を指定する。 |
+| 03 | `c03_read-target-area` | 対象範囲を読み込み、EPSG:4326 bboxを作成する。 |
+| 04 | `c04_build-tile-index` | 対象範囲を含むXYZタイル番号を計算する。 |
+| 05 | `c05_fetch-raster-tiles` | XYZ PNGタイルを取得し、EPSG:3857ラスタとして読み込む。 |
+| 06 | `c06_mosaic-crop-project` | タイルをモザイクし、crop/maskし、指定CRSへ投影する。 |
+| 07 | `c07_write-geotiff` | モザイク済みラスタをGeoTIFFとして保存する。 |
+| 08 | `c08_write-summary` | 取得・保存結果のCSVとダウンロードログを作成する。 |
+| 09 | `c09_chunk-list` | chunk一覧を表示する。 |
